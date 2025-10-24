@@ -53,7 +53,7 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="查看远端作业状态")
 
     provider = subparsers.add_parser("provider", help="查看或切换部署 provider")
-    provider.add_argument("--set", choices=["builtin", "legacy"], help="切换 provider")
+    provider.add_argument("--set", choices=["builtin", "legacy", "sshfs"], help="切换 provider")
     provider.add_argument("--show", action="store_true", help="仅显示当前 provider")
 
     return parser
@@ -121,7 +121,7 @@ def handle_provider(args: argparse.Namespace) -> int:
     if args.show or not args.set:
         log_info(f"当前 provider：{current}")
         if not args.show and not args.set:
-            log_info("可使用 --set builtin|legacy 进行切换。")
+            log_info("可使用 --set builtin|legacy|sshfs 进行切换。")
         return 0
     return 0
 

@@ -1,7 +1,7 @@
 # OnePass Audio 部署提供者配置
-# 用途：在 builtin（官方 ssh/scp 流水线）与 legacy（既有项目适配层）之间切换，并提供统一的命令模板。
+# 用途：在 builtin（官方 ssh/scp 流水线）、legacy（既有项目适配层）与 sshfs（反向挂载）之间切换。
 # 请复制本文件为 deploy/provider.local.yaml 进行私有修改，避免在版本库中泄露敏感配置。
-current: builtin   # builtin | legacy
+current: sshfs   # builtin | legacy | sshfs
 builtin:
   root: .
 legacy:
@@ -13,6 +13,9 @@ legacy:
     run_asr: "pwsh -File scripts/run_asr.ps1 --model {model} --device {device} --workers {workers} --pattern {pattern}"
     fetch_outputs: "pwsh -File scripts/fetch_outputs.ps1 --remote {remote_asr_json} --local {local_asr_json}"
     status: "pwsh -File scripts/status.ps1"
+sshfs:
+  env_file: deploy/sshfs/sshfs.env
+  mount_point: /home/ubuntu/onepass/data/audio
 common:
   remote_dir: "/home/ubuntu/onepass"
   audio_pattern: "*.m4a,*.wav,*.mp3,*.flac"
