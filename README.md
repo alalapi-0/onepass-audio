@@ -96,7 +96,7 @@ python onepass_main.py batch --aggr 60 --regen --render
 
 直接运行 `python onepass_main.py` 会进入菜单模式，当前提供以下选项：
 
-0. 批量转写音频 → 生成 ASR JSON
+0. 批量转写音频 → 生成 ASR JSON（统一部署 CLI）
 1. 环境自检
 2. 素材检查
 3. 单章处理（去口癖 + 保留最后一遍 + 生成字幕/EDL/标记）
@@ -105,6 +105,7 @@ python onepass_main.py batch --aggr 60 --regen --render
 6. 重新生成（清理旧产物后重跑一章）
 7. 批量生成（遍历全部章节）
 8. 清理产物（按 stem 或全部）
+L. 本地批量转写（旧版 CLI）
 
 若 PowerShell 执行策略阻止脚本运行，可临时执行：
 
@@ -157,6 +158,38 @@ pwsh -File .\scripts\bulk_process.ps1 -AutoASR
 ```
 
 主程序子命令 `asr` 会转调用 `scripts/asr_batch.py`，支持常用参数；批处理脚本开启 `-AutoASR` 后会在缺少 JSON 时自动转写音频，再继续执行去口癖、字幕和渲染流程。
+
+## 接入你已有的 VPS 项目（provider=legacy）
+
+新版部署流水线通过 `scripts/deploy_cli.py` 统一封装 provision/upload/run/fetch/status 流程，并通过 `deploy/provider.yaml` 切换 builtin（官方 ssh/scp）与 legacy（既有项目适配层）。接入步骤如下：
+
+1. 将旧项目完整复制到 `integrations/vps_legacy/<你的目录>/`，密钥与缓存请留在本地安全位置；
+2. 编辑 `deploy/provider.yaml`，在 `legacy.project_dir` 填写你的目录名称（或确保 `integrations/vps_legacy/` 下仅有一个子目录）；
+3. 若旧项目提供现成脚本，可在 `legacy.hooks.*` 中填写命令模板；未配置的步骤会尝试自动探测常见脚本名，或在设置 `LEGACY_SSH_TARGET` 等环境变量后降级到内置 ssh/scp；
+4. 执行以下命令切换 provider 并按顺序完成部署与转写：
+
+```bash
+# 选择 legacy 适配层
+python scripts/deploy_cli.py provider --set legacy
+
+# 可按需逐步执行，默认会实时输出远端日志
+python scripts/deploy_cli.py provision
+python scripts/deploy_cli.py upload_audio
+python scripts/deploy_cli.py run_asr --model medium --device auto --workers 1
+python scripts/deploy_cli.py fetch_outputs
+
+# 校验 data/asr-json/*.json 是否含 segments[].words[*].start/end
+python scripts/verify_asr_words.py
+```
+
+在交互式主菜单中，选项 `0)` 将引导你确认当前 provider，按需执行四步流程，并在结束后自动运行 `verify_asr_words.py`。若需要本地直接运行旧版批量转写，可选择隐藏项 `L)`。
+
+常见问题：
+
+- **脚本名称不匹配**：请在 `legacy.hooks.*` 中填写准确命令；
+- **权限/SSH 配置**：builtin 与 fallback ssh/scp 会读取 `deploy/vps.env`，注意填写 `VPS_HOST`、`VPS_USER`、密钥路径与端口；
+- **PATH/虚拟环境**：可在 `deploy/vps.env` 中设置 `VPS_VENV_ACTIVATE` 或在 legacy 项目脚本内自行处理；
+- **后台日志位置**：建议在旧项目脚本里输出 tmux/session 名称，方便排查远端 whisper 进程。
 
 ## 素材准备与验证
 
