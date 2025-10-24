@@ -65,7 +65,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 ## 主程序使用说明
 
-`onepass_main.py` 提供统一入口，可通过子命令或交互式菜单串联安装、校验、处理与渲染流程。支持的子命令包括：`setup`、`validate`、`process`、`render`。
+`onepass_main.py` 提供统一入口，可通过子命令或交互式菜单串联安装、校验、处理、清理与批处理流程。支持的子命令包括：`setup`、`validate`、`process`、`render`、`clean`、`regen`、`batch`、`asr`。
 
 ```
 python onepass_main.py  # 进入交互式菜单
@@ -82,18 +82,29 @@ python onepass_main.py validate
 python onepass_main.py process --json data/asr-json/001.json \
   --original data/original_txt/001.txt --outdir out --aggr 60 --dry-run
 
+# 清理后重新生成单章（保留新产物）
+python onepass_main.py regen --json data/asr-json/001.json \
+  --original data/original_txt/001.txt --outdir out --aggr 60
+
 # 按 EDL 渲染音频（带轻微 crossfade 与响度归一）
 python onepass_main.py render --audio data/audio/001.m4a \
   --edl out/001.keepLast.edl.json --out out/001.clean.wav --xfade --loudnorm
+
+# 批量遍历整本书（先清理 generated，再输出 summary.csv/md）
+python onepass_main.py batch --aggr 60 --regen --render
 ```
 
 直接运行 `python onepass_main.py` 会进入菜单模式，当前提供以下选项：
 
+0. 批量转写音频 → 生成 ASR JSON
 1. 环境自检
 2. 素材检查
 3. 单章处理（去口癖 + 保留最后一遍 + 生成字幕/EDL/标记）
 4. 仅渲染音频（按 EDL）
 5. 退出
+6. 重新生成（清理旧产物后重跑一章）
+7. 批量生成（遍历全部章节）
+8. 清理产物（按 stem 或全部）
 
 若 PowerShell 执行策略阻止脚本运行，可临时执行：
 
@@ -204,6 +215,30 @@ python scripts/retake_keep_last.py --json data/asr-json/004.json \
 
 执行后会额外生成 `*.diff.md` 差异报告，逐句列出保留的朗读与删除的重录明细，方便人工复核。
 
+### 重新生成与清理
+
+当需要“重跑一章并覆盖旧字幕/日志”时，可先清理旧产物再重新生成。新的 `--regen` 流程会调用 `scripts/clean_outputs.py`，仅处理 `out/` 目录下的衍生文件，默认移动到 `out/.trash/<时间戳>/` 以便随时还原：
+
+```bash
+# 在生成前先清理旧产物（安全移动到 .trash/）
+python scripts/retake_keep_last.py --json data/asr-json/001.json \
+  --original data/original_txt/001.txt --outdir out --aggr 60 --regen
+
+# 仅清理 generated，不重新生成
+python scripts/clean_outputs.py --stem 001 --what generated --trash --yes
+
+# 硬删除所有产物（慎用，无法撤销）
+python scripts/clean_outputs.py --stem 001 --what all --hard --yes
+```
+
+所有操作仅作用于 `out/` 目录，`data/audio`、`data/asr-json`、`data/original_txt` 等源素材不会被触碰。若需要彻底清空回收站，可运行：
+
+```bash
+python scripts/clean_outputs.py --all --what all --hard --yes
+```
+
+主程序也可一键执行同样的流程：`python onepass_main.py clean ...`、`python onepass_main.py regen ...`，交互式菜单第 6、8 项会提示确认后再调用脚本。
+
 ### 渲染
 
 ```bash
@@ -248,7 +283,15 @@ pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 50 -Render -AudioRequired
 
 # 指定自定义配置
 pwsh -File .\scripts\bulk_process.ps1 -Config "config\my_config.json" -Render
+
+# 逐章先清理再重跑（安全移动到 .trash/）
+pwsh -File .\scripts\bulk_process.ps1 -Regen
+
+# 硬删除旧产物后重跑（慎用）
+pwsh -File .\scripts\bulk_process.ps1 -Regen -HardDelete
 ```
+
+开启 `-Regen` 后，脚本会在每章处理前调用 `scripts/clean_outputs.py --stem <stem> --what generated --trash --yes`，并在 `summary.csv` / `summary.md` 中新增 `regened` 与 `cleaned_files` 列以记录清理情况。若配合 `-HardDelete`，旧文件会被直接删除而不会进入 `.trash/`，请谨慎使用。
 
 ### 输出产物
 

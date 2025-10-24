@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
+from scripts.clean_outputs import CleanResult, CleanupError, human_size, perform_cleanup
+
 PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
@@ -62,6 +64,16 @@ def parse_args() -> argparse.Namespace:
         help="自定义配置文件路径，默认 config/default_config.json。文件不存在时退回默认配置。",
     )
     parser.add_argument("--dry-run", action="store_true", help="仅生成字幕/EDL/标记，不触碰音频")
+    parser.add_argument(
+        "--regen",
+        action="store_true",
+        help="处理前清理旧的字幕/EDL/标记等产物，再重新生成",
+    )
+    parser.add_argument(
+        "--hard-delete",
+        action="store_true",
+        help="搭配 --regen 使用，跳过回收区直接删除旧产物（危险）",
+    )
     parser.add_argument(
         "--align-mode",
         choices=["fast", "accurate", "hybrid"],
@@ -156,6 +168,10 @@ def main() -> int:
         args = parse_args()
         verbose_flag = _determine_verbose(args)
 
+        if args.hard_delete and not args.regen:
+            log_err("--hard-delete 需搭配 --regen 使用。")
+            return 2
+
         section("参数确认")
         json_path = _resolve_path(args.json)
         original_path = _resolve_path(args.original)
@@ -173,6 +189,29 @@ def main() -> int:
 
         stem = json_path.stem
         paths = Paths(json=json_path, original=original_path, outdir=outdir)
+
+        regen_result: CleanResult | None = None
+        if args.regen:
+            section("重新生成：清理旧产物")
+            try:
+                regen_result = perform_cleanup(
+                    stems=[stem],
+                    categories={"generated"},
+                    mode="hard" if args.hard_delete else "trash",
+                    assume_yes=True,
+                    dry_run=False,
+                    reporter=log_info,
+                    emit_summary=False,
+                )
+            except CleanupError as exc:
+                log_err(f"清理失败：{exc}")
+                return 2
+            if regen_result.files == 0:
+                log_info("未发现需要清理的旧文件。")
+            else:
+                log_ok(
+                    f"已清理 {regen_result.files} 个旧文件（{human_size(regen_result.bytes_total)}）。"
+                )
 
         overrides: Dict[str, Any] = {}
         if args.align_mode:
@@ -228,6 +267,13 @@ def main() -> int:
         log_info(f"删除重复句: {duplicated}")
         if args.dry_run:
             log_warn("dry-run 模式：未触碰音频渲染流程。")
+
+        if args.regen:
+            cleaned = regen_result.files if regen_result else 0
+            cleaned_size = human_size(regen_result.bytes_total) if regen_result else "0 B"
+            log_ok(
+                f"已清理 {cleaned} 个旧文件（{cleaned_size}），已重新生成 5+1 件套。"
+            )
 
         log_ok("流程完成")
         return 0
