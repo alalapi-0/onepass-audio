@@ -110,6 +110,18 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 若对应脚本尚未生成，会显示友好提示而不会直接报错退出。
 
+### 实时进度与日志
+
+所有子命令与核心脚本均会实时输出阶段日志，并原样转发外部进程（如 ffmpeg、whisper-ctranslate2）的标准输出/错误；长时间无日志时，会自动打印心跳提示“仍在运行（已用时 Xs）”。
+
+如需调整显示样式，可使用以下环境变量与参数：
+
+- 关闭颜色输出：
+  - Windows PowerShell：`$env:ONEPASS_NO_ANSI=1`
+  - Windows CMD：`set ONEPASS_NO_ANSI=1`
+- 全局关闭详细日志：`ONEPASS_VERBOSE=0`（或在命令后加 `--quiet`）
+- 强制显示详细日志：`ONEPASS_VERBOSE=1`（或在命令后加 `--verbose`，适用于支持该选项的脚本）
+
 ## 从音频到 ASR JSON
 
 当原始音频已准备就绪但尚未生成词级 ASR JSON 时，可使用 `scripts/asr_batch.py` 批量调用 whisper-ctranslate2 完成转写。该脚本默认扫描 `data/audio/`，并在 `data/asr-json/` 下生成 `<stem>.json`。运行前需确保已安装 `ffmpeg` 与 `whisper-ctranslate2`（可通过步骤 #3 的 `scripts/install_deps.ps1` 安装）。
