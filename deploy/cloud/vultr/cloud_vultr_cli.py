@@ -142,19 +142,17 @@ def _format_exception(exc: Exception) -> str:
     return f"{exc.__class__.__name__}: {exc}"
 
 
-def _check_command(command: str, args: Optional[List[str]] = None) -> Tuple[bool, str]:
+def _check_command(command: str, args: Optional[List[str]] = None) -> Tuple[bool, str, Optional[int]]:
     args = args or ["--version"]
     path = shutil.which(command)
     if not path:
-        return False, f"未检测到 {command}，请确认已安装并加入 PATH。"
+        return False, f"未检测到 {command}，请确认已安装并加入 PATH。", None
     try:
         proc = subprocess.run([path, *args], capture_output=True, text=True, check=False)
     except OSError as exc:  # pragma: no cover - 平台相关
-        return False, f"无法执行 {command}：{exc}"
+        return False, f"无法执行 {command}：{exc}", None
     output = proc.stdout.strip() or proc.stderr.strip()
-    if proc.returncode != 0:
-        return False, f"执行 {command} {args} 失败：{output}"
-    return True, output
+    return True, output, proc.returncode
 
 
 def _load_state() -> Dict[str, str]:
@@ -259,85 +257,155 @@ def _ensure_ssh_key(env: Dict[str, str]) -> Tuple[str, str]:
 
 
 def cmd_env_check(args: argparse.Namespace) -> int:
+    if args.yes and args.no:
+        log_err("--yes 与 --no 不能同时使用。")
+        return 2
+
     section("步骤①：检查本机环境")
     if args.dry_run:
         log_warn("dry-run 对 env-check 无实际意义，将继续执行只读检查。")
-    env = _read_env_file(optional=True)
-    status_fail: List[str] = []
-    status_warn: List[str] = []
 
-    log_info(f"操作系统：{platform.system()} {platform.release()}")
-    log_info(f"Python 版本：{platform.python_version()}")
+    first_run = True
 
-    ok, message = _check_command(sys.executable, ["--version"])
-    if ok:
-        log_ok(f"Python 可用：{message}")
-    else:
-        log_err(message)
-        status_fail.append("python")
+    def run_checks() -> Tuple[List[str], List[str]]:
+        nonlocal first_run
+        status_fail: List[str] = []
+        status_warn: List[str] = []
 
-    pwsh_path = shutil.which("pwsh")
-    if pwsh_path:
-        ok, message = _check_command("pwsh", ["-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"])
-        if ok:
-            log_ok(f"PowerShell 7+ 可用：{message}")
-        else:
-            log_warn(message)
-            status_warn.append("pwsh")
-    else:
-        log_err("未找到 PowerShell 7 (pwsh)，请安装 https://aka.ms/powershell 并重启终端。")
-        status_fail.append("pwsh")
+        env = _read_env_file(optional=True)
 
-    for cmd in ("ssh", "scp"):
-        ok, message = _check_command(cmd)
-        if ok:
-            log_ok(f"{cmd} 可用：{message}")
+        if first_run:
+            log_info(f"操作系统：{platform.system()} {platform.release()}")
+            log_info(f"Python 版本：{platform.python_version()}")
+        first_run = False
+
+        ok, message, code = _check_command(sys.executable, ["--version"])
+        if ok and (code == 0 or code is None):
+            log_ok(f"Python 可用：{message}")
+        elif ok:
+            log_warn(f"Python 命令退出码 {code}：{message}")
+            status_warn.append("python")
         else:
             log_err(message)
-            status_fail.append(cmd)
+            status_fail.append("python")
 
-    if platform.system().lower() == "windows":
-        log_info("Windows 环境将调用 cloud_env_check.ps1 进行服务检测。")
-    else:
-        log_info("macOS/Linux 将调用 cloud_env_check.ps1 做补充检测。")
-
-    if env:
-        key_path_value = env.get("SSH_PRIVATE_KEY")
-        if key_path_value:
-            priv_path = _expand_path(key_path_value)
-            if priv_path.exists():
-                log_ok(f"检测到私钥：{priv_path}")
-                try:
-                    mode = priv_path.stat().st_mode
-                    if mode & 0o077:
-                        log_warn("私钥权限较宽松，建议执行 chmod 600 确保安全。")
-                        status_warn.append("ssh-key-perm")
-                except OSError as exc:  # pragma: no cover
-                    log_warn(f"无法检查私钥权限：{exc}")
-            else:
-                log_warn(f"未找到私钥 {priv_path}，可使用 ssh-keygen -t ed25519 生成。")
-                status_warn.append("ssh-key-missing")
+        pwsh_path = shutil.which("pwsh")
+        if pwsh_path:
+            ok, message, code = _check_command(
+                "pwsh",
+                ["-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+            )
+            if ok and (code == 0 or code is None):
+                log_ok(f"PowerShell 7+ 可用：{message}")
+            elif ok:
+                log_warn(f"pwsh 返回码 {code}：{message}")
+                status_warn.append("pwsh")
         else:
-            log_warn("vultr.env 中未配置 SSH_PRIVATE_KEY，将跳过私钥检查。")
-            status_warn.append("ssh-key-config")
-    else:
-        status_warn.append("env")
+            log_err("未找到 PowerShell 7 (pwsh)，请安装 https://aka.ms/powershell 并重启终端。")
+            status_fail.append("pwsh")
 
-    ps_script = CUR_DIR / "cloud_env_check.ps1"
-    if ps_script.exists() and pwsh_path:
-        cmd = [pwsh_path, "-NoLogo", "-NoProfile", "-File", str(ps_script)]
-        log_info("调用 PowerShell 环境检查脚本…")
-        rc = run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
-        if rc == 2:
-            status_fail.append("cloud_env_check")
-        elif rc == 1:
-            status_warn.append("cloud_env_check")
-    elif not pwsh_path:
-        log_warn("由于未安装 pwsh，跳过 PowerShell 补充检测。")
-        status_warn.append("pwsh-missing")
-    else:
-        log_warn("未找到 cloud_env_check.ps1 脚本。")
-        status_warn.append("ps-script")
+        for cmd in ("ssh", "scp"):
+            ok, message, code = _check_command(cmd, ["-V"])
+            if ok and (code == 0 or code is None):
+                log_ok(f"{cmd} 可用：{message}")
+            elif ok:
+                log_warn(f"{cmd} 返回码 {code}：{message}")
+                status_warn.append(cmd)
+            else:
+                log_err(message)
+                status_fail.append(cmd)
+
+        ok, message, code = _check_command("rsync", ["--version"])
+        if ok and (code == 0 or code is None):
+            log_ok(f"rsync 可用：{message.splitlines()[0] if message else message}")
+        elif ok:
+            log_warn(f"rsync 返回码 {code}：{message}")
+            status_warn.append("rsync")
+        else:
+            log_warn("未检测到 rsync，缺少时将回退到 scp。")
+            status_warn.append("rsync-missing")
+
+        if env:
+            key_path_value = env.get("SSH_PRIVATE_KEY")
+            if key_path_value:
+                priv_path = _expand_path(key_path_value)
+                if priv_path.exists():
+                    log_ok(f"检测到私钥：{priv_path}")
+                    try:
+                        mode = priv_path.stat().st_mode
+                        if mode & 0o077:
+                            log_warn("私钥权限较宽松，建议执行 chmod 600 确保安全。")
+                            status_warn.append("ssh-key-perm")
+                    except OSError as exc:  # pragma: no cover
+                        log_warn(f"无法检查私钥权限：{exc}")
+                else:
+                    log_warn(f"未找到私钥 {priv_path}，可使用 ssh-keygen -t ed25519 生成。")
+                    status_warn.append("ssh-key-missing")
+            else:
+                log_warn("vultr.env 中未配置 SSH_PRIVATE_KEY，将跳过私钥检查。")
+                status_warn.append("ssh-key-config")
+        else:
+            log_warn("未找到 vultr.env，将使用默认值并跳过部分检查。")
+            status_warn.append("vultr.env")
+
+        ps_script = CUR_DIR / "cloud_env_check.ps1"
+        pwsh_path = shutil.which("pwsh")
+        if ps_script.exists() and pwsh_path:
+            cmd = [pwsh_path, "-NoLogo", "-NoProfile", "-File", str(ps_script)]
+            log_info("调用 PowerShell 环境检查脚本…")
+            rc = run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
+            if rc == 2:
+                status_fail.append("cloud_env_check")
+            elif rc == 1:
+                status_warn.append("cloud_env_check")
+        elif not pwsh_path:
+            log_warn("由于未安装 pwsh，跳过 PowerShell 补充检测。")
+            status_warn.append("pwsh-missing")
+        else:
+            log_warn("未找到 cloud_env_check.ps1 脚本。")
+            status_warn.append("ps-script")
+
+        return status_fail, status_warn
+
+    status_fail, status_warn = run_checks()
+
+    if args.auto_fix and (status_fail or status_warn):
+        initial_fail = set(status_fail)
+        initial_warn = set(status_warn)
+        section("步骤②：自动修复缺失环境")
+        auto_fix_script = PROJ_ROOT / "scripts" / "auto_fix_env.py"
+        if not auto_fix_script.exists():
+            log_err(f"未找到自动修复脚本：{auto_fix_script}")
+            return 2
+        auto_cmd = [sys.executable, str(auto_fix_script)]
+        if args.yes:
+            auto_cmd.append("--yes")
+        elif args.no:
+            auto_cmd.append("--no")
+        log_info(f"执行自动修复：{format_cmd(auto_cmd)}")
+        auto_rc = run_streamed(auto_cmd, cwd=PROJ_ROOT, heartbeat_s=30.0, show_cmd=False)
+        if auto_rc == 2:
+            log_err("自动修复脚本执行失败。")
+        elif auto_rc == 1:
+            log_warn("自动修复脚本返回警告，请查看日志确认状态。")
+
+        section("步骤③：自动修复后再次检查")
+        status_fail, status_warn = run_checks()
+        new_fail = set(status_fail)
+        new_warn = set(status_warn)
+
+        resolved_fail = initial_fail - new_fail
+        resolved_warn = initial_warn - new_warn
+        remaining_fail = new_fail
+        remaining_warn = new_warn
+
+        if resolved_fail or resolved_warn:
+            resolved = sorted(resolved_fail | resolved_warn)
+            log_ok(f"已修复：{', '.join(resolved)}")
+        if remaining_fail:
+            log_err(f"仍缺失：{', '.join(sorted(remaining_fail))}")
+        if remaining_warn:
+            log_warn(f"仍存在警告：{', '.join(sorted(remaining_warn))}")
 
     if status_fail:
         log_err("环境检测存在阻塞项，请修复后重试。")
@@ -956,6 +1024,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     env_parser = sub.add_parser("env-check", help="检查本机环境")
     _add_dry_run(env_parser)
+    env_parser.add_argument(
+        "--auto-fix",
+        action="store_true",
+        help="检测到缺失项时自动调用 scripts/auto_fix_env.py",
+    )
+    env_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="自动确认自动修复中的安装提示",
+    )
+    env_parser.add_argument(
+        "--no",
+        action="store_true",
+        help="拒绝自动修复安装操作，仅查看建议",
+    )
     env_parser.set_defaults(func=cmd_env_check)
 
     create_parser = sub.add_parser("create", help="创建 VPS 实例")

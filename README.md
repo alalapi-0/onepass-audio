@@ -63,6 +63,23 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 `scripts/install_deps.ps1` 会优先使用 `winget`（备用：Chocolatey）安装 ffmpeg，并调用 `python -m pip install -r requirements.txt`。该脚本可多次执行，若依赖已满足会提示“已安装”。ffmpeg 是后续音频渲染及切片脚本的基础工具，缺失会导致相关命令无法运行；转写 JSON 建议由 faster-whisper（或兼容工具）生成后放入 `data/asr-json/`。
 
+## 自动修复环境（Windows/macOS）
+
+若想一键修复常见缺失项，可运行：
+
+```bash
+python scripts/auto_fix_env.py --yes
+```
+
+脚本会根据系统自动选择修复策略：
+
+- **Windows**：检测/安装 PowerShell 7、OpenSSH 客户端（可选开启服务与 ssh-agent）、Git for Windows，以及 MSYS2 + rsync（可选，若失败自动降级为 scp）。依赖 `winget`/App Installer，不会覆盖现有配置。
+- **macOS**：检测/安装 Homebrew、Xcode Command Line Tools、OpenSSH、rsync，并尝试启动 `ssh-agent`。如 Homebrew 缺失，会在 `--yes` 下自动调用官方安装脚本。
+
+安装过程可能触发管理员权限（Windows 会弹出 UAC），请按照提示确认。若设备策略禁止安装、或机器处于离线状态，脚本会以 WARN/FAIL 退出并给出下一步建议。
+
+脚本运行完毕会重新执行轻量自检，汇总每项状态（OK/WARN/FAIL）。缺少 rsync 时会自动提示改用 scp，同步性能会受到影响但不阻塞工作流程。
+
 ## 主程序使用说明
 
 `onepass_main.py` 提供统一入口，可通过子命令或交互式菜单串联安装、校验、处理、清理与批处理流程。支持的子命令包括：`setup`、`validate`、`process`、`render`、`clean`、`regen`、`batch`、`asr`。
@@ -98,6 +115,7 @@ python onepass_main.py batch --aggr 60 --regen --render
 
 0. 批量转写音频 → 生成 ASR JSON（统一部署 CLI）
 1. 环境自检
+X. 一键自动修复环境（缺啥装啥；Windows/macOS）
 2. 素材检查
 3. 单章处理（去口癖 + 保留最后一遍 + 生成字幕/EDL/标记）
 4. 仅渲染音频（按 EDL）
