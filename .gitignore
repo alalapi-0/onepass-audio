@@ -28,3 +28,4 @@ Thumbs.db
 *.mp3
 *.m4a
 *.flac
+deploy/vps.env

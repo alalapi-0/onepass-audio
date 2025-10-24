@@ -23,6 +23,10 @@ import time
 from pathlib import Path
 from typing import Iterable, List
 
+from onepass.deploy_api import (
+    get_current_provider_name as deploy_get_current_provider_name,
+    load_provider_config as deploy_load_provider_config,
+)
 from onepass.ux import (
     Spinner,
     enable_ansi,
@@ -72,6 +76,16 @@ def _check_script_exists(script_path: Path, step_hint: str) -> bool:
 
 def _print_command(cmd: Iterable[str]) -> None:
     log_info(f"将要执行的命令：{format_cmd(list(cmd))}")
+
+
+def _run_deploy_cli(args: list[str], heartbeat: float = 45.0) -> int:
+    script = PROJ_ROOT / "scripts" / "deploy_cli.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}")
+        return 2
+    cmd = [sys.executable, str(script), *args]
+    _print_command(cmd)
+    return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
 
 
 def _make_common_parent() -> argparse.ArgumentParser:
@@ -809,7 +823,122 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _interactive_asr() -> int:
+def _interactive_deploy_asr() -> int:
+    section("批量转写 · 统一部署流水线")
+    try:
+        config = deploy_load_provider_config()
+    except FileNotFoundError:
+        log_err("缺少 deploy/provider.yaml，请先创建后再试。")
+        return 2
+    current = deploy_get_current_provider_name(config)
+    log_info(f"当前 provider：{current}")
+    provider_choice = _prompt("选择 provider (builtin/legacy)", current).strip().lower()
+    if not provider_choice:
+        provider_choice = current
+    if provider_choice not in {"builtin", "legacy"}:
+        log_warn("输入无效，将继续使用当前 provider。")
+        provider_choice = current
+    if provider_choice != current:
+        log_info(f"切换 provider -> {provider_choice}")
+        rc_switch = _run_deploy_cli(["provider", "--set", provider_choice], heartbeat=10.0)
+        if rc_switch != 0:
+            log_err("切换 provider 失败。")
+            return rc_switch
+        current = provider_choice
+
+    do_provision = _prompt_bool("执行 provision（环境准备）?", True)
+    do_upload = _prompt_bool("执行 upload_audio（同步音频）?", True)
+    do_run = _prompt_bool("执行 run_asr（远端转写）?", True)
+    do_fetch = _prompt_bool("执行 fetch_outputs（下载 JSON）?", True)
+
+    common = config.get("common", {})
+    pattern_default = str(common.get("audio_pattern", "*.m4a,*.wav,*.mp3,*.flac"))
+    model_default = str(common.get("model", "medium"))
+    language_default = str(common.get("language", "zh"))
+    device_default = str(common.get("device", "auto"))
+    compute_default = str(common.get("compute", "auto"))
+    workers_default = int(common.get("workers", 1))
+
+    severity = 0
+
+    if do_provision:
+        rc = _run_deploy_cli(["provision"])
+        if rc == 2:
+            return 2
+        if rc == 1 and severity == 0:
+            severity = 1
+
+    if do_upload:
+        rc = _run_deploy_cli(["upload_audio"])
+        if rc == 2:
+            return 2
+        if rc == 1 and severity == 0:
+            severity = 1
+
+    run_params: list[str] = []
+    if do_run:
+        pattern = _prompt("音频匹配模式", pattern_default) or pattern_default
+        model = _prompt("whisper 模型", model_default) or model_default
+        language = _prompt("转写语言", language_default) or language_default
+        device = _prompt("推理设备 (auto/cpu/cuda)", device_default) or device_default
+        compute = _prompt("compute_type", compute_default) or compute_default
+        workers = _prompt_int("并发数量", workers_default)
+        run_params = [
+            "run_asr",
+            "--pattern",
+            pattern,
+            "--model",
+            model,
+            "--language",
+            language,
+            "--device",
+            device,
+            "--compute",
+            compute,
+            "--workers",
+            str(workers),
+        ]
+        rc = _run_deploy_cli(run_params)
+        if rc == 2:
+            return 2
+        if rc == 1 and severity == 0:
+            severity = 1
+
+    if do_fetch:
+        since = _prompt("仅下载指定 ISO 时间后的文件（可留空）", "").strip()
+        fetch_args = ["fetch_outputs"]
+        if since:
+            fetch_args.extend(["--since", since])
+        rc = _run_deploy_cli(fetch_args)
+        if rc == 2:
+            return 2
+        if rc == 1 and severity == 0:
+            severity = 1
+
+    verify_script = PROJ_ROOT / "scripts" / "verify_asr_words.py"
+    if verify_script.exists():
+        log_info("开始验证 ASR JSON words 字段。")
+        cmd = [sys.executable, str(verify_script)]
+        _print_command(cmd)
+        verify_rc = run_streamed(cmd, heartbeat_s=15.0, show_cmd=False)
+        if verify_rc == 2:
+            log_err("验证脚本返回 FAIL。")
+            return 2
+        if verify_rc == 1 and severity == 0:
+            severity = 1
+    else:
+        log_warn("未找到 scripts/verify_asr_words.py，跳过校验。")
+        if severity == 0:
+            severity = 1
+
+    if severity == 0:
+        log_ok("远程批量转写流程完成。")
+    elif severity == 1:
+        log_warn("流程包含 WARN，请根据日志检查。")
+    return severity
+
+
+def _interactive_asr_local() -> int:
     audio_dir = _prompt("音频目录", "data/audio")
     out_dir = _prompt("ASR JSON 输出目录", "data/asr-json")
     model = _prompt("whisper-ctranslate2 模型", "small")
@@ -1103,9 +1232,10 @@ def interactive_menu() -> int:
         print("8) 清理产物（按 stem 或全部）")
         print("9) 生成快照（冻结当前 out/）")
         print("A) 回滚到某次快照")
+        print("L) 本地批量转写（旧版 CLI）")
         choice = input("选择（0-9/A）: ").strip()
         if choice == "0":
-            _interactive_asr()
+            _interactive_deploy_asr()
             continue
         if choice == "1":
             _interactive_env_check()
@@ -1136,6 +1266,9 @@ def interactive_menu() -> int:
             continue
         if choice.lower() == "a":
             _interactive_rollback()
+            continue
+        if choice.lower() == "l":
+            _interactive_asr_local()
             continue
         log_warn("该选项尚未在菜单中实现，请使用命令行子命令。")
 

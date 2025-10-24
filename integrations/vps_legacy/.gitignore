@@ -1,0 +1,10 @@
+# 忽略旧项目的密钥、缓存与运行日志
+*.pem
+*.key
+*.crt
+*.log
+*.cache/
+.env
+.env.*
+**/secrets/
+**/tmp/
