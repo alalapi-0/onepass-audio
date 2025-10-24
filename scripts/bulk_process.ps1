@@ -14,6 +14,9 @@ pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 50 -Render -AudioRequired
 
 # 指定自定义配置
 pwsh -File .\scripts\bulk_process.ps1 -Config "config\my_config.json" -Render
+
+# 批处理前先自动转写音频生成 JSON
+pwsh -File .\scripts\bulk_process.ps1 -AutoASR -Aggressiveness 60 -Render
 !#>
 [CmdletBinding()]
 param(
@@ -23,7 +26,16 @@ param(
     [switch]$DryRun,
     [string]$Config = "config/default_config.json",
     [switch]$AudioRequired,
-    [string]$AudioExtPattern = "*.m4a,*.wav,*.mp3,*.flac"
+    [string]$AudioExtPattern = "*.m4a,*.wav,*.mp3,*.flac",
+    [switch]$AutoASR,
+    [string]$AsrModel,
+    [string]$AsrDevice,
+    [int]$AsrWorkers = 0,
+    [string]$AsrLanguage,
+    [string]$AsrComputeType,
+    [switch]$AsrNoVad,
+    [switch]$AsrOverwrite,
+    [switch]$AsrDryRun
 )
 
 Set-StrictMode -Version Latest
@@ -182,6 +194,34 @@ function Ensure-CommandExists {
     return $cmd
 }
 
+function Get-AsrArgumentList {
+    param(
+        [string[]]$Patterns
+    )
+    $args = @($asrScript)
+    if (Test-Path -LiteralPath $audioDir) {
+        $args += @('--audio-dir', (Resolve-Path -LiteralPath $audioDir).ProviderPath)
+    } else {
+        $args += @('--audio-dir', $audioDir)
+    }
+    if (-not (Test-Path -LiteralPath $asrDir)) {
+        New-Item -ItemType Directory -Path $asrDir -Force | Out-Null
+    }
+    $args += @('--out-dir', (Resolve-Path -LiteralPath $asrDir).ProviderPath)
+    if ($AsrModel) { $args += @('--model', $AsrModel) }
+    if ($AsrDevice) { $args += @('--device', $AsrDevice) }
+    if ($AsrLanguage) { $args += @('--language', $AsrLanguage) }
+    if ($AsrComputeType) { $args += @('--compute-type', $AsrComputeType) }
+    if ($AsrWorkers -gt 0) { $args += @('--workers', $AsrWorkers.ToString()) }
+    if ($AsrNoVad.IsPresent) { $args += '--no-vad' }
+    if ($AsrOverwrite.IsPresent) { $args += '--overwrite' }
+    if ($AsrDryRun.IsPresent) { $args += '--dry-run' }
+    if ($Patterns -and $Patterns.Count -gt 0) {
+        $args += @('--pattern', ($Patterns -join ','))
+    }
+    return $args
+}
+
 try {
     $pythonCmd = Ensure-CommandExists -Name 'python' -Friendly 'Python'
 } catch {
@@ -189,9 +229,15 @@ try {
     exit 1
 }
 
+$asrScript = Join-Path '.' 'scripts/asr_batch.py'
 $retakeScript = Join-Path '.' 'scripts/retake_keep_last.py'
 if (-not (Test-Path -LiteralPath $retakeScript)) {
     Write-Error "缺少脚本 $retakeScript"
+    exit 1
+}
+
+if ($AutoASR.IsPresent -and -not (Test-Path -LiteralPath $asrScript)) {
+    Write-Error "缺少脚本 $asrScript"
     exit 1
 }
 
@@ -211,29 +257,100 @@ if ($Render.IsPresent) {
     }
 }
 
+$audioDirExists = Test-Path -LiteralPath $audioDir
+if ($AutoASR.IsPresent) {
+    if (-not $audioDirExists) {
+        Write-Warning "启用了 AutoASR，但未找到音频目录：$audioDir"
+    } else {
+        $asrArgs = Get-AsrArgumentList -Patterns @()
+        $asrResult = Invoke-LoggedCommand -FilePath $pythonCmd.Source -ArgumentList $asrArgs
+        if ($asrResult.ExitCode -ne 0) {
+            Write-Warning ("自动 ASR 执行失败 (exit {0})" -f $asrResult.ExitCode)
+        }
+    }
+}
+
 $audioPatterns = $AudioExtPattern -split ','
 $summary = @()
 $overallStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$jsonFiles = Get-ChildItem -LiteralPath $asrDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object -Property BaseName
-if (-not $jsonFiles) {
-    Write-Host "未找到任何 JSON 文件：$asrDir"
+$jsonMap = @{}
+if (Test-Path -LiteralPath $asrDir) {
+    Get-ChildItem -LiteralPath $asrDir -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $jsonMap[$_.BaseName] = $_
+    }
+}
+$txtMap = @{}
+if (Test-Path -LiteralPath $txtDir) {
+    Get-ChildItem -LiteralPath $txtDir -Filter '*.txt' -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $txtMap[$_.BaseName] = $_
+    }
+}
+$stems = @($jsonMap.Keys + $txtMap.Keys | Sort-Object -Unique)
+if ($stems.Count -eq 0) {
+    Write-Host "未找到可处理的 JSON/TXT 素材。"
 }
 
-foreach ($jsonFile in $jsonFiles) {
-    $stem = $jsonFile.BaseName
+foreach ($stem in $stems) {
     Write-Host "===== 开始处理：$stem ====="
     $chapterMessages = @()
     $startedAt = [DateTime]::UtcNow
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    $jsonPath = (Resolve-Path -LiteralPath $jsonFile.FullName).ProviderPath
+    $jsonInfo = $null
+    if ($jsonMap.ContainsKey($stem)) { $jsonInfo = $jsonMap[$stem] }
+    $txtInfo = $null
+    if ($txtMap.ContainsKey($stem)) { $txtInfo = $txtMap[$stem] }
+
+    $jsonPath = Join-Path $asrDir "$stem.json"
+    $jsonExists = $false
+    if ($jsonInfo -and (Test-Path -LiteralPath $jsonInfo.FullName)) {
+        $jsonExists = $true
+        $jsonPath = (Resolve-Path -LiteralPath $jsonInfo.FullName).ProviderPath
+    }
+
     $txtPath = Join-Path $txtDir "$stem.txt"
+    $txtExists = $false
+    if ($txtInfo -and (Test-Path -LiteralPath $txtInfo.FullName)) {
+        $txtExists = $true
+        $txtPath = (Resolve-Path -LiteralPath $txtInfo.FullName).ProviderPath
+    }
+
     $audioPath = Get-AudioPath -Stem $stem -Patterns $audioPatterns
     $retakeExit = ''
     $renderExit = ''
     $status = 'OK'
 
-    if (-not (Test-Path -LiteralPath $txtPath)) {
+    if (-not $jsonExists) {
+        if ($AutoASR.IsPresent -and $audioPath) {
+            $singleArgs = Get-AsrArgumentList -Patterns @("$stem.*")
+            $singleResult = Invoke-LoggedCommand -FilePath $pythonCmd.Source -ArgumentList $singleArgs
+            if ($singleResult.ExitCode -eq 0) {
+                $candidate = Join-Path $asrDir "$stem.json"
+                if (Test-Path -LiteralPath $candidate) {
+                    $jsonExists = $true
+                    $jsonPath = (Resolve-Path -LiteralPath $candidate).ProviderPath
+                    $jsonMap[$stem] = Get-Item -LiteralPath $candidate
+                } else {
+                    $chapterMessages += 'auto ASR 完成但未找到生成的 JSON'
+                    $status = 'FAIL'
+                }
+            } else {
+                $status = 'FAIL'
+                $chapterMessages += ('auto ASR failed (exit {0})' -f $singleResult.ExitCode)
+                if ($singleResult.Output) {
+                    $chapterMessages += ($singleResult.Output -split "`n" | Select-Object -First 1)
+                }
+            }
+        } elseif ($AutoASR.IsPresent -and -not $audioPath) {
+            $chapterMessages += 'audio missing for auto ASR'
+            $status = 'FAIL'
+        } else {
+            $chapterMessages += 'ASR JSON missing'
+            $status = 'FAIL'
+        }
+    }
+
+    if (-not $txtExists) {
         $chapterMessages += 'original text missing'
         $status = 'FAIL'
     }
@@ -245,6 +362,13 @@ foreach ($jsonFile in $jsonFiles) {
         } else {
             $chapterMessages += 'audio missing'
         }
+    }
+
+    if (-not [IO.Path]::IsPathRooted($jsonPath)) {
+        $jsonPath = [IO.Path]::GetFullPath($jsonPath)
+    }
+    if (-not [IO.Path]::IsPathRooted($txtPath)) {
+        $txtPath = [IO.Path]::GetFullPath($txtPath)
     }
 
     $hasSrt = $false
@@ -264,8 +388,13 @@ foreach ($jsonFile in $jsonFiles) {
     $originalDuration = $null
     $outputDuration = $null
 
+    if ($status -ne 'FAIL' -and -not (Test-Path -LiteralPath $jsonPath)) {
+        $chapterMessages += 'ASR JSON missing before retake'
+        $status = 'FAIL'
+    }
+
     if ($status -ne 'FAIL') {
-        $originalResolved = (Resolve-Path -LiteralPath $txtPath).ProviderPath
+        $originalResolved = $txtPath
         $args = @('--json', $jsonPath, '--original', $originalResolved, '--outdir', $outDirFull, '--aggr', $Aggressiveness.ToString([System.Globalization.CultureInfo]::InvariantCulture))
         if (Test-Path -LiteralPath $Config) {
             $args += @('--config', (Resolve-Path -LiteralPath $Config).ProviderPath)

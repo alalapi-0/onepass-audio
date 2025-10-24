@@ -137,6 +137,46 @@ def handle_validate(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def handle_asr(args: argparse.Namespace) -> int:
+    """Handle the asr subcommand by delegating to scripts/asr_batch.py."""
+
+    script = PROJ_ROOT / "scripts" / "asr_batch.py"
+    if not check_script_exists(script, "#11"):
+        return 2
+
+    audio_dir = resolve_from_root(args.audio_dir)
+    out_dir = resolve_from_root(args.out_dir)
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--audio-dir",
+        str(audio_dir),
+        "--out-dir",
+        str(out_dir),
+        "--model",
+        args.model,
+        "--language",
+        args.language,
+        "--device",
+        args.device,
+        "--compute-type",
+        args.compute_type,
+        "--workers",
+        str(args.workers),
+    ]
+
+    if not args.vad:
+        cmd.append("--no-vad")
+    if args.overwrite:
+        cmd.append("--overwrite")
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    result = run_cmd(cmd)
+    return 0 if result.returncode == 0 else 2
+
+
 def _build_process_command(
     json_path: Path,
     original_path: Path,
@@ -230,14 +270,71 @@ def interactive_menu() -> int:
 
     while True:
         print_header("OnePass Audio · 主菜单")
+        print("0) 批量转写音频 → 生成 ASR JSON")
         print("1) 环境自检")
         print("2) 素材检查")
         print("3) 单章处理（去口癖 + 保留最后一遍 + 字幕/EDL/标记）")
         print("4) 仅渲染音频（按 EDL）")
         print("5) 退出")
-        choice = input("选择（1-5）: ").strip()
+        choice = input("选择（0-5）: ").strip()
 
-        if choice == "1":
+        if choice == "0":
+            script = PROJ_ROOT / "scripts" / "asr_batch.py"
+            if not check_script_exists(script, "#11"):
+                continue
+
+            audio_input = input("音频目录 [默认 data/audio]: ").strip() or "data/audio"
+            out_input = input("输出目录 [默认 data/asr-json]: ").strip() or "data/asr-json"
+            model_input = input("模型 (tiny/base/small/medium/large-v3) [默认 small]: ").strip() or "small"
+            language_input = input("语言 [默认 zh]: ").strip() or "zh"
+            device_input = input("设备 (auto/cpu/cuda) [默认 auto]: ").strip() or "auto"
+            compute_input = input("compute_type [默认 auto]: ").strip() or "auto"
+            workers_input = input("并发数量 [默认 1]: ").strip() or "1"
+            vad_input = input("启用 VAD？(Y/N) [默认 Y]: ").strip().lower()
+            overwrite_input = input("覆盖已存在 JSON？(Y/N) [默认 N]: ").strip().lower()
+            dry_run_input = input("仅打印命令（dry-run）？(Y/N) [默认 N]: ").strip().lower()
+
+            try:
+                workers_value = int(workers_input)
+            except ValueError:
+                print("[错误] 并发数量必须是整数。")
+                continue
+
+            if workers_value < 1:
+                print("[提示] 并发数量必须 ≥1，已自动设置为 1。")
+                workers_value = 1
+
+            cmd = [
+                sys.executable,
+                str(script),
+                "--audio-dir",
+                str(resolve_from_root(audio_input)),
+                "--out-dir",
+                str(resolve_from_root(out_input)),
+                "--model",
+                model_input,
+                "--language",
+                language_input,
+                "--device",
+                device_input,
+                "--compute-type",
+                compute_input,
+                "--workers",
+                str(workers_value),
+            ]
+
+            if vad_input.startswith("n"):
+                cmd.append("--no-vad")
+            if overwrite_input.startswith("y"):
+                cmd.append("--overwrite")
+            if dry_run_input.startswith("y"):
+                cmd.append("--dry-run")
+
+            result = run_cmd(cmd)
+            if result.returncode != 0:
+                print(f"[警告] 命令返回码：{result.returncode}")
+
+        elif choice == "1":
             script = PROJ_ROOT / "scripts" / "env_check.py"
             if not check_script_exists(script, "#4"):
                 continue
@@ -367,6 +464,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="强制音频素材也必须存在",
     )
     validate_parser.set_defaults(func=handle_validate)
+
+    asr_parser = subparsers.add_parser("asr", help="批量转写音频生成 ASR JSON")
+    asr_parser.add_argument("--audio-dir", default="data/audio", help="音频目录（默认 data/audio）")
+    asr_parser.add_argument("--out-dir", default="data/asr-json", help="输出目录（默认 data/asr-json）")
+    asr_parser.add_argument("--model", default="small", help="whisper-ctranslate2 模型（默认 small）")
+    asr_parser.add_argument("--language", default="zh", help="转写语言（默认 zh，可设 auto）")
+    asr_parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="推理设备：auto|cpu|cuda（默认 auto）",
+    )
+    asr_parser.add_argument("--compute-type", default="auto", help="compute_type 参数（默认 auto）")
+    asr_parser.add_argument("--workers", type=int, default=1, help="并发数量（默认 1）")
+    asr_parser.add_argument("--vad", dest="vad", action="store_true", default=True, help="启用 VAD（默认）")
+    asr_parser.add_argument("--no-vad", dest="vad", action="store_false", help="禁用 VAD")
+    asr_parser.add_argument("--overwrite", action="store_true", help="覆盖已存在的 JSON")
+    asr_parser.add_argument("--dry-run", action="store_true", help="仅打印命令不执行")
+    asr_parser.set_defaults(func=handle_asr)
 
     process_parser = subparsers.add_parser("process", help="处理单章音频并生成字幕/EDL")
     process_parser.add_argument("--json", required=True, help="ASR JSON 文件路径")
