@@ -191,6 +191,33 @@ python scripts/verify_asr_words.py
 - **PATH/虚拟环境**：可在 `deploy/vps.env` 中设置 `VPS_VENV_ACTIVATE` 或在 legacy 项目脚本内自行处理；
 - **后台日志位置**：建议在旧项目脚本里输出 tmux/session 名称，方便排查远端 whisper 进程。
 
+## 远端直读本地音频（SSHFS 反向隧道）
+
+当你希望远端 VPS 直接读取本地 `data/audio/` 而无需上传时，可将 provider 切换为 `sshfs`。流程依赖 Windows OpenSSH Server 与反向 SSH 隧道：
+
+```powershell
+# 1) 本地建立反向隧道（首次启用 OpenSSH Server）
+pwsh -File .\deploy\sshfs\local_reverse_tunnel.ps1
+
+# 2) 远端挂载你的本地 data/audio
+ssh -i C:\Users\ASUS\.ssh\id_rsa ubuntu@your.vps.ip "bash -lc 'cd onepass && bash deploy/sshfs/remote_mount_local.sh'"
+
+# 3) 运行批量转写（远端直接读挂载路径）
+python scripts/deploy_cli.py provider --set sshfs
+python scripts/deploy_cli.py run_asr --workers 1
+
+# 4) 拉回 JSON 并校验词级时间戳
+python scripts/deploy_cli.py fetch_outputs
+python scripts/verify_asr_words.py
+```
+
+注意事项：
+
+- 本地电脑需保持在线，网络波动可能导致 sshfs 掉线（脚本使用 `reconnect` 选项自动重连）；
+- Windows 必须启用 **OpenSSH Server**，并在用户主目录下创建指向 `E:\onepass\data\audio` 的目录联结（`local_reverse_tunnel.ps1` 会自动处理）；
+- 反向隧道依赖 `ssh -R` 暴露本地 22 端口，首次需要放行防火墙并启动 `sshd` 服务；
+- 如果更偏好“上传到云端再跑”，可执行 `python scripts/deploy_cli.py provider --set builtin` 切换回默认流程。
+
 ## 素材准备与验证
 
 素材需按 stem（不含扩展名）对齐放置在 `data/` 目录下，常见示例如下：
