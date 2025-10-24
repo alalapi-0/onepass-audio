@@ -21,6 +21,13 @@ from .retake import find_retake_keeps
 from .segment import to_segments
 from .types import Paths, Stats, ensure_outdir
 from .writers import write_plain, write_srt, write_vtt
+from .ux import ts
+
+
+def _log(verbose: bool, message: str) -> None:
+    if not verbose:
+        return
+    print(f"[{ts()}] {message}", flush=True)
 
 
 def run_once(
@@ -29,9 +36,12 @@ def run_once(
     aggr: int = 50,
     config_path: Path | None = None,
     cfg_overrides: Optional[Dict[str, Any]] = None,
+    verbose: bool | int = True,
 ) -> dict[str, Any]:
     """执行单次处理流程并返回输出信息。"""
 
+    verbose_flag = bool(verbose)
+    _log(verbose_flag, f"开始处理 {stem}")
     cfg = load_config(config_path)
     if cfg_overrides:
         for key, value in cfg_overrides.items():
@@ -40,17 +50,51 @@ def run_once(
 
     ensure_outdir(paths.outdir)
 
+    _log(verbose_flag, "加载词序列…")
     words = load_words(paths.json)
+    _log(verbose_flag, f"加载词序列完成（{len(words)} 词）")
+    _log(verbose_flag, "读取原始文本…")
     original_text = paths.original.read_text("utf-8")
+    _log(verbose_flag, f"读取原始文本完成（{len(original_text)} 字符）")
 
-    keeps, retake_cuts, diff_items = find_retake_keeps(words, original_text, cfg)
+    progress_state = {"last": 0, "total": 0}
+
+    def _progress(done: int, total: int) -> None:
+        progress_state["last"] = done
+        progress_state["total"] = total
+        if not verbose:
+            return
+        _log(True, f"句级对齐进度：{done}/{total} 句")
+
+    _log(verbose_flag, "开始句级对齐…")
+    keeps, retake_cuts, diff_items = find_retake_keeps(
+        words,
+        original_text,
+        cfg,
+        progress_cb=_progress,
+    )
+    if verbose_flag and progress_state["total"] and progress_state["last"] < progress_state["total"]:
+        _log(True, f"句级对齐进度：{progress_state['total']}/{progress_state['total']} 句")
+    _log(verbose_flag, f"判定重录完成（删除 {len(retake_cuts)} 段，保留 {len(keeps)} 段）")
+
+    _log(verbose_flag, "移除口癖…")
     words_for_subs = remove_fillers(words, cfg, strict=cfg.get("filler_strict", False))
+    filler_removed = max(0, len(words) - len(words_for_subs))
+    _log(verbose_flag, f"去口癖完成（移除 {filler_removed} 词）")
+
+    _log(verbose_flag, "生成断句段落…")
     segs = to_segments(words_for_subs, cfg)
+    _log(verbose_flag, f"断句完成（{len(segs)} 段）")
+
+    _log(verbose_flag, "生成 EDL…")
     edl_actions = build_edl(words, retake_cuts, keeps, cfg)
+    cut_count = sum(1 for action in edl_actions if action.type == "cut")
+    tighten_count = sum(1 for action in edl_actions if action.type == "tighten_pause")
+    _log(verbose_flag, f"生成 EDL 完成（cut {cut_count} / tighten {tighten_count}）")
 
     stats = Stats()
     stats.total_words = len(words)
-    stats.filler_removed = max(0, len(words) - len(words_for_subs))
+    stats.filler_removed = filler_removed
     stats.retake_cuts = sum(1 for action in edl_actions if action.type == "cut")
     stats.long_pauses = sum(1 for action in edl_actions if action.type == "tighten_pause")
     stats.duplicated_sentences = sum(len(item.get("deleted", [])) for item in diff_items)
@@ -68,8 +112,7 @@ def run_once(
     edl_path = paths.outdir / f"{stem}.keepLast.edl.json"
     marker_path = paths.outdir / f"{stem}.keepLast.audition_markers.csv"
     log_path = paths.outdir / f"{stem}.keepLast.log"
-    diff_path = write_diff_markdown(stem, diff_items, paths.outdir)
-
+    _log(verbose_flag, "写出字幕、标记与日志…")
     write_srt(segs, srt_path)
     write_vtt(segs, vtt_path)
     write_plain(segs, txt_path)
@@ -101,8 +144,11 @@ def run_once(
         "edl": str(edl_path),
         "markers": str(marker_path),
         "log": str(log_path),
-        "diff": str(diff_path),
     }
+    _log(verbose_flag, "写出差异报告…")
+    diff_path = write_diff_markdown(stem, diff_items, paths.outdir)
+    outputs["diff"] = str(diff_path)
+    _log(verbose_flag, "处理完成")
     return {"outputs": outputs, "stats": asdict(stats), "keeps": [asdict(k) for k in keeps]}
 
 

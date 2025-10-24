@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 from .align import MatchTuple, find_sentence_matches, refine_with_dp_if_needed
 from .textnorm import SentencePiece, split_sentences
@@ -95,11 +95,20 @@ def _build_diff_item(
 
 
 def find_retake_keeps(
-    words: List[Word], original_text: str, cfg: dict
+    words: List[Word],
+    original_text: str,
+    cfg: dict,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> Tuple[List[KeepSpan], List[Tuple[float, float]], List[dict]]:
-    """根据原文句子查找需保留的朗读窗口及重录剪切区间。"""
+    """根据原文句子查找需保留的朗读窗口及重录剪切区间。
+
+    :param progress_cb: 可选回调，用于报告已处理句数与总句数。
+    """
 
     sentences = split_sentences(original_text, cfg)
+    total_sentences = len(sentences)
+    if progress_cb and total_sentences == 0:
+        progress_cb(0, 0)
     keeps: list[KeepSpan] = []
     retake_cuts: list[tuple[float, float]] = []
     diff_items: list[dict] = []
@@ -109,9 +118,11 @@ def find_retake_keeps(
         logger.warning("unknown overlap_keep=%s, fallback to 'last'", keep_mode)
         keep_mode = "last"
 
-    for piece in sentences:
+    for index, piece in enumerate(sentences, 1):
         raw_matches = find_sentence_matches(words, piece.norm, cfg)
         if not raw_matches:
+            if progress_cb and (index % 50 == 0 or index == total_sentences):
+                progress_cb(index, total_sentences)
             continue
         refined: list[MatchInfo] = []
         for match in raw_matches:
@@ -126,6 +137,8 @@ def find_retake_keeps(
         for occ in deleted:
             retake_cuts.append((occ.start, occ.end))
         diff_items.append(_build_diff_item(piece, kept, deleted, keep_mode))
+        if progress_cb and (index % 50 == 0 or index == total_sentences):
+            progress_cb(index, total_sentences)
 
     keeps.sort(key=lambda span: (span.start, span.end))
     retake_cuts.sort()
