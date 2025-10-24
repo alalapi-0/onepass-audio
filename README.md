@@ -110,6 +110,31 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 若对应脚本尚未生成，会显示友好提示而不会直接报错退出。
 
+## 从音频到 ASR JSON
+
+当原始音频已准备就绪但尚未生成词级 ASR JSON 时，可使用 `scripts/asr_batch.py` 批量调用 whisper-ctranslate2 完成转写。该脚本默认扫描 `data/audio/`，并在 `data/asr-json/` 下生成 `<stem>.json`。运行前需确保已安装 `ffmpeg` 与 `whisper-ctranslate2`（可通过步骤 #3 的 `scripts/install_deps.ps1` 安装）。
+
+常用命令示例：
+
+```bash
+# 最简单（CPU）
+python scripts/asr_batch.py
+
+# GPU + medium 模型 + 2 并发
+python scripts/asr_batch.py --model medium --device cuda --workers 2
+```
+
+生成的 JSON 文件会放在 `data/asr-json/<stem>.json`，并与 `data/original_txt/<stem>.txt` 搭配使用。
+
+ASR 工具也已接入主程序与批处理流程：
+
+```bash
+python onepass_main.py asr --audio-dir data/audio --out-dir data/asr-json
+pwsh -File .\scripts\bulk_process.ps1 -AutoASR
+```
+
+主程序子命令 `asr` 会转调用 `scripts/asr_batch.py`，支持常用参数；批处理脚本开启 `-AutoASR` 后会在缺少 JSON 时自动转写音频，再继续执行去口癖、字幕和渲染流程。
+
 ## 素材准备与验证
 
 素材需按 stem（不含扩展名）对齐放置在 `data/` 目录下，常见示例如下：
