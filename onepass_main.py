@@ -90,6 +90,23 @@ def _prompt(text: str, default: str | None = None) -> str:
     return input(prompt).strip() or (default or "")
 
 
+def _first_matching_file(directory: Path, pattern: str, fallback: str) -> str:
+    """Return the first matching file path relative to project root."""
+
+    if not directory.is_absolute():
+        directory = PROJ_ROOT / directory
+    if not directory.exists():
+        return fallback
+    matches = sorted(directory.glob(pattern))
+    if not matches:
+        return fallback
+    try:
+        rel = matches[0].resolve().relative_to(PROJ_ROOT)
+        return rel.as_posix()
+    except ValueError:
+        return matches[0].as_posix()
+
+
 def _prompt_bool(text: str, default: bool = False) -> bool:
     suffix = "Y/n" if default else "y/N"
     while True:
@@ -835,9 +852,21 @@ def _interactive_validate() -> int:
 
 
 def _interactive_process() -> int:
-    json_path = _prompt("ASR JSON 路径", "data/asr-json/001.json")
+    default_json = _first_matching_file(Path("data/asr-json"), "*.json", "data/asr-json/001.json")
+    json_path = _prompt("ASR JSON 路径", default_json)
     stem = Path(json_path).stem
-    default_original = f"data/original_txt/{stem}.txt" if stem else "data/original_txt/001.txt"
+    if stem:
+        candidate_original = Path("data/original_txt") / f"{stem}.txt"
+        if (PROJ_ROOT / candidate_original).exists():
+            default_original = candidate_original.as_posix()
+        else:
+            default_original = _first_matching_file(
+                Path("data/original_txt"), "*.txt", "data/original_txt/001.txt"
+            )
+    else:
+        default_original = _first_matching_file(
+            Path("data/original_txt"), "*.txt", "data/original_txt/001.txt"
+        )
     original_path = _prompt("原始文本路径", default_original)
     outdir = _prompt("输出目录", "out")
     aggr = _prompt_int("去口癖力度 (0-100)", 50)
