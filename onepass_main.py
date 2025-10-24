@@ -88,6 +88,16 @@ def _run_deploy_cli(args: list[str], heartbeat: float = 45.0) -> int:
     return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
 
 
+def _run_vultr_cli(subcommand: str, heartbeat: float = 45.0) -> int:
+    script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}，请确认已更新仓库。")
+        return 2
+    cmd = [sys.executable, str(script), subcommand]
+    _print_command(cmd)
+    return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
+
+
 def _make_common_parent() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     group = parent.add_mutually_exclusive_group()
@@ -1189,6 +1199,42 @@ def _interactive_snapshot() -> int:
     return handle_snapshot(args)
 
 
+def _interactive_vultr_wizard() -> None:
+    script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
+    env_file = script.with_name("vultr.env")
+    if not script.exists():
+        log_err(f"未找到 Vultr 向导脚本：{_rel_to_root(script)}")
+        return
+    while True:
+        print("\n==================== 云端部署（Vultr）向导 ====================")
+        print("1) 检查本机环境（Windows/macOS）")
+        print("2) 创建 VPS（Vultr）")
+        print("3) 准备本机接入 VPS 网络")
+        print("4) 检查账户中的 Vultr 实例")
+        print("Q) 返回主菜单")
+        choice = input("选择（1-4 / Q 返回）: ").strip().lower()
+        if choice in {"q", ""}:
+            log_info("已返回主菜单。")
+            return
+        if choice not in {"1", "2", "3", "4"}:
+            log_warn("无效选项，请重新输入。")
+            continue
+        if choice in {"2", "3", "4"} and not env_file.exists():
+            log_err(
+                "未检测到 vultr.env，请先复制 deploy/cloud/vultr/vultr.env.example 并填写后再试。"
+            )
+            continue
+        subcommand = {
+            "1": "env-check",
+            "2": "create",
+            "3": "prepare-local",
+            "4": "list",
+        }[choice]
+        rc = _run_vultr_cli(subcommand)
+        if rc != 0:
+            log_warn(f"命令返回码：{rc}，请根据日志检查。")
+
+
 def _interactive_rollback() -> int:
     recent = _list_recent_snapshots()
     if recent:
@@ -1225,6 +1271,7 @@ def _interactive_rollback() -> int:
 def interactive_menu() -> int:
     section("OnePass Audio · 主菜单")
     while True:
+        print("V) 云端部署（Vultr）向导（四步式）")
         print("0) 批量转写音频（本地/云端一键流程）")
         print("1) 环境自检")
         print("2) 素材检查")
@@ -1236,7 +1283,10 @@ def interactive_menu() -> int:
         print("8) 清理产物（按 stem 或全部）")
         print("9) 生成快照（冻结当前 out/）")
         print("A) 回滚到某次快照")
-        choice = input("选择（0-9/A）: ").strip()
+        choice = input("选择（0-9/A/V）: ").strip()
+        if choice.lower() == "v":
+            _interactive_vultr_wizard()
+            continue
         if choice == "0":
             _interactive_deploy_asr()
             continue
