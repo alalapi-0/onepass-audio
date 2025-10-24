@@ -31,6 +31,7 @@ class CheckOutcome:
     status: str
     detail: str
     fix: str
+    data: dict | None = None
 
     @property
     def ok(self) -> bool:
@@ -56,6 +57,8 @@ def run_command(args: Sequence[str]) -> tuple[int, str, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         return completed.returncode, completed.stdout.strip(), completed.stderr.strip()
     except FileNotFoundError:
@@ -164,7 +167,13 @@ def check_whisper_cli() -> CheckOutcome:
 
     detail = "；".join(errors)
     fix = "请安装 whisper-ctranslate2，例如运行 python -m pip install whisper-ctranslate2"
-    return CheckOutcome("whisper-ctranslate2 CLI", "FAIL", detail, fix)
+    return CheckOutcome(
+        "whisper-ctranslate2 CLI",
+        "FAIL",
+        detail,
+        fix,
+        data={"install": ["whisper-ctranslate2"]},
+    )
 
 
 def check_python_dependencies() -> CheckOutcome:
@@ -190,10 +199,66 @@ def check_python_dependencies() -> CheckOutcome:
     if missing:
         detail = "缺少依赖：" + ", ".join(missing)
         fix = "请运行 python -m pip install -r requirements.txt"
-        return CheckOutcome("Python 依赖导入", "FAIL", detail, fix)
+        return CheckOutcome(
+            "Python 依赖导入",
+            "FAIL",
+            detail,
+            fix,
+            data={"missing": missing},
+        )
 
     detail = "，".join(infos) if infos else "依赖已导入"
     return CheckOutcome("Python 依赖导入", "OK", detail, "无需操作")
+
+
+def run_all_checks() -> List[CheckOutcome]:
+    """Execute every environment check and return their outcomes."""
+
+    return [
+        check_python_version(),
+        check_pip(),
+        check_virtual_env(),
+        check_ffmpeg(),
+        check_whisper_cli(),
+        check_python_dependencies(),
+    ]
+
+
+def attempt_auto_fix(outcomes: List[CheckOutcome]) -> bool:
+    """Try to automatically resolve known failure cases.
+
+    Returns True when at least one fix command was executed.
+    """
+
+    executed = False
+
+    for item in outcomes:
+        if item.status == "OK":
+            continue
+
+        if item.name == "Python 依赖导入" and item.data and item.data.get("missing"):
+            missing = list(dict.fromkeys(item.data["missing"]))
+            print(f"[AUTO] 尝试安装缺失依赖：{', '.join(missing)}")
+            code, _, stderr = run_command([sys.executable, "-m", "pip", "install", *missing])
+            if code == 0:
+                print("[AUTO] 缺失依赖安装完成")
+            else:
+                print(f"[AUTO] 缺失依赖安装失败：{stderr}")
+            executed = True
+            continue
+
+        if item.name == "whisper-ctranslate2 CLI" and item.data:
+            packages = item.data.get("install") or []
+            if packages:
+                print(f"[AUTO] 尝试安装 {', '.join(packages)}")
+                code, _, stderr = run_command([sys.executable, "-m", "pip", "install", *packages])
+                if code == 0:
+                    print("[AUTO] whisper-ctranslate2 安装完成")
+                else:
+                    print(f"[AUTO] whisper-ctranslate2 安装失败：{stderr}")
+                executed = True
+
+    return executed
 
 
 def build_markdown_report(timestamp: str, outcomes: List[CheckOutcome]) -> str:
@@ -252,14 +317,11 @@ def main() -> int:
 
     ensure_out_dir()
     timestamp = datetime.now().isoformat()
-    outcomes = [
-        check_python_version(),
-        check_pip(),
-        check_virtual_env(),
-        check_ffmpeg(),
-        check_whisper_cli(),
-        check_python_dependencies(),
-    ]
+    outcomes = run_all_checks()
+    if attempt_auto_fix(outcomes):
+        print("[AUTO] 自动修复已执行，重新检查环境……")
+        outcomes = run_all_checks()
+        timestamp = datetime.now().isoformat()
     print_console(outcomes)
 
     json_report = build_json_report(timestamp, outcomes)
