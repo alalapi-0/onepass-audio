@@ -42,6 +42,25 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
+## 环境自检与一键安装
+
+以下脚本帮助快速核对运行环境并自动安装缺失依赖：
+
+```bash
+# 运行环境自检（生成 out/env_report.*）
+python scripts/env_check.py
+
+# PowerShell 7+ 一键安装（ffmpeg + Python 依赖）
+pwsh -File .\scripts\install_deps.ps1
+
+# 如果遇到执行策略限制，可临时放行当前会话
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+```
+
+环境自检会在终端输出每项检测结果，并写入 `out/env_report.json` 与 `out/env_report.md`。退出码含义如下：`0=全部 OK`，`1=存在 WARN（如未启用虚拟环境）`，`2=存在 FAIL（如缺少 ffmpeg 或依赖）`。
+
+`scripts/install_deps.ps1` 会优先使用 `winget`（备用：Chocolatey）安装 ffmpeg，并调用 `python -m pip install -r requirements.txt`。该脚本可多次执行，若依赖已满足会提示“已安装”。ffmpeg 是后续音频渲染及切片脚本的基础工具，缺失会导致相关命令无法运行。
+
 ## 使用示例
 
 ```bash
