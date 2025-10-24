@@ -36,6 +36,14 @@ DEFAULT_CFG: dict = {
     "long_silence_s": 0.8,
     "retake_sim_threshold": 0.88,
     "tighten_target_ms": 300,
+    "sentence_min_chars": 6,
+    "align_min_sim": 0.84,
+    "align_window_expand_ratio": 0.35,
+    "align_strategy": "hybrid",
+    "align_dp_max_chars": 200,
+    "overlap_keep": "last",
+    "punct_insensitive": True,
+    "case_insensitive": True,
 }
 
 

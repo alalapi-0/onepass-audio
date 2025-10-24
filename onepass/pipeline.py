@@ -8,12 +8,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional
 
 from .aggr import map_aggr
 from .asr_loader import load_words
 from .clean import remove_fillers
 from .config import load_config
+from .diffreport import write_diff_markdown
 from .edl import build_edl, edl_to_json
 from .markers import write_audition_markers
 from .retake import find_retake_keeps
@@ -22,10 +23,19 @@ from .types import Paths, Stats, ensure_outdir
 from .writers import write_plain, write_srt, write_vtt
 
 
-def run_once(stem: str, paths: Paths, aggr: int = 50, config_path: Path | None = None) -> dict[str, Any]:
+def run_once(
+    stem: str,
+    paths: Paths,
+    aggr: int = 50,
+    config_path: Path | None = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
     """执行单次处理流程并返回输出信息。"""
 
     cfg = load_config(config_path)
+    if cfg_overrides:
+        for key, value in cfg_overrides.items():
+            cfg[key] = value
     cfg = map_aggr(aggr, cfg)
 
     ensure_outdir(paths.outdir)
@@ -33,16 +43,17 @@ def run_once(stem: str, paths: Paths, aggr: int = 50, config_path: Path | None =
     words = load_words(paths.json)
     original_text = paths.original.read_text("utf-8")
 
-    keeps, retake_cuts = find_retake_keeps(words, original_text, cfg)
+    keeps, retake_cuts, diff_items = find_retake_keeps(words, original_text, cfg)
     words_for_subs = remove_fillers(words, cfg, strict=cfg.get("filler_strict", False))
     segs = to_segments(words_for_subs, cfg)
-    edl_actions = build_edl(words, retake_cuts, cfg)
+    edl_actions = build_edl(words, retake_cuts, keeps, cfg)
 
     stats = Stats()
     stats.total_words = len(words)
     stats.filler_removed = max(0, len(words) - len(words_for_subs))
     stats.retake_cuts = sum(1 for action in edl_actions if action.type == "cut")
     stats.long_pauses = sum(1 for action in edl_actions if action.type == "tighten_pause")
+    stats.duplicated_sentences = sum(len(item.get("deleted", [])) for item in diff_items)
     for action in edl_actions:
         duration_ms = int(round(max(0.0, (action.end - action.start) * 1000)))
         if action.type == "cut":
@@ -57,6 +68,7 @@ def run_once(stem: str, paths: Paths, aggr: int = 50, config_path: Path | None =
     edl_path = paths.outdir / f"{stem}.keepLast.edl.json"
     marker_path = paths.outdir / f"{stem}.keepLast.audition_markers.csv"
     log_path = paths.outdir / f"{stem}.keepLast.log"
+    diff_path = write_diff_markdown(stem, diff_items, paths.outdir)
 
     write_srt(segs, srt_path)
     write_vtt(segs, vtt_path)
@@ -73,6 +85,12 @@ def run_once(stem: str, paths: Paths, aggr: int = 50, config_path: Path | None =
         f"long_pauses: {stats.long_pauses}",
         f"shortened_ms: {stats.shortened_ms}",
         f"keeps: {len(keeps)}",
+        f"duplicated_sentences: {stats.duplicated_sentences}",
+        (
+            "overlap_keep = "
+            f"{cfg.get('overlap_keep', 'last')}, align_strategy = {cfg.get('align_strategy', 'hybrid')}, "
+            f"align_min_sim = {cfg.get('align_min_sim', 0.84)}"
+        ),
     ]
     log_path.write_text("\n".join(log_lines) + "\n", "utf-8")
 
@@ -83,6 +101,7 @@ def run_once(stem: str, paths: Paths, aggr: int = 50, config_path: Path | None =
         "edl": str(edl_path),
         "markers": str(marker_path),
         "log": str(log_path),
+        "diff": str(diff_path),
     }
     return {"outputs": outputs, "stats": asdict(stats), "keeps": [asdict(k) for k in keeps]}
 

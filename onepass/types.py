@@ -68,6 +68,7 @@ class Stats:
     retake_cuts: int = 0
     long_pauses: int = 0
     shortened_ms: int = 0
+    duplicated_sentences: int = 0
 
 
 def ensure_outdir(p: Path) -> None:
