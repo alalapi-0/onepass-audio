@@ -98,6 +98,18 @@ def _run_vultr_cli(subcommand: str, heartbeat: float = 45.0) -> int:
     return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
 
 
+def _ensure_sync_env() -> bool:
+    sync_env = PROJ_ROOT / "deploy" / "sync" / "sync.env"
+    if sync_env.exists():
+        return True
+    log_warn("未检测到 deploy/sync/sync.env，尝试自动生成……")
+    rc = _run_vultr_cli("write-sync-env")
+    if rc != 0:
+        log_err("生成 sync.env 失败，请检查输出后重试。")
+        return False
+    return True
+
+
 def _make_common_parent() -> argparse.ArgumentParser:
     parent = argparse.ArgumentParser(add_help=False)
     group = parent.add_mutually_exclusive_group()
@@ -1211,18 +1223,33 @@ def _interactive_vultr_wizard() -> None:
         print("2) 创建 VPS（Vultr）")
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
+        print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
         print("Q) 返回主菜单")
-        choice = input("选择（1-4 / Q 返回）: ").strip().lower()
+        choice = input("选择（1-5 / Q 返回）: ").strip().lower()
         if choice in {"q", ""}:
             log_info("已返回主菜单。")
             return
-        if choice not in {"1", "2", "3", "4"}:
+        if choice not in {"1", "2", "3", "4", "5"}:
             log_warn("无效选项，请重新输入。")
             continue
         if choice in {"2", "3", "4"} and not env_file.exists():
             log_err(
                 "未检测到 vultr.env，请先复制 deploy/cloud/vultr/vultr.env.example 并填写后再试。"
             )
+            continue
+        if choice == "5":
+            if not env_file.exists():
+                log_err("缺少 vultr.env，无法运行一键桥接。")
+                continue
+            if not _ensure_sync_env():
+                continue
+            rc = _run_vultr_cli("asr-bridge", heartbeat=90.0)
+            if rc == 0:
+                log_ok("一键桥接完成，verify_asr_words.py 返回 OK。")
+            elif rc == 1:
+                log_warn("一键桥接完成但存在警告（可能部分 JSON 缺少 words）。请检查日志。")
+            else:
+                log_err(f"一键桥接失败（返回码 {rc}）。")
             continue
         subcommand = {
             "1": "env-check",

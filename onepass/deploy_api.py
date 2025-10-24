@@ -569,6 +569,9 @@ class _SyncProvider:
             "ASR_COMPUTE": compute,
             "ASR_WORKERS": str(workers),
         }
+        overwrite_flag = os.environ.get("ASR_OVERWRITE")
+        if overwrite_flag:
+            overrides["ASR_OVERWRITE"] = overwrite_flag
         env = self._make_env(overrides)
         remote_env_parts = []
         for key, value in env.items():
@@ -599,13 +602,13 @@ class _SyncProvider:
         since_iso: str | None = None,
         dry_run: bool = False,
     ) -> int:
-        if since_iso:
-            log_warn("sync provider 暂不支持 --since 过滤，将完整增量拉取。")
         overrides = {}
         env = self._make_env(overrides)
         cmd = [self._pwsh or "pwsh", "-File", str(self._fetch_script)]
         if dry_run:
             cmd.append("-DryRun")
+        if since_iso:
+            cmd.extend(["-Since", since_iso])
         log_info(f"执行：{format_cmd(cmd)}")
         return run_streamed(cmd, cwd=PROJ_ROOT, env=env)
 
