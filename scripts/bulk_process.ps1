@@ -29,6 +29,7 @@ param(
     [ValidateRange(0,100)]
     [int]$Aggressiveness = 50,
     [switch]$Render,
+    [switch]$Snapshot,
     [switch]$Regen,
     [switch]$HardDelete,
     [switch]$DryRun,
@@ -246,6 +247,7 @@ try {
 $asrScript = Join-Path '.' 'scripts/asr_batch.py'
 $retakeScript = Join-Path '.' 'scripts/retake_keep_last.py'
 $cleanScript = Join-Path '.' 'scripts/clean_outputs.py'
+$snapshotScript = Join-Path '.' 'scripts/snapshot.py'
 if (-not (Test-Path -LiteralPath $retakeScript)) {
     Write-Error "缺少脚本 $retakeScript"
     exit 1
@@ -258,6 +260,11 @@ if ($Regen.IsPresent -and -not (Test-Path -LiteralPath $cleanScript)) {
 
 if ($AutoASR.IsPresent -and -not (Test-Path -LiteralPath $asrScript)) {
     Write-Error "缺少脚本 $asrScript"
+    exit 1
+}
+
+if ($Snapshot.IsPresent -and -not (Test-Path -LiteralPath $snapshotScript)) {
+    Write-Error "缺少脚本 $snapshotScript"
     exit 1
 }
 
@@ -627,10 +634,36 @@ $mdLines += '- 路径包含中文或空格：请使用引号或切换至英文�
 
 $mdLines | Set-Content -Path $summaryMdPath -Encoding UTF8
 
+$finalExit = 0
 if ($failCount -gt 0) {
-    exit 2
+    $finalExit = 2
 } elseif ($warnCount -gt 0) {
-    exit 1
-} else {
-    exit 0
+    $finalExit = 1
 }
+
+if ($Snapshot.IsPresent -and -not $DryRun.IsPresent) {
+    Write-Host "===== 创建快照 ====="
+    $note = ('bulk run: aggr={0} render={1} regen={2}' -f $Aggressiveness, $Render.IsPresent, $Regen.IsPresent)
+    $snapshotArgs = @($snapshotScript, '--what', 'all', '--note', $note)
+    $snapResult = Invoke-LoggedCommand -FilePath $pythonCmd.Source -ArgumentList $snapshotArgs
+    if ($snapResult.ExitCode -ne 0) {
+        Write-Warning ("快照命令失败 (exit {0})" -f $snapResult.ExitCode)
+    } else {
+        $match = [regex]::Match(
+            $snapResult.Output,
+            'SNAPSHOT_ID\s+(\S+)\s+(.+)',
+            [System.Text.RegularExpressions.RegexOptions]::Multiline
+        )
+        if ($match.Success) {
+            $snapshotId = $match.Groups[1].Value
+            $snapshotPath = $match.Groups[2].Value.Trim()
+            Write-Host ("SNAPSHOT_ID: {0}" -f $snapshotId)
+            Write-Host ("SNAPSHOT_PATH: {0}" -f $snapshotPath)
+        }
+    }
+    if ($snapResult.ExitCode -gt $finalExit) {
+        $finalExit = $snapResult.ExitCode
+    }
+}
+
+exit $finalExit
