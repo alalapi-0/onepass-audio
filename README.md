@@ -153,6 +153,20 @@ python scripts/retake_keep_last.py --json data/asr-json/001.json \
 
 以上命令会生成字幕（SRT/VTT/TXT）、EDL、Audition 标记及日志，但不会触碰音频；移除 `--dry-run` 即可按配置执行收紧静音等修改。
 
+```bash
+# 更激进的句级对齐与去重（对读错但相似的整句也会识别为重复，保留最后一遍）
+python scripts/retake_keep_last.py --json data/asr-json/003.json \
+  --original data/original_txt/003.txt --outdir out --aggr 60 \
+  --align-mode hybrid --align-sim 0.86 --keep last
+
+# 只想保留得分最高的一遍（非常严格的内容对齐）
+python scripts/retake_keep_last.py --json data/asr-json/004.json \
+  --original data/original_txt/004.txt --outdir out --aggr 50 \
+  --align-mode accurate --align-sim 0.90 --keep best
+```
+
+执行后会额外生成 `*.diff.md` 差异报告，逐句列出保留的朗读与删除的重录明细，方便人工复核。
+
 ### 渲染
 
 ```bash

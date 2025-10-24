@@ -15,6 +15,7 @@ PROJ_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
+from onepass.config import load_config
 from onepass.pipeline import run_once
 from onepass.types import Paths
 
@@ -59,6 +60,21 @@ def parse_args() -> argparse.Namespace:
         help="自定义配置文件路径，默认 config/default_config.json。文件不存在时退回默认配置。",
     )
     parser.add_argument("--dry-run", action="store_true", help="仅生成字幕/EDL/标记，不触碰音频")
+    parser.add_argument(
+        "--align-mode",
+        choices=["fast", "accurate", "hybrid"],
+        help="句级对齐策略，默认为配置文件中的 align_strategy",
+    )
+    parser.add_argument(
+        "--align-sim",
+        type=float,
+        help="句级匹配最低相似度阈值，覆盖配置中的 align_min_sim",
+    )
+    parser.add_argument(
+        "--keep",
+        choices=["last", "best"],
+        help="重复句保留策略，覆盖配置中的 overlap_keep",
+    )
     return parser.parse_args()
 
 
@@ -134,7 +150,25 @@ def main() -> int:
         stem = json_path.stem
         paths = Paths(json=json_path, original=original_path, outdir=outdir)
 
-        result = run_once(stem, paths, aggr=aggr, config_path=config_path)
+        overrides: Dict[str, Any] = {}
+        if args.align_mode:
+            overrides["align_strategy"] = args.align_mode
+        if args.align_sim is not None:
+            overrides["align_min_sim"] = float(args.align_sim)
+        if args.keep:
+            overrides["overlap_keep"] = args.keep
+
+        preview_cfg = load_config(config_path)
+        if overrides:
+            preview_cfg.update(overrides)
+
+        result = run_once(
+            stem,
+            paths,
+            aggr=aggr,
+            config_path=config_path,
+            cfg_overrides=overrides if overrides else None,
+        )
 
         outputs = {name: Path(path) for name, path in result.get("outputs", {}).items()}
         stats: Dict[str, Any] = result.get("stats", {})
@@ -147,16 +181,25 @@ def main() -> int:
         for key, path in sorted(outputs.items()):
             print(f"  - {key:>10s}: {_relative_to_cwd(path)}")
 
+        strategy = preview_cfg.get("align_strategy", "hybrid")
+        min_sim = float(preview_cfg.get("align_min_sim", 0.84))
+        keep_mode = preview_cfg.get("overlap_keep", "last")
+        print(f"[提示] 本次对齐：strategy={strategy}，min_sim={min_sim:.2f}，keep={keep_mode}")
+        if "diff" in outputs:
+            print(f"[提示] 差异报告：{_relative_to_cwd(outputs['diff'])}")
+
         filler_removed = stats.get("filler_removed", 0)
         retake_cuts = stats.get("retake_cuts", 0)
         shortened_ms = stats.get("shortened_ms", 0)
         shortened_s = shortened_ms / 1000
         long_pauses = stats.get("long_pauses", 0)
+        duplicated = stats.get("duplicated_sentences", 0)
 
         print(f"[统计] 重录段数: {retake_cuts}")
         print(f"[统计] 口癖移除词数: {filler_removed}")
         print(f"[统计] 预计缩短时长: {shortened_s:.2f}s")
         print(f"[统计] 紧凑停顿段数: {long_pauses}")
+        print(f"[统计] 删除的重复句次数: {duplicated}")
 
         if args.dry_run:
             print("[提示] dry-run 模式：未执行任何音频渲染步骤。")
