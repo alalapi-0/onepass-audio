@@ -1,7 +1,7 @@
 # OnePass Audio 部署提供者配置
-# 用途：在 builtin（官方 ssh/scp 流水线）、legacy（既有项目适配层）与 sshfs（反向挂载）之间切换。
+# 用途：在 builtin（官方 ssh/scp 流水线）、legacy（既有项目适配层）、sshfs（反向挂载）与 sync（一键流水线）之间切换。
 # 请复制本文件为 deploy/provider.local.yaml 进行私有修改，避免在版本库中泄露敏感配置。
-current: sshfs   # builtin | legacy | sshfs
+current: sync   # builtin|legacy|sshfs|sync
 builtin:
   root: .
 legacy:
@@ -16,8 +16,14 @@ legacy:
 sshfs:
   env_file: deploy/sshfs/sshfs.env
   mount_point: /home/ubuntu/onepass/data/audio
+sync:
+  env_file: deploy/sync/sync.env
+  audio_dir_local: onepass/data/audio
+  audio_dir_remote: /home/ubuntu/onepass/data/audio
+  asr_json_remote: /home/ubuntu/onepass/data/asr-json
+  log_dir_remote: /home/ubuntu/onepass/out
 common:
-  remote_dir: "/home/ubuntu/onepass"
+  remote_dir: /home/ubuntu/onepass
   audio_pattern: "*.m4a,*.wav,*.mp3,*.flac"
   model: "medium"
   language: "zh"
