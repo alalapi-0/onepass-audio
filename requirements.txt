@@ -1,0 +1,5 @@
+faster-whisper
+rapidfuzz
+srt
+pandas
+whisper-ctranslate2
