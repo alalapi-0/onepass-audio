@@ -37,6 +37,7 @@ from onepass.ux import (
 
 PROJ_ROOT = Path(__file__).resolve().parent
 CONFIG_DEFAULT = PROJ_ROOT / "config" / "default_config.json"
+OUT_DIR = PROJ_ROOT / "out"
 
 
 def _determine_verbose(args: argparse.Namespace) -> bool:
@@ -512,6 +513,70 @@ def handle_batch(args: argparse.Namespace) -> int:
     return 2
 
 
+def handle_snapshot(args: argparse.Namespace) -> int:
+    section("生成快照")
+    script = PROJ_ROOT / "scripts" / "snapshot.py"
+    if not _check_script_exists(script, "#12"):
+        return 2
+
+    cmd: List[str] = [sys.executable, str(script)]
+    if args.stems:
+        cmd.extend(["--stems", args.stems])
+    if args.what and args.what != "all":
+        cmd.extend(["--what", args.what])
+    if args.note:
+        cmd.extend(["--note", args.note])
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    _print_command(cmd)
+    start = time.monotonic()
+    rc = run_streamed(cmd, heartbeat_s=15.0, show_cmd=False)
+    elapsed = time.monotonic() - start
+    if rc == 0:
+        log_ok(f"快照完成，耗时 {elapsed:.1f}s，返回码 {rc}")
+        return 0
+    if rc == 1:
+        log_warn(f"快照操作返回 1（可能无文件），耗时 {elapsed:.1f}s。")
+        return 1
+    log_err(f"快照失败，耗时 {elapsed:.1f}s，返回码 {rc}")
+    return 2
+
+
+def handle_rollback(args: argparse.Namespace) -> int:
+    section("回滚快照")
+    script = PROJ_ROOT / "scripts" / "rollback.py"
+    if not _check_script_exists(script, "#13"):
+        return 2
+
+    cmd: List[str] = [sys.executable, str(script)]
+    if args.id:
+        cmd.extend(["--id", args.id])
+    elif args.dir:
+        cmd.extend(["--dir", args.dir])
+    if args.targets:
+        cmd.extend(["--targets", args.targets])
+    if not args.verify:
+        cmd.append("--no-verify")
+    if not args.soft:
+        cmd.append("--hard")
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    _print_command(cmd)
+    start = time.monotonic()
+    rc = run_streamed(cmd, heartbeat_s=15.0, show_cmd=False)
+    elapsed = time.monotonic() - start
+    if rc == 0:
+        log_ok(f"回滚完成，耗时 {elapsed:.1f}s，返回码 {rc}")
+        return 0
+    if rc == 1:
+        log_warn(f"回滚流程返回 1，耗时 {elapsed:.1f}s。")
+        return 1
+    log_err(f"回滚失败，耗时 {elapsed:.1f}s，返回码 {rc}")
+    return 2
+
+
 def handle_asr(args: argparse.Namespace) -> int:
     verbose_flag = _determine_verbose(args)
     section("批量转写")
@@ -651,6 +716,30 @@ def build_parser() -> argparse.ArgumentParser:
     regen_parser.add_argument("--dry-run", action="store_true", help="仅生成文本类产物，不渲染音频")
     regen_parser.add_argument("--hard-delete", action="store_true", help="搭配 --regen，直接删除旧产物")
     regen_parser.set_defaults(func=handle_regen)
+
+    snapshot_parser = subparsers.add_parser("snapshot", parents=[parent], help="生成 out/ 快照")
+    snapshot_parser.add_argument("--stems", help="限定章节 stem（逗号分隔）", default=None)
+    snapshot_parser.add_argument(
+        "--what",
+        choices=["generated", "render", "all"],
+        default="all",
+        help="快照范围（默认 all）",
+    )
+    snapshot_parser.add_argument("--note", default=None, help="写入 manifest 的备注")
+    snapshot_parser.add_argument("--dry-run", action="store_true", help="仅预览不创建快照")
+    snapshot_parser.set_defaults(func=handle_snapshot)
+
+    rollback_parser = subparsers.add_parser("rollback", parents=[parent], help="从快照回滚 out/ 产物")
+    id_group = rollback_parser.add_mutually_exclusive_group(required=True)
+    id_group.add_argument("--id", help="快照 ID（out/_snapshots/<id>）")
+    id_group.add_argument("--dir", help="快照目录路径")
+    rollback_parser.add_argument("--targets", help="指定回滚目标（逗号分隔）", default=None)
+    rollback_parser.add_argument("--dry-run", action="store_true", help="仅预览不写入")
+    rollback_parser.add_argument("--verify", dest="verify", action="store_true", default=True, help="回滚前校验哈希")
+    rollback_parser.add_argument("--no-verify", dest="verify", action="store_false", help="跳过哈希校验")
+    rollback_parser.add_argument("--soft", dest="soft", action="store_true", default=True, help="冲突文件先备份")
+    rollback_parser.add_argument("--hard", dest="soft", action="store_false", help="直接覆盖不备份")
+    rollback_parser.set_defaults(func=handle_rollback)
 
     batch_parser = subparsers.add_parser("batch", parents=[parent], help="批量遍历全部章节")
     batch_parser.add_argument("--aggr", type=int, default=50, help="去口癖力度 0-100（默认 50）")
@@ -803,6 +892,67 @@ def _interactive_batch() -> int:
     return handle_batch(args)
 
 
+def _list_recent_snapshots(limit: int = 5) -> list[Path]:
+    root = OUT_DIR / "_snapshots"
+    if not root.exists():
+        return []
+    entries = [p for p in root.iterdir() if p.is_dir()]
+    entries.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return entries[:limit]
+
+
+def _interactive_snapshot() -> int:
+    stems = _prompt("限定章节 stem（逗号分隔，可留空）", "")
+    what = _prompt("快照范围 (generated/render/all)", "all").strip().lower() or "all"
+    if what not in {"generated", "render", "all"}:
+        log_warn("输入范围无效，使用 all。")
+        what = "all"
+    note = _prompt("备注（可留空）", "")
+    dry_run = _prompt_bool("仅 dry-run（不创建快照）?", False)
+    args = argparse.Namespace(
+        stems=stems or None,
+        what=what,
+        note=note or None,
+        dry_run=dry_run,
+        verbose=False,
+        quiet=False,
+    )
+    return handle_snapshot(args)
+
+
+def _interactive_rollback() -> int:
+    recent = _list_recent_snapshots()
+    if recent:
+        print("最近的快照：")
+        for path in recent:
+            print(f"  - {path.name} ({_rel_to_root(path)})")
+    choice = _prompt("输入快照 ID 或目录路径", recent[0].name if recent else "").strip()
+    if not choice:
+        log_warn("未选择快照，已取消。")
+        return 1
+    if Path(choice).expanduser().exists():
+        snap_id = None
+        snap_dir = choice
+    else:
+        snap_id = choice
+        snap_dir = None
+    targets = _prompt("指定回滚目标（stem 或相对路径，逗号分隔，可留空）", "")
+    verify = _prompt_bool("回滚前校验哈希?", True)
+    soft = _prompt_bool("冲突文件先备份?", True)
+    dry_run = _prompt_bool("仅 dry-run?", False)
+    args = argparse.Namespace(
+        id=snap_id,
+        dir=snap_dir,
+        targets=targets or None,
+        verify=verify,
+        soft=soft,
+        dry_run=dry_run,
+        verbose=False,
+        quiet=False,
+    )
+    return handle_rollback(args)
+
+
 def interactive_menu() -> int:
     section("OnePass Audio · 主菜单")
     while True:
@@ -815,7 +965,9 @@ def interactive_menu() -> int:
         print("6) 重新生成（清理旧产物后重跑一章）")
         print("7) 批量生成（遍历全部章节）")
         print("8) 清理产物（按 stem 或全部）")
-        choice = input("选择（0-8）: ").strip()
+        print("9) 生成快照（冻结当前 out/）")
+        print("A) 回滚到某次快照")
+        choice = input("选择（0-9/A）: ").strip()
         if choice == "5":
             log_warn("用户选择退出。")
             return 1
@@ -827,6 +979,12 @@ def interactive_menu() -> int:
             continue
         if choice == "8":
             _interactive_clean()
+            continue
+        if choice == "9":
+            _interactive_snapshot()
+            continue
+        if choice.lower() == "a":
+            _interactive_rollback()
             continue
         log_warn("该选项尚未在菜单中实现，请使用命令行子命令。")
 

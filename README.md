@@ -239,6 +239,30 @@ python scripts/clean_outputs.py --all --what all --hard --yes
 
 主程序也可一键执行同样的流程：`python onepass_main.py clean ...`、`python onepass_main.py regen ...`，交互式菜单第 6、8 项会提示确认后再调用脚本。
 
+### 快照与回滚
+
+```bash
+# 生成快照（冻结当前 out/）
+python scripts/snapshot.py --note "after bulk render"
+
+# 仅为 001/002 生成快照（只含生成类，不含 .clean.wav）
+python scripts/snapshot.py --stems 001,002 --what generated
+
+# 预演（不落盘）
+python scripts/snapshot.py --dry-run
+
+# 回滚到某次快照（所有文件，遇到同名先备份到 .trash/）
+python scripts/rollback.py --id 20251024-143012-ab12cd --soft
+
+# 只回滚某几项（强制校验哈希）
+python scripts/rollback.py --id 20251024-143012-ab12cd --targets 001,序言01 --verify
+```
+
+- 快照会存放在 `out/_snapshots/<run_id>/`，默认优先使用硬链接节省磁盘空间（跨盘或不支持时会自动改为复制）。
+- 回滚仅覆盖 `out/` 目录下的产物，不会修改 `data/` 中的源素材；默认启用 `--soft` 会将冲突文件备份到 `out/.trash/rollback-<时间戳>/`。
+- 建议不要将 `_snapshots/` 目录提交到版本控制。如需清理旧快照，可运行 `python scripts/clean_outputs.py --all --what all --hard --yes`。
+- 主程序新增 `python onepass_main.py snapshot ...` 与 `python onepass_main.py rollback ...` 子命令，交互式菜单第 9、A 项也可直接创建或回滚快照。
+
 ### 渲染
 
 ```bash
@@ -266,6 +290,7 @@ pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -Render
 | --- | --- | --- |
 | `-Aggressiveness` | 50 | 传入 `--aggr`，0–100 的力度百分比 |
 | `-Render` | `False` | 若指定，存在音频且生成了 EDL 时将调用 `edl_to_ffmpeg.py` |
+| `-Snapshot` | `False` | 批处理结束后自动运行 `scripts/snapshot.py` 保存快照 |
 | `-DryRun` | `False` | 传给单章脚本，仅生成字幕/EDL/标记，不渲染音频 |
 | `-Config` | `config/default_config.json` | 若文件存在则作为 `--config` 传入 |
 | `-AudioRequired` | `False` | 若指定，同名音频缺失会直接判定为 FAIL |
@@ -277,6 +302,9 @@ pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -DryRun
 
 # 批量并渲染（若存在同名音频）
 pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -Render
+
+# 批量渲染并在结束时自动创建快照
+pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -Render -Snapshot
 
 # 强制音频也必须齐全（缺则判 FAIL）
 pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 50 -Render -AudioRequired
