@@ -154,6 +154,55 @@ python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLas
 
 片段很多时建议不用 `--xfade`（Windows 命令长度限制），需要淡入淡出可在 Audition 里完成。
 
+## 批处理与汇总
+
+当需要处理整本书或大量章节时，可使用 PowerShell 7+ 脚本 `scripts/bulk_process.ps1` 进行批量处理与结果汇总。脚本会自动匹配 `data/asr-json/*.json`、`data/original_txt/*.txt` 以及同名音频（若存在），逐章调用 `retake_keep_last.py`，并在指定时渲染干净音频。
+
+### 常用参数与示例
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-Aggressiveness` | 50 | 传入 `--aggr`，0–100 的力度百分比 |
+| `-Render` | `False` | 若指定，存在音频且生成了 EDL 时将调用 `edl_to_ffmpeg.py` |
+| `-DryRun` | `False` | 传给单章脚本，仅生成字幕/EDL/标记，不渲染音频 |
+| `-Config` | `config/default_config.json` | 若文件存在则作为 `--config` 传入 |
+| `-AudioRequired` | `False` | 若指定，同名音频缺失会直接判定为 FAIL |
+| `-AudioExtPattern` | `*.m4a,*.wav,*.mp3,*.flac` | 搜索音频时匹配的扩展名列表 |
+
+```powershell
+# 仅批量生成字幕/EDL/标记（不渲染）
+pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -DryRun
+
+# 批量并渲染（若存在同名音频）
+pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -Render
+
+# 强制音频也必须齐全（缺则判 FAIL）
+pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 50 -Render -AudioRequired
+
+# 指定自定义配置
+pwsh -File .\scripts\bulk_process.ps1 -Config "config\my_config.json" -Render
+```
+
+### 输出产物
+
+- `out/summary.csv`：按章节列出 `stem,json_path,txt_path,audio_path,aggr,exit_retake,exit_render,has_*` 等字段，便于二次统计或导入表格工具。
+- `out/summary.md`：Markdown 汇总，包含总览统计、章节状态表格及常见问题提示。
+
+CSV 中的 `delta_s` 为渲染后音频与原始音频的时长差值；若缺少音频或渲染未执行则为空。`filler_removed`、`retake_cuts`、`long_pauses`、`shortened_ms` 源自 `out/<stem>.log` 中的统计数值。
+
+### 退出码
+
+- `0`：全部章节成功（OK）
+- `1`：至少存在 WARN（如缺少音频、未渲染、统计缺失）
+- `2`：存在 FAIL（单章或渲染失败、硬性检查未通过）
+
+### 常见问题
+
+- **只需字幕不渲染**：不要加 `-Render` 或关闭 `-AudioRequired`，缺音频不会阻塞流程。
+- **ffmpeg 不可用**：运行 `pwsh -File .\scripts\install_deps.ps1` 安装依赖，或手动将 ffmpeg 加入 PATH。
+- **单章失败定位**：查看终端日志及 `out/<stem>.log`，日志中会包含外部命令行与返回码。
+- **包含中文或空格路径**：建议在英文路径下执行，或在命令中对包含空格/中文的路径使用引号包裹。
+
 ## 配置（config/default_config.json）
 
 默认配置位于 `config/default_config.json`，字段说明如下：
