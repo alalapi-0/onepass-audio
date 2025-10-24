@@ -140,7 +140,7 @@ python scripts/validate_assets.py --audio-required
 
 ```bash
 # 单章：生成去口癖字幕 + 保留最后一遍 + EDL + Audition 标记
-python scripts/retake_keep_last.py --json data/asr-json/001.json --original data/original_txt/001.txt --outdir out
+python scripts/retake_keep_last.py --json data/asr-json/001.json --original data/original_txt/001.txt --outdir out --aggr 60
 
 # （可选）按 EDL 导出干净音频
 python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
@@ -165,10 +165,10 @@ python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLas
 覆盖配置的方式示例如下：
 
 ```bash
-# 占位示例：实际脚本在后续步骤加入 --config 参数
+# 自定义配置示例：
 python scripts/retake_keep_last.py --json data/asr-json/001.json \
   --original data/original_txt/001.txt --outdir out \
-  --config config/default_config.json
+  --config config/default_config.json --aggr 55
 ```
 
 或者复制默认配置：
@@ -178,10 +178,10 @@ copy config/default_config.json config/my_config.json  # Windows PowerShell/命�
 # 编辑 config/my_config.json 后再执行：
 python scripts/retake_keep_last.py --json data/asr-json/001.json \
   --original data/original_txt/001.txt --outdir out \
-  --config config/my_config.json
+  --config config/my_config.json --aggr 55
 ```
 
-后续将提供 `--aggr`（aggressiveness，力度百分比）参数，用于统一调节阈值松紧度。
+脚本的 `--aggr`（aggressiveness，力度百分比）参数会被自动限制在 0–100 之间，用于统一调节阈值松紧度。
 
 ## 不提交二进制/媒体的约定
 
