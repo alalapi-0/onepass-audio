@@ -142,9 +142,17 @@ python scripts/validate_assets.py --audio-required
 # 单章：生成去口癖字幕 + 保留最后一遍 + EDL + Audition 标记
 python scripts/retake_keep_last.py --json data/asr-json/001.json --original data/original_txt/001.txt --outdir out --aggr 60
 
-# （可选）按 EDL 导出干净音频
+# 按 EDL 渲染干净音频（最稳）
 python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
+
+# 需要接缝平滑（片段不多）
+python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav --xfade
+
+# 播客响度标准（-16 LUFS）
+python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav --loudnorm
 ```
+
+片段很多时建议不用 `--xfade`（Windows 命令长度限制），需要淡入淡出可在 Audition 里完成。
 
 ## 配置（config/default_config.json）
 
