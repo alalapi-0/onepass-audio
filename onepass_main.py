@@ -153,6 +153,27 @@ def handle_validate(args: argparse.Namespace) -> int:
     return 2
 
 
+def handle_env_check(args: argparse.Namespace) -> int:
+    section("环境自检")
+    script = PROJ_ROOT / "scripts" / "env_check.py"
+    if not _check_script_exists(script, "#2"):
+        return 2
+
+    cmd = [sys.executable, str(script)]
+    _print_command(cmd)
+    start = time.monotonic()
+    rc = run_streamed(cmd, heartbeat_s=15.0, show_cmd=False)
+    elapsed = time.monotonic() - start
+    if rc == 0:
+        log_ok(f"完成，耗时 {elapsed:.1f}s，返回码 {rc}")
+        return 0
+    if rc == 1:
+        log_warn(f"检查完成但存在警告，耗时 {elapsed:.1f}s，返回码 {rc}")
+        return 1
+    log_err(f"环境自检失败，耗时 {elapsed:.1f}s，返回码 {rc}")
+    return 2
+
+
 def _build_process_command(
     json_path: Path,
     original_path: Path,
@@ -651,6 +672,9 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser = subparsers.add_parser("setup", parents=[parent], help="安装依赖（需要 PowerShell 7）")
     setup_parser.set_defaults(func=handle_setup)
 
+    env_parser = subparsers.add_parser("env", parents=[parent], help="环境自检")
+    env_parser.set_defaults(func=handle_env_check)
+
     validate_parser = subparsers.add_parser("validate", parents=[parent], help="检查素材与配置")
     validate_parser.add_argument("--audio-required", action="store_true", help="强制音频素材也必须存在")
     validate_parser.set_defaults(func=handle_validate)
@@ -766,6 +790,89 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.set_defaults(func=handle_batch)
 
     return parser
+
+
+def _interactive_asr() -> int:
+    audio_dir = _prompt("音频目录", "data/audio")
+    out_dir = _prompt("ASR JSON 输出目录", "data/asr-json")
+    model = _prompt("whisper-ctranslate2 模型", "small")
+    language = _prompt("转写语言 (auto/zh/en …)", "zh")
+    device = _prompt("推理设备 (auto/cpu/cuda)", "auto")
+    compute_type = _prompt("compute_type (auto/int8/int8_float16 …)", "auto")
+    workers = _prompt_int("并发数量", 1)
+    vad = _prompt_bool("启用 VAD?", True)
+    overwrite = _prompt_bool("覆盖已存在 JSON?", False)
+    dry_run = _prompt_bool("仅 dry-run（不执行）?", False)
+    args = argparse.Namespace(
+        audio_dir=audio_dir,
+        out_dir=out_dir,
+        model=model,
+        language=language,
+        device=device,
+        compute_type=compute_type,
+        workers=workers,
+        vad=vad,
+        overwrite=overwrite,
+        dry_run=dry_run,
+        verbose=False,
+        quiet=False,
+    )
+    return handle_asr(args)
+
+
+def _interactive_env_check() -> int:
+    if not _prompt_bool("立即执行环境自检?", True):
+        log_warn("已取消环境自检。")
+        return 1
+    args = argparse.Namespace(verbose=False, quiet=False)
+    return handle_env_check(args)
+
+
+def _interactive_validate() -> int:
+    audio_required = _prompt_bool("缺少音频是否视为失败?", False)
+    args = argparse.Namespace(audio_required=audio_required, verbose=False, quiet=False)
+    return handle_validate(args)
+
+
+def _interactive_process() -> int:
+    json_path = _prompt("ASR JSON 路径", "data/asr-json/001.json")
+    stem = Path(json_path).stem
+    default_original = f"data/original_txt/{stem}.txt" if stem else "data/original_txt/001.txt"
+    original_path = _prompt("原始文本路径", default_original)
+    outdir = _prompt("输出目录", "out")
+    aggr = _prompt_int("去口癖力度 (0-100)", 50)
+    config_input = _prompt("配置文件路径（留空使用默认）", str(CONFIG_DEFAULT))
+    config = config_input or str(CONFIG_DEFAULT)
+    dry_run = _prompt_bool("仅生成字幕/EDL（dry-run）?", False)
+    args = argparse.Namespace(
+        json=json_path,
+        original=original_path,
+        outdir=outdir,
+        aggr=aggr,
+        config=config,
+        dry_run=dry_run,
+        verbose=False,
+        quiet=False,
+    )
+    return handle_process(args)
+
+
+def _interactive_render() -> int:
+    audio = _prompt("原始音频路径", "data/audio/001.m4a")
+    edl = _prompt("EDL JSON 路径", "out/001.keepLast.edl.json")
+    out_path = _prompt("输出音频路径", "out/001.clean.wav")
+    xfade = _prompt_bool("启用 crossfade?", False)
+    loudnorm = _prompt_bool("启用响度归一化?", False)
+    args = argparse.Namespace(
+        audio=audio,
+        edl=edl,
+        out=out_path,
+        xfade=xfade,
+        loudnorm=loudnorm,
+        verbose=False,
+        quiet=False,
+    )
+    return handle_render(args)
 
 
 def _interactive_clean() -> int:
@@ -968,6 +1075,21 @@ def interactive_menu() -> int:
         print("9) 生成快照（冻结当前 out/）")
         print("A) 回滚到某次快照")
         choice = input("选择（0-9/A）: ").strip()
+        if choice == "0":
+            _interactive_asr()
+            continue
+        if choice == "1":
+            _interactive_env_check()
+            continue
+        if choice == "2":
+            _interactive_validate()
+            continue
+        if choice == "3":
+            _interactive_process()
+            continue
+        if choice == "4":
+            _interactive_render()
+            continue
         if choice == "5":
             log_warn("用户选择退出。")
             return 1
