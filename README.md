@@ -61,6 +61,49 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 `scripts/install_deps.ps1` 会优先使用 `winget`（备用：Chocolatey）安装 ffmpeg，并调用 `python -m pip install -r requirements.txt`。该脚本可多次执行，若依赖已满足会提示“已安装”。ffmpeg 是后续音频渲染及切片脚本的基础工具，缺失会导致相关命令无法运行。
 
+## 主程序使用说明
+
+`onepass_main.py` 提供统一入口，可通过子命令或交互式菜单串联安装、校验、处理与渲染流程。
+
+```bash
+# 一键安装（需要 PowerShell 7）
+python onepass_main.py setup
+
+# 环境自检
+python onepass_main.py validate
+
+# 单章处理（力度 60，生成字幕/EDL/标记，不渲染音频）
+python onepass_main.py process --json data/asr-json/001.json \
+  --original data/original_txt/001.txt --outdir out --aggr 60 --dry-run
+
+# 按 EDL 渲染音频（带轻微 crossfade 与响度归一）
+python onepass_main.py render --audio data/audio/001.m4a \
+  --edl out/001.keepLast.edl.json --out out/001.clean.wav --xfade --loudnorm
+```
+
+直接运行 `python onepass_main.py` 会进入菜单模式，当前提供以下选项：
+
+1. 环境自检
+2. 素材检查
+3. 单章处理（去口癖 + 保留最后一遍 + 生成字幕/EDL/标记）
+4. 仅渲染音频（按 EDL）
+5. 退出
+
+若 PowerShell 执行策略阻止脚本运行，可临时执行：
+
+```
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+```
+
+子命令依赖关系如下：
+
+- `setup` 调用 `scripts/install_deps.ps1`（步骤 #3）
+- `validate` 调用 `scripts/validate_assets.py`（步骤 #5）
+- `process` 调用 `scripts/retake_keep_last.py`（步骤 #7）
+- `render` 调用 `scripts/edl_to_ffmpeg.py`（步骤 #8）
+
+若对应脚本尚未生成，会显示友好提示而不会直接报错退出。
+
 ## 使用示例
 
 ```bash
