@@ -9,6 +9,12 @@ pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -DryRun
 # 批量并渲染（若存在同名音频）
 pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 60 -Render
 
+# 逐章先清理再重跑（安全移动到 .trash/）
+pwsh -File .\scripts\bulk_process.ps1 -Regen
+
+# 硬删除旧产物后重跑（慎用）
+pwsh -File .\scripts\bulk_process.ps1 -Regen -HardDelete
+
 # 强制音频也必须齐全（缺则判 FAIL）
 pwsh -File .\scripts\bulk_process.ps1 -Aggressiveness 50 -Render -AudioRequired
 
@@ -23,6 +29,8 @@ param(
     [ValidateRange(0,100)]
     [int]$Aggressiveness = 50,
     [switch]$Render,
+    [switch]$Regen,
+    [switch]$HardDelete,
     [switch]$DryRun,
     [string]$Config = "config/default_config.json",
     [switch]$AudioRequired,
@@ -40,6 +48,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$hardWithoutRegen = $HardDelete.IsPresent -and -not $Regen.IsPresent
+if ($hardWithoutRegen) {
+    Write-Error '-HardDelete 必须与 -Regen 搭配使用。'
+    exit 1
+}
 
 $scriptRoot = Split-Path -Parent -Path $PSCommandPath
 $projectRoot = (Resolve-Path -LiteralPath (Join-Path $scriptRoot '..')).ProviderPath
@@ -231,8 +245,14 @@ try {
 
 $asrScript = Join-Path '.' 'scripts/asr_batch.py'
 $retakeScript = Join-Path '.' 'scripts/retake_keep_last.py'
+$cleanScript = Join-Path '.' 'scripts/clean_outputs.py'
 if (-not (Test-Path -LiteralPath $retakeScript)) {
     Write-Error "缺少脚本 $retakeScript"
+    exit 1
+}
+
+if ($Regen.IsPresent -and -not (Test-Path -LiteralPath $cleanScript)) {
+    Write-Error "缺少脚本 $cleanScript"
     exit 1
 }
 
@@ -319,6 +339,8 @@ foreach ($stem in $stems) {
     $retakeExit = ''
     $renderExit = ''
     $status = 'OK'
+    $regened = $false
+    $cleanedFiles = 0
 
     if (-not $jsonExists) {
         if ($AutoASR.IsPresent -and $audioPath) {
@@ -394,6 +416,34 @@ foreach ($stem in $stems) {
     }
 
     if ($status -ne 'FAIL') {
+        if ($Regen.IsPresent) {
+            $regened = $true
+            $cleanArgs = @($cleanScript, '--stem', $stem, '--what', 'generated', '--yes')
+            if ($HardDelete.IsPresent) {
+                $cleanArgs += '--hard'
+            } else {
+                $cleanArgs += '--trash'
+            }
+            $cleanResult = Invoke-LoggedCommand -FilePath $pythonCmd.Source -ArgumentList $cleanArgs
+            if ($cleanResult.ExitCode -eq 2) {
+                $status = 'FAIL'
+                $chapterMessages += 'cleanup failed'
+                if ($cleanResult.Output) {
+                    $chapterMessages += ($cleanResult.Output -split "`n" | Select-Object -First 1)
+                }
+            } else {
+                $summaryMatch = [regex]::Match($cleanResult.Output, 'CLEAN_SUMMARY\s+files=(\d+)\s+bytes=(\d+)')
+                if ($summaryMatch.Success) {
+                    $cleanedFiles = [int]$summaryMatch.Groups[1].Value
+                }
+            }
+        }
+
+        if ($status -eq 'FAIL') {
+            # 跳过后续步骤
+            goto SkipRetake
+        }
+
         $originalResolved = $txtPath
         $args = @('--json', $jsonPath, '--original', $originalResolved, '--outdir', $outDirFull, '--aggr', $Aggressiveness.ToString([System.Globalization.CultureInfo]::InvariantCulture))
         if (Test-Path -LiteralPath $Config) {
@@ -402,7 +452,6 @@ foreach ($stem in $stems) {
         if ($DryRun.IsPresent) {
             $args += '--dry-run'
         }
-
         $retakeResult = Invoke-LoggedCommand -FilePath $pythonCmd.Source -ArgumentList @($retakeScript) + $args
         $retakeExit = $retakeResult.ExitCode
         if ($retakeExit -ne 0) {
@@ -462,6 +511,8 @@ foreach ($stem in $stems) {
         }
     }
 
+    :SkipRetake
+
     if ($status -eq 'OK') {
         $warnings = $chapterMessages | Where-Object { $_ -like '*missing*' -or $_ -like '*skipped*' -or $_ -like 'audio missing*' }
         if ($warnings.Count -gt 0) {
@@ -504,6 +555,8 @@ foreach ($stem in $stems) {
         txt_path = $txtRelative
         audio_path = $audioRelative
         aggr = $Aggressiveness
+        regened = $regened
+        cleaned_files = $cleanedFiles
         exit_retake = $retakeExit
         exit_render = $renderExit
         has_srt = $hasSrt
@@ -533,7 +586,7 @@ $overallStopwatch.Stop()
 
 $summaryCsvPath = Join-Path $outDir 'summary.csv'
 $summaryMdPath = Join-Path $outDir 'summary.md'
-$orderedProps = 'stem','json_path','txt_path','audio_path','aggr','exit_retake','exit_render','has_srt','has_vtt','has_txt','has_edl','has_markers','render_out','original_duration_s','output_duration_s','delta_s','filler_removed','retake_cuts','long_pauses','shortened_ms','started_at','ended_at','elapsed_s','status','message'
+$orderedProps = 'stem','json_path','txt_path','audio_path','aggr','regened','cleaned_files','exit_retake','exit_render','has_srt','has_vtt','has_txt','has_edl','has_markers','render_out','original_duration_s','output_duration_s','delta_s','filler_removed','retake_cuts','long_pauses','shortened_ms','started_at','ended_at','elapsed_s','status','message'
 
 if ($summary.Count -eq 0) {
     $header = ($orderedProps | ForEach-Object { '"{0}"' -f $_ }) -join ','
@@ -557,11 +610,11 @@ $mdLines += "- WARN：$warnCount"
 $mdLines += "- FAIL：$failCount"
 $mdLines += "- 总用时：$totalElapsed 秒"
 $mdLines += ''
-$mdLines += '| 章节 | 状态 | 用时 (秒) | 缺失/错误摘要 |'
-$mdLines += '| --- | --- | --- | --- |'
+$mdLines += '| 章节 | 状态 | 用时 (秒) | 重新生成 | 清理数量 | 缺失/错误摘要 |'
+$mdLines += '| --- | --- | --- | --- | --- | --- |'
 foreach ($item in $summary) {
     $msg = [string]::IsNullOrWhiteSpace($item.message) ? '—' : ($item.message -replace '\|', '\\|')
-    $mdLines += ("| {0} | {1} | {2} | {3} |" -f $item.stem, $item.status, $item.elapsed_s, $msg)
+    $mdLines += ("| {0} | {1} | {2} | {3} | {4} | {5} |" -f $item.stem, $item.status, $item.elapsed_s, ($item.regened ? 'true' : 'false'), $item.cleaned_files, $msg)
 }
 $mdLines += ''
 $mdLines += '## 常见问题/修复建议'
