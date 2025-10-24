@@ -185,6 +185,39 @@ Vultr 云端部署向导将常见的 VPS 创建与接入流程拆解为四个步
    - 根据预算及时关停/删除不再使用的实例；`cloud_vultr_cli.py` 支持在列表中确认当前实例信息；
    - 删除实例前请再次确认计费周期，必要时手动在 Vultr 控制台核对费用。
 
+## 云端⇄本地互通桥（一键 ASR）
+
+当实例已经按照四步式向导创建完成后，可直接使用 Vultr CLI 的“一键桥接”能力：自动生成同步配置、增量上传音频、远端批量转写并回收 JSON，最后校验 `segments[].words` 字段。
+
+```powershell
+# 自动写入/更新 deploy/sync/sync.env（缺失时）
+python deploy/cloud/vultr/cloud_vultr_cli.py write-sync-env
+
+# 上传音频 → 远端词级 ASR → 回收 JSON → 校验 words 字段
+python deploy/cloud/vultr/cloud_vultr_cli.py asr-bridge --workers 1 --model medium
+```
+
+删除实例也提供快捷命令（包含二次确认与计费提醒）：
+
+```powershell
+python deploy/cloud/vultr/cloud_vultr_cli.py delete-current
+# 或删除指定 ID
+python deploy/cloud/vultr/cloud_vultr_cli.py delete --id <INSTANCE_ID>
+```
+
+需要实时观察远端推理日志，可直接在命令行 tail：
+
+```powershell
+python deploy/cloud/vultr/cloud_vultr_cli.py tail-log
+```
+
+常见排查思路：
+
+- `sync.env` 缺失或连接参数变动：重新执行 `write-sync-env` 或手动校验 `VPS_HOST/VPS_USER/VPS_SSH_KEY/VPS_REMOTE_DIR`；
+- 远端不可达/SSH 失败：在主菜单 `V)` 中先执行 `3)` 连通性检测，必要时检查安全组/防火墙；
+- 虚拟环境未初始化：通过 `cloud_vultr_cli.py provision` 或 `deploy/remote_provision.sh` 重新部署依赖；
+- `verify_asr_words.py` WARN：`asr-bridge` 会给出缺少 `words` 的清单，可按提示重跑或开启 `--overwrite`。
+
 ## 稳定同步→远端处理→回收结果（rsync 优先）
 
 当本地音频体积较大、需要多次增量推送至远端 VPS 时，可使用全新的 `sync` provider 构建“一键流水线”：上传音频 → 远端批量转写 → 回收 JSON 与日志 → 本地校验。流程完全基于 PowerShell 7、rsync/scp 与现有脚本，保持幂等，可多次重复执行。

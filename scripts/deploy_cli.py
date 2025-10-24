@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from onepass.deploy_api import (
+    format_cmd,
     get_current_provider_name,
     get_provider,
     load_provider_config,
@@ -46,6 +48,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--device", help="推理设备", default=None)
     run.add_argument("--compute", help="compute_type 参数", default=None)
     run.add_argument("--workers", type=int, help="并发数量", default=None)
+    run.add_argument("--overwrite", action="store_true", help="覆盖远端已有 JSON")
     _add_common_options(run)
 
     fetch = subparsers.add_parser("fetch_outputs", help="下载远端 data/asr-json/")
@@ -61,6 +64,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="切换 provider",
     )
     provider.add_argument("--show", action="store_true", help="仅显示当前 provider")
+
+    bridge = subparsers.add_parser("cloud-bridge", help="调用 Vultr asr-bridge 一键流程")
+    bridge.add_argument("--workers", type=int, help="远端并发数量", default=None)
+    bridge.add_argument("--model", help="Whisper 模型", default=None)
+    bridge.add_argument("--pattern", help="音频匹配模式", default=None)
+    bridge.add_argument("--overwrite", action="store_true", help="覆盖已有 JSON")
+    bridge.add_argument("--no-delete", action="store_true", help="上传时保留远端冗余文件")
+    _add_common_options(bridge)
 
     return parser
 
@@ -91,15 +102,26 @@ def handle_upload(args: argparse.Namespace) -> int:
 def handle_run(args: argparse.Namespace) -> int:
     pattern, model, language, device, compute, workers = _resolve_defaults(args)
     provider = get_provider()
-    return provider.run_asr(
-        audio_pattern=pattern,
-        model=model,
-        language=language,
-        device=device,
-        compute=compute,
-        workers=workers,
-        dry_run=args.dry_run,
-    )
+    previous_overwrite = os.environ.get("ASR_OVERWRITE")
+    if args.overwrite:
+        os.environ["ASR_OVERWRITE"] = "true"
+    else:
+        os.environ.pop("ASR_OVERWRITE", None)
+    try:
+        return provider.run_asr(
+            audio_pattern=pattern,
+            model=model,
+            language=language,
+            device=device,
+            compute=compute,
+            workers=workers,
+            dry_run=args.dry_run,
+        )
+    finally:
+        if previous_overwrite is None:
+            os.environ.pop("ASR_OVERWRITE", None)
+        else:
+            os.environ["ASR_OVERWRITE"] = previous_overwrite
 
 
 def handle_fetch(args: argparse.Namespace) -> int:
@@ -115,6 +137,33 @@ def handle_fetch(args: argparse.Namespace) -> int:
             if result.returncode != 0:
                 log_warn(f"verify_asr_words 返回码 {result.returncode}。")
     return rc
+
+
+def handle_cloud_bridge(args: argparse.Namespace) -> int:
+    script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
+    if not script.exists():
+        log_err(f"未找到 {script}")
+        return 2
+    cmd = [
+        sys.executable,
+        str(script),
+        "asr-bridge",
+    ]
+    if args.workers is not None:
+        cmd.extend(["--workers", str(args.workers)])
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if args.pattern:
+        cmd.extend(["--pattern", args.pattern])
+    if args.overwrite:
+        cmd.append("--overwrite")
+    if args.no_delete:
+        cmd.append("--no-delete")
+    if args.dry_run:
+        cmd.append("--dry-run")
+    log_info(f"执行：{format_cmd(cmd)}")
+    result = subprocess.run(cmd, cwd=PROJ_ROOT)
+    return result.returncode
 
 
 def handle_status(args: argparse.Namespace) -> int:
@@ -152,6 +201,7 @@ def main(argv: list[str] | None = None) -> int:
         "fetch_outputs": handle_fetch,
         "status": handle_status,
         "provider": handle_provider,
+        "cloud-bridge": handle_cloud_bridge,
     }
 
     handler = handlers.get(args.command)

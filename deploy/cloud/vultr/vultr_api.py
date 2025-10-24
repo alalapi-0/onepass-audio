@@ -148,6 +148,12 @@ def create_instance(
     return api_post("/instances", payload, api_key)
 
 
+def delete_instance(instance_id: str, api_key: str) -> dict:
+    """删除指定实例。"""
+
+    return _request("DELETE", f"/instances/{instance_id}", api_key)
+
+
 def wait_for_instance_active(
     instance_id: str,
     timeout_s: int,
