@@ -159,6 +159,32 @@ pwsh -File .\scripts\bulk_process.ps1 -AutoASR
 
 主程序子命令 `asr` 会转调用 `scripts/asr_batch.py`，支持常用参数；批处理脚本开启 `-AutoASR` 后会在缺少 JSON 时自动转写音频，再继续执行去口癖、字幕和渲染流程。
 
+## 云端部署（Vultr）向导：四步式
+
+Vultr 云端部署向导将常见的 VPS 创建与接入流程拆解为四个步骤，并集成在 `python onepass_main.py` 的交互式菜单中：
+
+1. **准备配置文件**：复制 `deploy/cloud/vultr/vultr.env.example` 为 `deploy/cloud/vultr/vultr.env`，填写 API Key、区域、实例规格、SSH 私钥路径等信息。切记不要把 `vultr.env` 提交到 Git。
+2. **主菜单运行四步式**：在主菜单中选择 “V) 云端部署（Vultr）向导”，依次执行：
+   - `1)` 检查本机环境（Python、PowerShell 7、OpenSSH、ssh-agent 等）；
+   - `2)` 创建 Vultr VPS（自动上传 SSH 公钥、创建实例并轮询到 active）；
+   - `3)` 准备本机接入 VPS（启动 ssh-agent、加载私钥、防火墙放行并自动探测连通性）；
+   - `4)` 检查 Vultr 账户中的实例（表格列出，标记当前实例）。
+3. **完成后续 ASR 流水线**：实例就绪并通过连通性检测后，可切换到你偏好的 provider（`sync`/`sshfs`/`builtin`）继续上传音频、远端转写与结果回收，例如：
+
+   ```powershell
+   # 例：使用 sync provider 的“先同步→远端跑→回收”流程
+   python scripts/deploy_cli.py provider --set sync
+   python scripts/deploy_cli.py upload_audio
+   python scripts/deploy_cli.py run_asr --workers 1
+   python scripts/deploy_cli.py fetch_outputs
+   python scripts/verify_asr_words.py
+   ```
+
+4. **安全提示**：
+   - Vultr API Key 仅保存在本地 `deploy/cloud/vultr/vultr.env`，请勿上传或共享；
+   - 根据预算及时关停/删除不再使用的实例；`cloud_vultr_cli.py` 支持在列表中确认当前实例信息；
+   - 删除实例前请再次确认计费周期，必要时手动在 Vultr 控制台核对费用。
+
 ## 稳定同步→远端处理→回收结果（rsync 优先）
 
 当本地音频体积较大、需要多次增量推送至远端 VPS 时，可使用全新的 `sync` provider 构建“一键流水线”：上传音频 → 远端批量转写 → 回收 JSON 与日志 → 本地校验。流程完全基于 PowerShell 7、rsync/scp 与现有脚本，保持幂等，可多次重复执行。
