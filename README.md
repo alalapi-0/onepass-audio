@@ -52,6 +52,43 @@ python scripts/retake_keep_last.py --json data/asr-json/001.json --original data
 python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
 ```
 
+## 配置（config/default_config.json）
+
+默认配置位于 `config/default_config.json`，字段说明如下：
+
+| 字段 | 说明 |
+| --- | --- |
+| `filler_terms` | 需去除的口癖词列表，可按说话习惯增删。 |
+| `gap_newline_s` | 连续词语的停顿超过该秒数时，强制换行。 |
+| `max_seg_dur_s` | 单段字幕的最大时长，超出将自动拆分。 |
+| `max_seg_chars` | 单段字幕允许的最大字符数。 |
+| `safety_pad_s` | 导出音频时保留的安全缓冲时长。 |
+| `merge_gap_s` | 停顿低于该值时合并相邻片段。 |
+| `long_silence_s` | 识别为长静音的阈值，用于后续收紧。 |
+| `retake_sim_threshold` | 判断重录段落的文本相似度阈值，越高越严格。 |
+| `tighten_target_ms` | 收紧长静音的目标时长（毫秒）。 |
+
+覆盖配置的方式示例如下：
+
+```bash
+# 占位示例：实际脚本在后续步骤加入 --config 参数
+python scripts/retake_keep_last.py --json data/asr-json/001.json \
+  --original data/original_txt/001.txt --outdir out \
+  --config config/default_config.json
+```
+
+或者复制默认配置：
+
+```bash
+copy config/default_config.json config/my_config.json  # Windows PowerShell/命令提示符均可
+# 编辑 config/my_config.json 后再执行：
+python scripts/retake_keep_last.py --json data/asr-json/001.json \
+  --original data/original_txt/001.txt --outdir out \
+  --config config/my_config.json
+```
+
+后续将提供 `--aggr`（aggressiveness，力度百分比）参数，用于统一调节阈值松紧度。
+
 ## 不提交二进制/媒体的约定
 
 `data/audio/`、`data/asr-json/`、`data/original_txt/`、`out/` 等目录仅用于存放本地原始素材与工具产出，涉及版权、隐私与容量问题，**全部不入库**。提交前请确认这些目录下无实际媒体文件。
