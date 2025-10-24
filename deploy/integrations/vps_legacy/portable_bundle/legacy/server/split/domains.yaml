@@ -1,0 +1,30 @@
+#
+# domains.yaml -- Domain groups that should egress via the PrivateTunnel split tunnel.
+#
+# Usage:
+#   - Organise destinations into logical groups for easier on/off control.
+#   - Options control resolver behaviour and TTL hints.
+#   - Comment out groups you temporarily do not need; the resolver will skip them.
+#
+# Example invocation:
+#   python3 resolve_domains.py --groups openai,github
+#   bash ipset_apply.sh --apply
+#
+groups:
+  openai:
+    - api.openai.com
+    - oauth.openai.com
+  github:
+    - github.com
+    - api.github.com
+  cloudflare:
+    - one.one.one.one
+    - cloudflare-dns.com
+
+options:
+  resolve_ipv6: false
+  resolvers:
+    - 1.1.1.1
+    - 8.8.8.8
+  min_ttl_sec: 300
+  max_workers: 4

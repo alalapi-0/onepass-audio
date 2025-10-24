@@ -1,0 +1,13 @@
+/var/log/private-tunnel/wireguard-journal.log {
+    weekly
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/bin/journalctl -u wg-quick@wg0 --since "yesterday" > /var/log/private-tunnel/wireguard-journal.log.tmp 2>/dev/null || true
+        mv /var/log/private-tunnel/wireguard-journal.log.tmp /var/log/private-tunnel/wireguard-journal.log 2>/dev/null || true
+    endscript
+}

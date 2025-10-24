@@ -1,0 +1,16 @@
+[Unit]
+Description=PrivateTunnel toy UDP/TUN gateway watchdog
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/privatetunnel/toy-gateway
+ExecStart=/usr/bin/python3 /opt/privatetunnel/toy-gateway/toy_tun_gateway.py
+Restart=on-failure
+RestartSec=3
+# Capture stdout/stderr to journal for post-mortem analysis
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://privatetunnel.local/schema/client-config.json",
+  "title": "PrivateTunnel WireGuard 客户端配置 v1",
+  "description": "定义通过工具链生成 WireGuard 客户端配置所需的 JSON 结构。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1",
+      "description": "配置版本号，当前仅支持字符串 \"1\"。"
+    },
+    "profile_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "用于命名输出文件以及区分不同客户端的标签 (字母/数字/._-)。"
+    },
+    "endpoint": {
+      "type": "object",
+      "description": "WireGuard 服务端的连接信息。",
+      "additionalProperties": false,
+      "required": ["host", "port", "public_key", "ipv6"],
+      "properties": {
+        "host": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.:-]*$",
+          "description": "服务端出口 IP 或域名。"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "WireGuard UDP 端口。"
+        },
+        "public_key": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/=]+$",
+          "description": "服务器的 WireGuard 公钥 (Base64 字符串)。"
+        },
+        "ipv6": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否启用 IPv6 隧道 (v1 中仅占位，不影响生成结果)。"
+        }
+      }
+    },
+    "client": {
+      "type": "object",
+      "description": "客户端私钥与本地网络参数。",
+      "additionalProperties": false,
+      "required": ["private_key", "address", "dns"],
+      "properties": {
+        "private_key": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/=]+$",
+          "description": "客户端 WireGuard 私钥，生成后务必妥善保管并限制权限。"
+        },
+        "address": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$",
+          "description": "分配给客户端的虚拟 IP/CIDR (支持 IPv4 或 IPv6)。"
+        },
+        "dns": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^([0-9A-Fa-f:.]+|([A-Za-z0-9-]+\\.)*[A-Za-z0-9-]+)$",
+            "description": "DNS 服务器地址或域名。"
+          },
+          "description": "客户端应使用的 DNS 服务器列表 (至少一个)。"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 576,
+          "maximum": 9200,
+          "description": "可选的接口 MTU，未提供时不会写入配置。"
+        },
+        "keepalive": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 25,
+          "description": "PersistentKeepalive 秒数，未指定时工具会采用默认值 25。"
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "description": "定义分流策略。",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["global", "whitelist"],
+          "description": "分流模式：global 表示全局代理，whitelist 表示按域名白名单。"
+        },
+        "allowed_ips": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[0-9A-Fa-f:.]+/[0-9]{1,3}$",
+            "description": "允许通过隧道的 IP/CIDR。"
+          },
+          "description": "global 模式下写入 WireGuard AllowedIPs。"
+        },
+        "whitelist_domains": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "format": "hostname",
+            "description": "需要代理的域名，在 Round 8 中由服务器扩展为 IP 列表。"
+          },
+          "description": "whitelist 模式下的域名列表。"
+        }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "description": "可选备注信息 (仅供本地查看)。"
+    }
+  },
+  "required": ["version", "profile_name", "endpoint", "client", "routing"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "mode": {"const": "global"}
+            },
+            "required": ["mode"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "required": ["allowed_ips"],
+            "properties": {
+              "whitelist_domains": {
+                "maxItems": 0,
+                "description": "global 模式不应提供 whitelist_domains。"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "mode": {"const": "whitelist"}
+            },
+            "required": ["mode"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "required": ["whitelist_domains"],
+            "properties": {
+              "allowed_ips": {
+                "maxItems": 0,
+                "description": "whitelist 模式下由后端填充 AllowedIPs，占位阶段无需填写。"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "profile_name": "mac-whitelist",
+  "endpoint": {
+    "host": "us.example.net",
+    "port": 443,
+    "public_key": "sjVxi8cvRlBu8TX7uXbUWPONrP7610Tu1O3M2CowiGA=",
+    "ipv6": false
+  },
+  "client": {
+    "private_key": "DJVV3GJnzjYdQdm/DYLEdnEq/QucbrpuxTokU5bLuV4=",
+    "address": "10.6.0.3/32",
+    "dns": [
+      "1.1.1.1"
+    ],
+    "keepalive": 25
+  },
+  "routing": {
+    "mode": "whitelist",
+    "whitelist_domains": [
+      "api.openai.com",
+      "github.com"
+    ]
+  },
+  "notes": "Whitelist example. AllowedIPs will be expanded by server tooling in Round 8."
+}

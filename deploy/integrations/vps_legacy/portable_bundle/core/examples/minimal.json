@@ -1,0 +1,28 @@
+{
+  "version": "1",
+  "profile_name": "iphone",
+  "endpoint": {
+    "host": "jp.example.com",
+    "port": 443,
+    "public_key": "sjVxi8cvRlBu8TX7uXbUWPONrP7610Tu1O3M2CowiGA=",
+    "ipv6": false
+  },
+  "client": {
+    "private_key": "DJVV3GJnzjYdQdm/DYLEdnEq/QucbrpuxTokU5bLuV4=",
+    "address": "10.6.0.2/32",
+    "dns": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "mtu": 1380,
+    "keepalive": 25
+  },
+  "routing": {
+    "mode": "global",
+    "allowed_ips": [
+      "0.0.0.0/0",
+      "::/0"
+    ]
+  },
+  "notes": "Example global tunnel suitable for direct import into WireGuard clients."
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Replace the placeholders below with your own identifiers before exporting. -->
+    <key>method</key>
+    <string>ad-hoc</string>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>teamID</key>
+    <string>REPLACE_WITH_TEAM_ID</string>
+    <key>provisioningProfiles</key>
+    <dict>
+        <key>com.privatetunnel.app</key>
+        <string>REPLACE_WITH_APP_PROFILE_NAME</string>
+        <key>com.privatetunnel.PacketTunnelProvider</key>
+        <string>REPLACE_WITH_EXTENSION_PROFILE_NAME</string>
+    </dict>
+    <key>destination</key>
+    <string>export</string>
+    <key>compileBitcode</key>
+    <false/>
+    <key>stripSwiftSymbols</key>
+    <true/>
+    <key>thinning</key>
+    <string>&lt;none&gt;</string>
+</dict>
+</plist>

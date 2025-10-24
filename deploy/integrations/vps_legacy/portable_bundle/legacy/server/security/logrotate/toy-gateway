@@ -1,0 +1,13 @@
+/var/log/private-tunnel/toy-gateway.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    size 25M
+    postrotate
+        systemctl kill --signal=SIGUSR1 toy-gateway.service 2>/dev/null || true
+    endscript
+}

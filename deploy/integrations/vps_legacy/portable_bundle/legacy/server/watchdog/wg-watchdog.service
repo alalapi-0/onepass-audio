@@ -1,0 +1,15 @@
+[Unit]
+Description=PrivateTunnel WireGuard watchdog (placeholder)
+After=network.target
+Requires=wg-quick@wg0.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+# TODO: Replace ExecStart with a wrapper script once the WireGuard data plane is integrated.
+# Example:
+# ExecStart=/usr/bin/systemctl restart wg-quick@wg0
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

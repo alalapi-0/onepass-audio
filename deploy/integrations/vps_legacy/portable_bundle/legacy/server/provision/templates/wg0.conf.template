@@ -1,0 +1,18 @@
+# WireGuard server configuration managed by PrivateTunnel provisioning scripts.
+# Do not edit manually unless you know what you are doing—use wg-install.sh or
+# peer management helpers so backups and sync operations remain consistent.
+
+[Interface]
+Address = {{SERVER_ADDR}}
+{{SERVER_ADDR_V6}}
+ListenPort = {{PORT}}
+PrivateKey = {{SERVER_PRIVATE_KEY}}
+SaveConfig = false
+
+# The provisioning script dynamically injects firewall/NAT commands below. They
+# run automatically when systemd brings the interface up or down.
+{{POST_UP_BLOCK}}
+{{POST_DOWN_BLOCK}}
+
+# Additional peers are appended after this section. Use wg-add-peer.sh to manage
+# client entries safely.

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  This template illustrates the minimum Network Extension configuration entries
+  required by the Packet Tunnel Provider target. Import the file into the
+  extension target and adjust bundle identifiers as needed.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionAttributes</key>
+        <dict>
+            <key>NSExtensionPointName</key>
+            <string>com.apple.networkextension.packet-tunnel</string>
+        </dict>
+        <key>NSExtensionPrincipalClass</key>
+        <string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+    </dict>
+</dict>
+</plist>
