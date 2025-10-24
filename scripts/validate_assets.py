@@ -244,21 +244,48 @@ def write_markdown(report: dict, general_warnings: List[str], general_errors: Li
         fp.write("\n".join(lines))
 
 
-def item_display_cell(meta: Optional[dict]) -> str:
+def item_display_cell(meta: Optional[Sequence[dict]]) -> str:
     if not meta:
         return "❌ 缺失"
-    return f"✅ `{meta['path']}`"
+
+    if isinstance(meta, dict):
+        entries = [meta]
+    else:
+        entries = list(meta)
+
+    if not entries:
+        return "❌ 缺失"
+
+    first = entries[0]
+    suffix = ""
+    if len(entries) > 1:
+        suffix = f"（共 {len(entries)} 个）"
+    return f"✅ `{first['path']}`{suffix}"
 
 
-def item_audio_cell(meta: Optional[dict]) -> str:
+def item_audio_cell(meta: Optional[Sequence[dict]]) -> str:
     if not meta:
         return "⚠️ 未找到"
-    details = [f"`{meta['path']}`"]
-    if "ext" in meta:
-        details.append(meta["ext"])
-    if "duration_s" in meta:
-        details.append(f"{meta['duration_s']} s")
-    return "✅ " + " / ".join(details)
+
+    if isinstance(meta, dict):
+        entries = [meta]
+    else:
+        entries = list(meta)
+
+    if not entries:
+        return "⚠️ 未找到"
+
+    first = entries[0]
+    details = [f"`{first['path']}`"]
+    if "ext" in first:
+        details.append(first["ext"])
+    if "duration_s" in first:
+        details.append(f"{first['duration_s']} s")
+
+    suffix = ""
+    if len(entries) > 1:
+        suffix = f"（共 {len(entries)} 个）"
+    return "✅ " + " / ".join(details) + suffix
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
