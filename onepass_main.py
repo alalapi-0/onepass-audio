@@ -124,14 +124,17 @@ def handle_setup() -> int:
     return 0
 
 
-def handle_validate() -> int:
+def handle_validate(args: argparse.Namespace) -> int:
     """Handle asset validation via scripts/validate_assets.py."""
 
     script = PROJ_ROOT / "scripts" / "validate_assets.py"
     if not check_script_exists(script, "#5"):
         return 2
-    result = run_cmd([sys.executable, str(script)])
-    return 0 if result.returncode == 0 else 2
+    cmd = [sys.executable, str(script)]
+    if getattr(args, "audio_required", False):
+        cmd.append("--audio-required")
+    result = run_cmd(cmd)
+    return result.returncode
 
 
 def _build_process_command(
@@ -358,7 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.set_defaults(func=lambda _: handle_setup())
 
     validate_parser = subparsers.add_parser("validate", help="检查素材与配置")
-    validate_parser.set_defaults(func=lambda _: handle_validate())
+    validate_parser.add_argument(
+        "--audio-required",
+        action="store_true",
+        help="强制音频素材也必须存在",
+    )
+    validate_parser.set_defaults(func=handle_validate)
 
     process_parser = subparsers.add_parser("process", help="处理单章音频并生成字幕/EDL")
     process_parser.add_argument("--json", required=True, help="ASR JSON 文件路径")

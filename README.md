@@ -104,6 +104,38 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 若对应脚本尚未生成，会显示友好提示而不会直接报错退出。
 
+## 素材准备与验证
+
+素材需按 stem（不含扩展名）对齐放置在 `data/` 目录下，常见示例如下：
+
+```
+data/asr-json/001.json       ↔  data/original_txt/001.txt
+                               ↘ data/audio/001.m4a  (可选)
+```
+
+支持的音频扩展名为：`.m4a`、`.wav`、`.mp3`、`.flac`。音频素材是可选项，仅在需要渲染或试听时补齐即可。
+
+在录入素材后，可运行以下命令生成报告：
+
+```bash
+python scripts/validate_assets.py
+# 强制要求音频也齐全
+python scripts/validate_assets.py --audio-required
+```
+
+脚本会生成三份文件（均位于 `out/` 目录）：
+
+- `validate_report.json`：机器可读的完整明细，可供其他工具消费；
+- `validate_report.md`：人类可读的 Markdown 总览，含表格与修复建议；
+- `validate_summary.csv`：以 `stem, has_json, has_txt, has_audio, ...` 为列的汇总表。
+
+常见问题速查：
+
+- **文件名不一致**：确保 JSON/TXT/音频的文件名（stem）完全一致，例如 `001.json` ↔ `001.txt` ↔ `001.m4a`。
+- **目录缺失**：若提示缺少 `data/asr-json/` 或 `data/original_txt/`，请先创建目录再放入素材。
+- **只有字幕需求**：如只需导出字幕/标记，可忽略音频缺失警告；若执行 `--audio-required` 则会被视为错误。
+- **音频格式不受支持**：请转换为 `.m4a/.wav/.mp3/.flac` 中的一种后再放入 `data/audio/`。
+
 ## 使用示例
 
 ```bash
