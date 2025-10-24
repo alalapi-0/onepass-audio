@@ -227,6 +227,26 @@ def handle_env_check(args: argparse.Namespace) -> int:
     return 2
 
 
+def _run_auto_fix_env(auto_confirm: bool = True) -> int:
+    section("一键自动修复环境")
+    script = PROJ_ROOT / "scripts" / "auto_fix_env.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}")
+        return 2
+    cmd = [sys.executable, str(script)]
+    if auto_confirm:
+        cmd.append("--yes")
+    _print_command(cmd)
+    rc = run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
+    if rc == 0:
+        log_ok("自动修复完成。")
+    elif rc == 1:
+        log_warn("自动修复完成但存在警告，请检查输出。")
+    else:
+        log_err("自动修复失败，请根据日志手动处理后重试。")
+    return rc
+
+
 def _build_process_command(
     json_path: Path,
     original_path: Path,
@@ -1224,13 +1244,25 @@ def _interactive_vultr_wizard() -> None:
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
         print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
+        print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
         print("Q) 返回主菜单")
-        choice = input("选择（1-5 / Q 返回）: ").strip().lower()
+        choice = input("选择（1-5/X / Q 返回）: ").strip().lower()
         if choice in {"q", ""}:
             log_info("已返回主菜单。")
             return
-        if choice not in {"1", "2", "3", "4", "5"}:
+        if choice not in {"1", "2", "3", "4", "5", "x"}:
             log_warn("无效选项，请重新输入。")
+            continue
+        if choice == "x":
+            _run_auto_fix_env(auto_confirm=True)
+            log_info("自动修复完成后，重新执行环境自检……")
+            rc_env = _run_vultr_cli("env-check")
+            if rc_env == 0:
+                log_ok("环境自检通过。")
+            elif rc_env == 1:
+                log_warn("环境自检仍有警告，请查看输出。")
+            else:
+                log_err("环境自检仍未通过，请根据日志手动处理。")
             continue
         if choice in {"2", "3", "4"} and not env_file.exists():
             log_err(
@@ -1301,6 +1333,7 @@ def interactive_menu() -> int:
         print("V) 云端部署（Vultr）向导（四步式）")
         print("0) 批量转写音频（本地/云端一键流程）")
         print("1) 环境自检")
+        print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
         print("2) 素材检查")
         print("3) 单章处理（去口癖 + 保留最后一遍 + 字幕/EDL/标记）")
         print("4) 仅渲染音频（按 EDL）")
@@ -1310,7 +1343,7 @@ def interactive_menu() -> int:
         print("8) 清理产物（按 stem 或全部）")
         print("9) 生成快照（冻结当前 out/）")
         print("A) 回滚到某次快照")
-        choice = input("选择（0-9/A/V）: ").strip()
+        choice = input("选择（0-9/A/V/X）: ").strip()
         if choice.lower() == "v":
             _interactive_vultr_wizard()
             continue
@@ -1319,6 +1352,17 @@ def interactive_menu() -> int:
             continue
         if choice == "1":
             _interactive_env_check()
+            continue
+        if choice.lower() == "x":
+            _run_auto_fix_env(auto_confirm=True)
+            log_info("自动修复完成后，重新执行 Vultr 环境自检……")
+            rc_env = _run_vultr_cli("env-check")
+            if rc_env == 0:
+                log_ok("环境自检通过。")
+            elif rc_env == 1:
+                log_warn("环境自检仍有警告，请查看输出。")
+            else:
+                log_err("环境自检仍未通过，请根据日志手动处理。")
             continue
         if choice == "2":
             _interactive_validate()
