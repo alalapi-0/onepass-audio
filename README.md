@@ -159,6 +159,36 @@ pwsh -File .\scripts\bulk_process.ps1 -AutoASR
 
 主程序子命令 `asr` 会转调用 `scripts/asr_batch.py`，支持常用参数；批处理脚本开启 `-AutoASR` 后会在缺少 JSON 时自动转写音频，再继续执行去口癖、字幕和渲染流程。
 
+## 稳定同步→远端处理→回收结果（rsync 优先）
+
+当本地音频体积较大、需要多次增量推送至远端 VPS 时，可使用全新的 `sync` provider 构建“一键流水线”：上传音频 → 远端批量转写 → 回收 JSON 与日志 → 本地校验。流程完全基于 PowerShell 7、rsync/scp 与现有脚本，保持幂等，可多次重复执行。
+
+```powershell
+# 0) 复制模板并填写连接参数
+Copy-Item deploy/sync/sync.env.example deploy/sync/sync.env
+
+# 1) （可选）远端初始化依赖/venv
+ssh -i C:\Users\YOU\.ssh\id_rsa ubuntu@VPS "bash -lc 'cd onepass && bash deploy/remote_provision.sh'"
+
+# 2) 同步音频到远端（增量、断点续传）
+python scripts/deploy_cli.py provider --set sync
+python scripts/deploy_cli.py upload_audio
+
+# 3) 在远端批量生成词级 JSON
+python scripts/deploy_cli.py run_asr --workers 1
+
+# 4) 回收 JSON 与日志并校验
+python scripts/deploy_cli.py fetch_outputs
+python scripts/verify_asr_words.py
+```
+
+### FAQ（sync provider）
+
+- **没有 rsync？** 上传/拉取脚本会自动退回 scp（带 `-C` 压缩），但无法断点续传；建议在本地安装 rsync（可随 Git for Windows 或 MinGW 获取）。
+- **只想增量同步、不删远端多余文件？** 在上传命令后追加 `--no-delete` 即可：`python scripts/deploy_cli.py upload_audio --no-delete`。
+- **运行速度受什么影响？** 推理速度主要由远端 GPU 型号与并发决定，网络 IO 非主要瓶颈。建议首次完成全量同步，后续多为增量传输。
+- **脚本在哪里修改连接参数？** 复制 `deploy/sync/sync.env.example` 为 `deploy/sync/sync.env` 后填写 `VPS_HOST`、`VPS_USER`、密钥路径与远端目录。`USE_RSYNC_FIRST=true` 时会优先尝试 rsync。
+
 ## 接入你已有的 VPS 项目（provider=legacy）
 
 新版部署流水线通过 `scripts/deploy_cli.py` 统一封装 provision/upload/run/fetch/status 流程，并通过 `deploy/provider.yaml` 切换 builtin（官方 ssh/scp）与 legacy（既有项目适配层）。接入步骤如下：

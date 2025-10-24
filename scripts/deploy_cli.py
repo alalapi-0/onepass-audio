@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 
@@ -36,6 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     upload = subparsers.add_parser("upload_audio", help="同步 data/audio/ 到远端")
     _add_common_options(upload)
+    upload.add_argument("--no-delete", action="store_true", help="禁用远端多余文件删除")
 
     run = subparsers.add_parser("run_asr", help="在远端运行 scripts/asr_batch.py")
     run.add_argument("--pattern", help="音频匹配模式", default=None)
@@ -53,7 +55,11 @@ def _build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="查看远端作业状态")
 
     provider = subparsers.add_parser("provider", help="查看或切换部署 provider")
-    provider.add_argument("--set", choices=["builtin", "legacy", "sshfs"], help="切换 provider")
+    provider.add_argument(
+        "--set",
+        choices=["builtin", "legacy", "sshfs", "sync"],
+        help="切换 provider",
+    )
     provider.add_argument("--show", action="store_true", help="仅显示当前 provider")
 
     return parser
@@ -79,7 +85,7 @@ def handle_provision(args: argparse.Namespace) -> int:
 def handle_upload(args: argparse.Namespace) -> int:
     provider = get_provider()
     audio_dir = PROJ_ROOT / "data" / "audio"
-    return provider.upload_audio(audio_dir, dry_run=args.dry_run)
+    return provider.upload_audio(audio_dir, dry_run=args.dry_run, no_delete=args.no_delete)
 
 
 def handle_run(args: argparse.Namespace) -> int:
@@ -100,7 +106,15 @@ def handle_fetch(args: argparse.Namespace) -> int:
     provider = get_provider()
     local_dir = PROJ_ROOT / "data" / "asr-json"
     since = args.since
-    return provider.fetch_outputs(local_dir, since_iso=since, dry_run=args.dry_run)
+    rc = provider.fetch_outputs(local_dir, since_iso=since, dry_run=args.dry_run)
+    if rc == 0 and not args.dry_run:
+        verify_script = PROJ_ROOT / "scripts" / "verify_asr_words.py"
+        if verify_script.exists():
+            log_info("自动校验 ASR JSON words 字段……")
+            result = subprocess.run([sys.executable, str(verify_script)], cwd=PROJ_ROOT)
+            if result.returncode != 0:
+                log_warn(f"verify_asr_words 返回码 {result.returncode}。")
+    return rc
 
 
 def handle_status(args: argparse.Namespace) -> int:
@@ -121,7 +135,7 @@ def handle_provider(args: argparse.Namespace) -> int:
     if args.show or not args.set:
         log_info(f"当前 provider：{current}")
         if not args.show and not args.set:
-            log_info("可使用 --set builtin|legacy|sshfs 进行切换。")
+            log_info("可使用 --set builtin|legacy|sshfs|sync 进行切换。")
         return 0
     return 0
 

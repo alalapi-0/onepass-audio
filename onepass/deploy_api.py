@@ -34,7 +34,12 @@ class DeployProvider(Protocol):
 
     def provision(self, dry_run: bool = False) -> int: ...
 
-    def upload_audio(self, local_audio_dir: Path, dry_run: bool = False) -> int: ...
+    def upload_audio(
+        self,
+        local_audio_dir: Path,
+        dry_run: bool = False,
+        no_delete: bool = False,
+    ) -> int: ...
 
     def run_asr(
         self,
@@ -63,10 +68,14 @@ def format_cmd(cmd: Sequence[str]) -> str:
     return _format_cmd(list(cmd))
 
 
-def run_streamed(cmd: Sequence[str], cwd: Path | None = None) -> int:
+def run_streamed(
+    cmd: Sequence[str],
+    cwd: Path | None = None,
+    env: Dict[str, str] | None = None,
+) -> int:
     """对 ``onepass.ux.run_streamed`` 的轻量封装。"""
 
-    return _run_streamed(list(cmd), cwd=cwd, heartbeat_s=30.0, show_cmd=False)
+    return _run_streamed(list(cmd), cwd=cwd, env=env, heartbeat_s=30.0, show_cmd=False)
 
 
 def _simple_yaml_load(text: str) -> Dict[str, Any]:
@@ -190,8 +199,8 @@ def get_current_provider_name(config: Dict[str, Any] | None = None) -> str:
 
 
 def set_current_provider(name: str) -> None:
-    if name not in {"builtin", "legacy", "sshfs"}:
-        raise ValueError("provider 仅支持 builtin、legacy 或 sshfs")
+    if name not in {"builtin", "legacy", "sshfs", "sync"}:
+        raise ValueError("provider 仅支持 builtin、legacy、sshfs 或 sync")
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"缺少 {CONFIG_PATH}")
     text = CONFIG_PATH.read_text(encoding="utf-8")
@@ -269,13 +278,20 @@ class _BuiltinProvider:
             return 2
         return self._run_bash(script, [], dry_run=dry_run)
 
-    def upload_audio(self, local_audio_dir: Path, dry_run: bool = False) -> int:
+    def upload_audio(
+        self,
+        local_audio_dir: Path,
+        dry_run: bool = False,
+        no_delete: bool = False,
+    ) -> int:
         script = self._deploy_dir / "deploy_to_vps.ps1"
         if not script.exists():
             log_err(f"缺少脚本：{script}")
             return 2
         remote_audio = self._remote_path("data", "audio")
         args = ["-AudioDir", str(local_audio_dir), "-RemoteDir", remote_audio]
+        if no_delete:
+            log_warn("builtin provider 当前不支持 --no-delete，仍将执行默认行为。")
         return self._run_pwsh(script, args, dry_run=dry_run)
 
     def run_asr(
@@ -356,8 +372,15 @@ class _LegacyProvider:
     def provision(self, dry_run: bool = False) -> int:
         return self._invoke("provision", [], dry_run=dry_run)
 
-    def upload_audio(self, local_audio_dir: Path, dry_run: bool = False) -> int:
+    def upload_audio(
+        self,
+        local_audio_dir: Path,
+        dry_run: bool = False,
+        no_delete: bool = False,
+    ) -> int:
         extra = ["-LocalAudio", str(local_audio_dir)]
+        if no_delete:
+            log_warn("legacy provider 暂不支持 --no-delete，忽略该参数。")
         return self._invoke("upload_audio", extra, dry_run=dry_run)
 
     def run_asr(
@@ -442,6 +465,181 @@ class _SshfsProvider:
             cmd.extend(["-i", key])
         return cmd
 
+
+class _SyncProvider:
+    """rsync 优先的一键同步 Provider。"""
+
+    def __init__(self, config: Dict[str, Any]) -> None:
+        self._config = config
+        self._defaults = _read_common_defaults(config)
+        section = config.get("sync", {})
+        env_path_str = str(section.get("env_file", "deploy/sync/sync.env"))
+        self._env_file = PROJ_ROOT / env_path_str
+        self._env_vars = _load_env_file(self._env_file)
+        self._pwsh = shutil.which("pwsh")
+        self._ssh = shutil.which("ssh")
+        if self._pwsh is None:
+            raise FileNotFoundError("未找到 PowerShell 7 (pwsh)，无法使用 sync provider。")
+        if self._ssh is None:
+            raise FileNotFoundError("未找到 ssh 命令，无法使用 sync provider。")
+        self._upload_script = PROJ_ROOT / "deploy" / "sync" / "sync_upload.ps1"
+        self._fetch_script = PROJ_ROOT / "deploy" / "sync" / "sync_fetch.ps1"
+        self._remote_runner = PROJ_ROOT / "deploy" / "sync" / "remote_run_asr.sh"
+        for script in [self._upload_script, self._fetch_script, self._remote_runner]:
+            if not script.exists():
+                raise FileNotFoundError(f"缺少脚本：{script}")
+        required = [
+            "VPS_HOST",
+            "VPS_USER",
+            "VPS_SSH_KEY",
+            "VPS_REMOTE_DIR",
+            "REMOTE_AUDIO",
+            "REMOTE_ASR_JSON",
+            "REMOTE_LOG_DIR",
+        ]
+        for key in required:
+            if not self._env_vars.get(key):
+                raise ValueError(f"环境变量 {key} 未设置，无法使用 sync provider。")
+    def _make_env(self, overrides: Dict[str, str] | None = None) -> Dict[str, str]:
+        env = os.environ.copy()
+        env.update(self._env_vars)
+        if overrides:
+            env.update({k: str(v) for k, v in overrides.items()})
+        return env
+
+    def _ssh_target(self) -> str:
+        return f"{self._env_vars['VPS_USER']}@{self._env_vars['VPS_HOST']}"
+
+    def _ssh_base_cmd(self) -> list[str]:
+        cmd = [self._ssh or "ssh"]
+        key = self._env_vars.get("VPS_SSH_KEY")
+        if key:
+            cmd.extend(["-i", key])
+        return cmd
+
+    def _remote_dir(self) -> str:
+        remote_dir = self._env_vars.get("VPS_REMOTE_DIR") or self._defaults.remote_dir
+        return remote_dir.rstrip("/")
+
+    def provision(self, dry_run: bool = False) -> int:
+        remote_dir = self._remote_dir()
+        remote_cmd = f"cd {shlex.quote(remote_dir)} && bash deploy/remote_provision.sh"
+        ssh_cmd = self._ssh_base_cmd() + [
+            self._ssh_target(),
+            f"bash -lc {shlex.quote(remote_cmd)}",
+        ]
+        log_info("sync provider 将调用远端 deploy/remote_provision.sh 以准备环境。")
+        if dry_run:
+            log_info(f"[DryRun] 远端命令：{format_cmd(ssh_cmd)}")
+            return 0
+        log_info(f"执行：{format_cmd(ssh_cmd)}")
+        return run_streamed(ssh_cmd)
+
+    def upload_audio(
+        self,
+        local_audio_dir: Path,
+        dry_run: bool = False,
+        no_delete: bool = False,
+    ) -> int:
+        overrides = {"LOCAL_AUDIO": str(local_audio_dir)}
+        env = self._make_env(overrides)
+        cmd = [self._pwsh or "pwsh", "-File", str(self._upload_script)]
+        if dry_run:
+            cmd.append("-DryRun")
+        if no_delete:
+            cmd.append("-NoDelete")
+        log_info(f"执行：{format_cmd(cmd)}")
+        return run_streamed(cmd, cwd=PROJ_ROOT, env=env)
+
+    def run_asr(
+        self,
+        audio_pattern: str,
+        model: str,
+        language: str,
+        device: str,
+        compute: str,
+        workers: int,
+        dry_run: bool = False,
+    ) -> int:
+        overrides = {
+            "AUDIO_PATTERN": audio_pattern,
+            "ASR_MODEL": model,
+            "ASR_LANGUAGE": language,
+            "ASR_DEVICE": device,
+            "ASR_COMPUTE": compute,
+            "ASR_WORKERS": str(workers),
+        }
+        env = self._make_env(overrides)
+        remote_env_parts = []
+        for key, value in env.items():
+            if key.startswith("ASR_") or key in {
+                "AUDIO_PATTERN",
+                "REMOTE_AUDIO",
+                "REMOTE_ASR_JSON",
+                "REMOTE_LOG_DIR",
+                "VPS_REMOTE_DIR",
+            }:
+                remote_env_parts.append(f"{key}={shlex.quote(value)}")
+        remote_env = " ".join(remote_env_parts)
+        remote_dir = self._remote_dir()
+        inner = f"cd {shlex.quote(remote_dir)} && {remote_env} bash deploy/sync/remote_run_asr.sh"
+        ssh_cmd = self._ssh_base_cmd() + [
+            self._ssh_target(),
+            f"bash -lc {shlex.quote(inner)}",
+        ]
+        if dry_run:
+            log_info(f"[DryRun] 远端命令：{format_cmd(ssh_cmd)}")
+            return 0
+        log_info(f"执行：{format_cmd(ssh_cmd)}")
+        return run_streamed(ssh_cmd)
+
+    def fetch_outputs(
+        self,
+        local_asr_json_dir: Path,
+        since_iso: str | None = None,
+        dry_run: bool = False,
+    ) -> int:
+        if since_iso:
+            log_warn("sync provider 暂不支持 --since 过滤，将完整增量拉取。")
+        overrides = {}
+        env = self._make_env(overrides)
+        cmd = [self._pwsh or "pwsh", "-File", str(self._fetch_script)]
+        if dry_run:
+            cmd.append("-DryRun")
+        log_info(f"执行：{format_cmd(cmd)}")
+        return run_streamed(cmd, cwd=PROJ_ROOT, env=env)
+
+    def status(self) -> int:
+        remote_dir = self._remote_dir()
+        log_file = self._env_vars.get("REMOTE_LOG_DIR", f"{remote_dir}/out")
+        log_path = f"{log_file.rstrip('/')}/asr_job.log"
+        status_script = textwrap.dedent(
+            f"""
+            set -e
+            echo '=== 磁盘空间 ==='
+            df -h {shlex.quote(remote_dir)} || true
+            if command -v nvidia-smi >/dev/null 2>&1; then
+                echo '=== GPU 使用情况 ==='
+                nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv,noheader || true
+            else
+                echo 'nvidia-smi 未找到。'
+            fi
+            if [ -f {shlex.quote(log_path)} ]; then
+                echo '=== asr_job.log (最近 20 行) ==='
+                tail -n 20 {shlex.quote(log_path)}
+            else
+                echo '未找到日志文件：{log_path}'
+            fi
+            """
+        ).strip()
+        inner = f"cd {shlex.quote(remote_dir)} && {status_script}"
+        ssh_cmd = self._ssh_base_cmd() + [
+            self._ssh_target(),
+            f"bash -lc {shlex.quote(inner)}",
+        ]
+        log_info(f"执行：{format_cmd(ssh_cmd)}")
+        return run_streamed(ssh_cmd)
+
     def _build_remote_cmd(self, remote_command: str) -> list[str]:
         inner = f"cd {shlex.quote(self._remote_dir)} && {remote_command}"
         return self._ssh_base_cmd() + [self._ssh_target(), f"bash -lc {shlex.quote(inner)}"]
@@ -496,13 +694,20 @@ class _SshfsProvider:
         self._maybe_start_local_tunnel()
         return self._run_remote_script("remote_mount_local.sh")
 
-    def upload_audio(self, local_audio_dir: Path, dry_run: bool = False) -> int:
+    def upload_audio(
+        self,
+        local_audio_dir: Path,
+        dry_run: bool = False,
+        no_delete: bool = False,
+    ) -> int:
         pattern_src = self._env_vars.get("AUDIO_PATTERN", self._defaults.audio_pattern)
         pattern_list = [
             p.strip()
             for p in pattern_src.split(",")
             if p.strip()
         ]
+        if no_delete:
+            log_warn("sshfs provider 不执行远端删除操作，忽略 --no-delete。")
         py_code = textwrap.dedent(
             f"""
             from pathlib import Path
@@ -664,5 +869,8 @@ def get_provider(config: Dict[str, Any] | None = None) -> DeployProvider:
     if current == "sshfs":
         log_info("使用 sshfs provider")
         return _SshfsProvider(data)
+    if current == "sync":
+        log_info("使用 sync provider")
+        return _SyncProvider(data)
     log_info("使用 builtin provider")
     return _BuiltinProvider(data)
