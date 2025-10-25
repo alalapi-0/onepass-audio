@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import textwrap
 import time
 import urllib.error
@@ -247,7 +248,15 @@ def resolve_os_id(slug: str, *, api_key: str) -> str:
         raise VultrError("操作系统标识不能为空。")
     if normalized.isdigit():
         return normalized
+
+    def _normalize(value: str) -> str:
+        """将字符串标准化为便于匹配的形式。"""
+
+        value_lower = value.lower().strip()
+        return re.sub(r"[^a-z0-9]+", "", value_lower)
+
     target = normalized.lower()
+    normalized_target = _normalize(normalized)
     os_list = list_os(api_key)
     for item in os_list:
         candidates = [
@@ -255,9 +264,22 @@ def resolve_os_id(slug: str, *, api_key: str) -> str:
             item.get("name"),
             item.get("description"),
             item.get("family"),
+            item.get("short_name"),
         ]
         for value in candidates:
-            if value and str(value).lower() == target:
+            if not value:
+                continue
+            value_lower = str(value).lower()
+            if value_lower == target:
+                return str(item.get("id"))
+            normalized_value = _normalize(str(value))
+            if not normalized_value:
+                continue
+            if normalized_value == normalized_target or (
+                normalized_target and normalized_value.startswith(normalized_target)
+            ) or (
+                normalized_value and normalized_target.startswith(normalized_value)
+            ):
                 return str(item.get("id"))
     raise VultrError(f"未找到匹配的操作系统：{slug}")
 
