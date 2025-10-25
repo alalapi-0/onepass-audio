@@ -24,6 +24,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# ==== BEGIN: OnePass Patch · R4.5 (cli suppress) ====
+
+
+def _win_only_enabled_cli() -> bool:
+    v = os.environ.get("WIN_ONLY", "true").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+# ==== END: OnePass Patch · R4.5 (cli suppress) ====
+
 CUR_DIR = Path(__file__).resolve().parent
 PROJ_ROOT = CUR_DIR.parents[2]
 if str(PROJ_ROOT) not in sys.path:
@@ -1066,9 +1076,10 @@ def cmd_env_check(args: argparse.Namespace) -> int:
                 log_warn(f"pwsh 返回码 {code}：{message}")
                 status_warn.append("pwsh")
         else:
-            log_warn(
-                "未找到 PowerShell 7 (pwsh)，推荐安装 https://aka.ms/powershell 以使用补充功能。"
-            )
+            if not _win_only_enabled_cli():
+                log_warn(
+                    "未找到 PowerShell 7 (pwsh)，推荐安装 https://aka.ms/powershell 以使用补充功能。"
+                )
             status_warn.append("pwsh-missing")
 
         for cmd in ("ssh", "scp"):

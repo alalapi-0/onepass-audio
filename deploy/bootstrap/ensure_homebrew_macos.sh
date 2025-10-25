@@ -1,3 +1,8 @@
+# ==== BEGIN: OnePass Patch · R4.5 (deprecated header) ====
+# DEPRECATED (kept for fallback)
+# This script/path is retained for macOS/PowerShell fallback. Default Windows path no longer uses it.
+# To re-enable cross-platform prompts, set environment variable: WIN_ONLY=false
+# ==== END: OnePass Patch · R4.5 (deprecated header) ====
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
 #
