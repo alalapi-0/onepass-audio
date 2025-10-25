@@ -86,6 +86,11 @@ try {
     Write-Info 'Please restart your terminal session to use the newly installed pwsh.'
     exit 0
 } catch {
+    $message = $_.Exception.Message
+    if ($message -match 'exit code (-?\d+)' -and [int]$Matches[1] -in @(-1978335189, -1978335192, 1223)) {
+        Write-Warn 'winget elevation request was denied. Please rerun this script from an elevated PowerShell session (Run as Administrator) and accept the UAC prompt.'
+        exit 1
+    }
     Write-Error $_
     exit 2
 }

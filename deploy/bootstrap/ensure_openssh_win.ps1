@@ -25,6 +25,18 @@ function Write-Warn {
     Write-Warning $Message
 }
 
+function Is-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not (Is-Admin)) {
+    Write-Warn 'Administrator privileges are required to install Windows capabilities and configure ssh-agent.'
+    Write-Warn 'Please rerun auto_fix_env.py from an elevated PowerShell session (Run as Administrator) and accept the UAC prompt.'
+    exit 1
+}
+
 function Ensure-Capability {
     param([string]$CapabilityName)
     Write-Info "Ensuring Windows capability $CapabilityName is installed..."
