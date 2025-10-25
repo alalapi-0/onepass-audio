@@ -1299,7 +1299,7 @@ def _interactive_vultr_wizard() -> None:
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
         print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
-        print("L) 列出东京(nrt)+Ubuntu 22.04 可用的 GPU 计划")
+        print("L) 仅查看东京(nrt)+Ubuntu 22.04 可用的 GPU 计划")
         print("P) 选择配置 Profile 并应用")
         print("R) 查看当前激活配置 / 最近快照")
         print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")

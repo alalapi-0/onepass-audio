@@ -33,6 +33,7 @@ from deploy.cloud.vultr.vultr_api import (  # noqa: E402
     create_ssh_key,
     delete_instance,
     get_instance,
+    get_account_info,
     extract_region_availability,
     list_gpu_plans,
     list_instances,
@@ -637,11 +638,19 @@ def cmd_create(args: argparse.Namespace) -> int:
         return 2
 
     api_key = env["VULTR_API_KEY"].strip()
+    # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
+    try:
+        get_account_info(api_key)
+    except VultrError:
+        log_err("API Key 无效或无权限（请检查 deploy/cloud/vultr/vultr.env 的 VULTR_API_KEY）")
+        return 2
+
     try:
         ssh_key_id, ssh_key_name = _ensure_ssh_key(env)
     except VultrError as exc:
         log_err(_format_exception(exc))
         return 2
+    # ==== END: OnePass Patch · R1 ====
 
     try:
         region = _resolve_region(env.get("VULTR_REGION", "sgp"), api_key)
@@ -1468,30 +1477,31 @@ def cmd_regions(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_plans(args: argparse.Namespace) -> int:
-    gpu_only = False if args.gpu_only is None else args.gpu_only
-    only_available = False if args.only_available is None else args.only_available
-    region = args.region or "nrt"
+# ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
+def _cmd_plans_legacy(args: argparse.Namespace) -> int:
+    gpu_only = getattr(args, "gpu_only", False)
+    only_available = getattr(args, "only_available", False)
+    region = getattr(args, "region", None) or "nrt"
     try:
         env = _ensure_env_with_api_key(require_ssh=False)
     except (VultrError, FileNotFoundError) as exc:
         log_err(_format_exception(exc))
         return 2
     api_key = env["VULTR_API_KEY"].strip()
-    if args.dry_run:
+    if getattr(args, "dry_run", False):
         log_info(
             "[DryRun] 将列出 Vultr 计划："
-            f"region={region}, os={args.os}, gpu_only={gpu_only}, only_available={only_available}"
+            f"region={region}, os={getattr(args, 'os', 'ubuntu-22.04')}, gpu_only={gpu_only}, only_available={only_available}"
         )
         return 0
     try:
-        os_id = resolve_os_id(args.os, api_key=api_key)
+        os_id = resolve_os_id(getattr(args, "os", "ubuntu-22.04"), api_key=api_key)
     except VultrError as exc:
         log_err(_format_exception(exc))
         return 2
     try:
         if gpu_only:
-            plans = list_gpu_plans(region=region if only_available else None, api_key=api_key)
+            plans = [plan for plan in list_plans(api_key) if _plan_matches_gpu_keywords(plan)]
         else:
             plans = list_plans(api_key)
     except VultrError as exc:
@@ -1499,13 +1509,18 @@ def cmd_plans(args: argparse.Namespace) -> int:
         return 2
 
     entries: List[dict] = []
-    filter_text = args.filter.lower() if args.filter else None
+    filter_text_raw = getattr(args, "filter", None)
+    filter_text = filter_text_raw.lower() if filter_text_raw else None
     try:
-        family_pattern = re.compile(args.family, re.IGNORECASE) if args.family else None
+        family_pattern = (
+            re.compile(getattr(args, "family", None), re.IGNORECASE)
+            if getattr(args, "family", None)
+            else None
+        )
     except re.error as exc:
         log_err(f"无效的 --family 正则：{exc}")
         return 2
-    min_vram = args.min_vram
+    min_vram = getattr(args, "min_vram", None)
     os_id_str = str(os_id)
     for plan in plans:
         availability = extract_region_availability(plan)
@@ -1563,7 +1578,7 @@ def cmd_plans(args: argparse.Namespace) -> int:
         log_warn(msg)
         return 1
 
-    sort_key = args.sort
+    sort_key = getattr(args, "sort", "price")
     if sort_key == "price":
         entries.sort(key=lambda item: (item["price"], item["plan_id"]))
     elif sort_key == "vram":
@@ -1598,21 +1613,146 @@ def cmd_plans(args: argparse.Namespace) -> int:
     print("将某个 plan_id 填入 deploy/cloud/vultr/vultr.env 的 VULTR_PLAN= 后，再执行 create")
     print("或直接： python deploy/cloud/vultr/cloud_vultr_cli.py create --plan <plan_id>（若支持覆盖 env）")
     return 0
+# ==== END: OnePass Patch · R1 ====
 
+
+
+def cmd_plans(args: argparse.Namespace) -> int:
+    # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
+    if getattr(args, "legacy", False):
+        return _cmd_plans_legacy(args)
+
+    region = (args.region or "nrt").strip().lower()
+    os_slug = (args.os or "ubuntu-22.04").strip() or "ubuntu-22.04"
+
+    family_pattern = None
+    if args.family:
+        try:
+            family_pattern = re.compile(args.family, re.IGNORECASE)
+        except re.error as exc:
+            log_err(f"无效的 --family 正则：{exc}")
+            return 2
+
+    try:
+        min_vram = int(args.min_vram) if args.min_vram is not None else None
+    except (TypeError, ValueError):
+        log_err("--min-vram 需要整数值")
+        return 2
+
+    try:
+        env = _ensure_env_with_api_key(require_ssh=False)
+    except (VultrError, FileNotFoundError) as exc:
+        log_err(_format_exception(exc))
+        return 2
+
+    api_key = env["VULTR_API_KEY"].strip()
+    if args.dry_run:
+        log_info(
+            f"[DryRun] 将获取 GPU 计划：region={region} os={os_slug} only_available={args.only_available}"
+        )
+        return 0
+
+    if args.verbose:
+        log_info(f"[进行中] 请求 GPU 套餐，region={region}")
+    try:
+        plans = list_gpu_plans(
+            region=region if args.only_available else None,
+            os_slug=os_slug,
+            api_key=api_key,
+        )
+    except VultrError as exc:
+        log_err(_format_exception(exc))
+        return 2
+    if args.verbose:
+        log_ok(f"获取到 {len(plans)} 条套餐记录（原始数据）")
+
+    filtered: List[dict] = []
+    for plan in plans:
+        available_regions = plan.get("available_regions") or []
+        if args.only_available and available_regions:
+            normalized = {str(item).lower() for item in available_regions}
+            if region not in normalized:
+                continue
+        family = plan.get("family") or "-"
+        if family_pattern and not family_pattern.search(family):
+            continue
+        gpu_vram = plan.get("gpu_vram_gb")
+        if min_vram is not None and (gpu_vram is None or gpu_vram < min_vram):
+            continue
+        filtered.append(plan)
+
+    if args.verbose:
+        log_info(f"[提示] 按条件过滤后剩余 {len(filtered)} 条记录")
+
+    if args.json:
+        print(json.dumps(filtered, ensure_ascii=False, indent=2))
+        return 0 if filtered else 1
+
+    if not filtered:
+        region_display = {"nrt": "东京"}.get(region, region.upper())
+        log_warn(
+            f"{region_display}({region})暂无满足条件的 GPU 套餐，可尝试 --region sgp/lax/fra"
+        )
+        return 1
+
+    headers = ["plan_id", "family", "vRAM", "vCPU", "RAM", "Storage", "Price/h", "Regions"]
+    rows: List[List[str]] = []
+    for plan in filtered:
+        plan_id = plan.get("plan_id") or "-"
+        family = plan.get("family") or "-"
+        gpu_vram = plan.get("gpu_vram_gb")
+        ram_gb = plan.get("ram_gb")
+        price_hour = plan.get("price_hour")
+        regions = plan.get("available_regions")
+        if regions:
+            regions_text = ",".join(sorted(str(item).upper() for item in regions))
+        else:
+            regions_text = "?"
+        highlight = bool(min_vram is not None and gpu_vram is not None and gpu_vram >= min_vram)
+        family_display = family
+        if highlight:
+            family_display = f"*{family}" if family != "-" else "*GPU"
+        rows.append(
+            [
+                str(plan_id),
+                family_display,
+                f"{gpu_vram}GB" if gpu_vram is not None else "-",
+                str(plan.get("vcpu") if plan.get("vcpu") is not None else "-"),
+                f"{ram_gb}GB" if ram_gb is not None else "-",
+                plan.get("storage") or "-",
+                f"${price_hour:.4f}" if price_hour is not None else "-",
+                regions_text,
+            ]
+        )
+
+    _print_table(headers, rows, max_col_width=28)
+
+    grey = "[90m"
+    reset = "[0m"
+    for plan in filtered:
+        plan_id = plan.get("plan_id") or "-"
+        sample = f"› VULTR_PLAN={plan_id}  VULTR_REGION={region}  VULTR_OS={os_slug}"
+        print(f"{grey}{sample}{reset}")
+
+    log_ok("完成 GPU 套餐列表。")
+    # ==== END: OnePass Patch · R1 ====
+    return 0
 
 def cmd_plans_nrt(args: argparse.Namespace) -> int:
+    # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
     merged = argparse.Namespace(
         region="nrt",
         os="ubuntu-22.04",
-        gpu_only=True,
-        only_available=True,
-        family=None,
-        min_vram=None,
-        filter=None,
-        sort="price",
+        only_available=not getattr(args, "include_unavailable", False),
+        family=getattr(args, "family", None),
+        min_vram=getattr(args, "min_vram", None),
+        json=getattr(args, "json", False),
+        verbose=getattr(args, "verbose", False),
         dry_run=args.dry_run,
+        legacy=False,
     )
     return cmd_plans(merged)
+    # ==== END: OnePass Patch · R1 ====
 
 
 def cmd_os(args: argparse.Namespace) -> int:
@@ -1792,42 +1932,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     plans_parser = sub.add_parser("plans", help="列出可选 Plan")
     plans_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
-    plans_parser.add_argument("--os", default="ubuntu-22.04", help="操作系统 slug 或 ID")
-    plans_parser.add_argument("--gpu-only", dest="gpu_only", action="store_true", help="仅显示 GPU 套餐")
-    plans_parser.add_argument(
-        "--no-gpu-only",
-        dest="gpu_only",
-        action="store_false",
-        help="显示所有套餐（包含非 GPU）",
-    )
+    plans_parser.add_argument("--os", default="ubuntu-22.04", help="操作系统 slug（默认 ubuntu-22.04）")
+    plans_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
+    plans_parser.add_argument("--min-vram", type=int, help="最小 GPU 显存 (GB)", default=None)
     plans_parser.add_argument(
         "--only-available",
         dest="only_available",
         action="store_true",
-        help="仅显示指定 region 当前可用的套餐",
+        default=True,
+        help="仅显示指定 region 当前标记为可用的套餐（默认启用）",
     )
     plans_parser.add_argument(
         "--include-unavailable",
         dest="only_available",
         action="store_false",
-        help="包含暂不可用的套餐",
+        help="包含暂未标记为可用的套餐",
     )
-    plans_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
-    plans_parser.add_argument("--min-vram", type=float, help="最小 GPU 显存 (GB)", default=None)
-    plans_parser.add_argument(
-        "--sort",
-        choices=["price", "vram", "vcpu"],
-        default="price",
-        help="排序字段 (price/vram/vcpu)",
-    )
-    plans_parser.add_argument("--filter", help="对名称/描述模糊匹配", default=None)
+    plans_parser.add_argument("--json", action="store_true", help="以 JSON 形式输出")
+    plans_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
+    plans_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
     _add_dry_run(plans_parser)
-    plans_parser.set_defaults(func=cmd_plans, gpu_only=False, only_available=False)
+    plans_parser.set_defaults(func=cmd_plans, legacy=False)
 
     plans_nrt_parser = sub.add_parser(
         "plans-nrt",
         help="一键列出东京 nrt + Ubuntu 22.04 可用 GPU 套餐",
     )
+    plans_nrt_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
+    plans_nrt_parser.add_argument("--min-vram", type=int, help="最小 GPU 显存 (GB)", default=None)
+    plans_nrt_parser.add_argument(
+        "--include-unavailable",
+        dest="include_unavailable",
+        action="store_true",
+        help="包含暂未标记为可用的套餐",
+    )
+    plans_nrt_parser.add_argument("--json", action="store_true", help="以 JSON 形式输出")
+    plans_nrt_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
     _add_dry_run(plans_nrt_parser)
     plans_nrt_parser.set_defaults(func=cmd_plans_nrt)
 
