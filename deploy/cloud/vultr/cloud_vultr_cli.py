@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,7 @@ from onepass.ux import (  # noqa: E402
 ENV_FILE = CUR_DIR / "vultr.env"
 STATE_FILE = CUR_DIR / "state.json"
 SYNC_ENV_FILE = PROJ_ROOT / "deploy" / "sync" / "sync.env"
+ACTIVE_PROFILE_PATH = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
 SYNC_DEFAULTS: Dict[str, str] = {
     "VPS_HOST": "",
     "VPS_USER": "ubuntu",
@@ -133,9 +135,93 @@ def _write_env_file(path: Path, data: Dict[str, str], order: Iterable[str]) -> N
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _load_active_profile_env() -> Dict[str, str]:
+    if not ACTIVE_PROFILE_PATH.exists():
+        return {}
+    try:
+        return _parse_env_text(ACTIVE_PROFILE_PATH.read_text(encoding="utf-8"))
+    except OSError as exc:
+        log_warn(f"读取 {ACTIVE_PROFILE_PATH} 失败：{exc}")
+        return {}
+
+
+def _call_envsnap(args: List[str], *, capture: bool = False, dry_run: bool = False) -> Tuple[int, str]:
+    script = PROJ_ROOT / "scripts" / "envsnap.py"
+    if not script.exists():
+        log_err("未找到 scripts/envsnap.py，请确认仓库已更新。")
+        return 2, ""
+    cmd = [sys.executable, str(script), *args]
+    log_info(f"命令：{format_cmd(cmd)}")
+    if dry_run:
+        log_info("[DryRun] 已跳过 envsnap 操作。")
+        return 0, ""
+    if capture:
+        result = subprocess.run(cmd, cwd=PROJ_ROOT, text=True, capture_output=True)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode, result.stdout
+    rc = run_streamed(cmd, cwd=PROJ_ROOT)
+    return rc, ""
+
+
+def _parse_snapshot_output(text: str) -> Tuple[str, str]:
+    run_id = ""
+    snapshot_path = ""
+    for line in text.splitlines():
+        if line.startswith("RUN_ID="):
+            run_id = line.split("=", 1)[1].strip()
+        elif line.startswith("SNAPSHOT_PATH="):
+            snapshot_path = line.split("=", 1)[1].strip()
+    return run_id, snapshot_path
+
+
 def _expand_path(value: str) -> Path:
     expanded = os.path.expandvars(value)
     return Path(expanded).expanduser()
+
+
+def _ssh_read_text(host: str, user: str, key_path: Path, remote_path: str) -> Tuple[int, str]:
+    cmd = [
+        "ssh",
+        "-i",
+        str(key_path),
+        f"{user}@{host}",
+        f"cat {shlex.quote(remote_path)}",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode, result.stdout
+
+
+def _scp_remote_file(host: str, user: str, key_path: Path, remote_path: str, local_path: Path) -> bool:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "scp",
+        "-q",
+        "-i",
+        str(key_path),
+        f"{user}@{host}:{remote_path}",
+        str(local_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+
+def _format_watch_event(data: dict) -> str:
+    event_type = str(data.get("event", ""))
+    timestamp = str(data.get("timestamp", ""))
+    if event_type == "job_start":
+        profile = data.get("profile", "")
+        pattern = data.get("audio_pattern", "")
+        return f"[{timestamp}] job_start · profile={profile} · pattern={pattern}"
+    if event_type == "job_summary":
+        status = data.get("status", "")
+        success = data.get("success", "0")
+        skip = data.get("skip", "0")
+        failure = data.get("failure", "0")
+        return f"[{timestamp}] job_summary · status={status} · success={success} · skip={skip} · failure={failure}"
+    return f"[{timestamp}] {event_type} · {json.dumps(data, ensure_ascii=False)}"
 
 
 def _format_exception(exc: Exception) -> str:
@@ -655,12 +741,14 @@ def cmd_write_sync_env(args: argparse.Namespace) -> int:
     new_data = dict(existing or SYNC_DEFAULTS)
     for key, value in SYNC_DEFAULTS.items():
         new_data.setdefault(key, value)
+    active_profile = _load_active_profile_env()
+    default_remote_dir = active_profile.get("REMOTE_DIR", SYNC_DEFAULTS["VPS_REMOTE_DIR"])
     new_data.update(
         {
             "VPS_HOST": state.get("main_ip", ""),
             "VPS_USER": env.get("SSH_USER", "ubuntu"),
             "VPS_SSH_KEY": env.get("SSH_PRIVATE_KEY", ""),
-            "VPS_REMOTE_DIR": env.get("REMOTE_DIR", SYNC_DEFAULTS["VPS_REMOTE_DIR"]),
+            "VPS_REMOTE_DIR": env.get("REMOTE_DIR", default_remote_dir),
         }
     )
     main_remote_dir = new_data["VPS_REMOTE_DIR"].rstrip("/") or SYNC_DEFAULTS["VPS_REMOTE_DIR"]
@@ -690,14 +778,18 @@ def cmd_write_sync_env(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_step(name: str, cmd: List[str], dry_run: bool) -> int:
+def _run_step(name: str, cmd: List[str], dry_run: bool, extra_env: Optional[Dict[str, str]] = None) -> int:
     log_info(f"开始：{name}")
     log_info(f"命令：{format_cmd(cmd)}")
     if dry_run:
         log_info("[DryRun] 已跳过执行。")
         return 0
     start = time.perf_counter()
-    rc = run_streamed(cmd, cwd=PROJ_ROOT)
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update({k: str(v) for k, v in extra_env.items() if v is not None})
+    rc = run_streamed(cmd, cwd=PROJ_ROOT, env=env)
     elapsed = time.perf_counter() - start
     if rc == 0:
         log_ok(f"完成：{name}（耗时 {elapsed:.1f}s，返回码 0）")
@@ -715,6 +807,42 @@ def cmd_asr_bridge(args: argparse.Namespace) -> int:
         log_err("未找到 scripts/deploy_cli.py")
         return 2
     verify_script = PROJ_ROOT / "scripts" / "verify_asr_words.py"
+
+    active_profile = _load_active_profile_env()
+    active_profile_name = active_profile.get("ENV_PROFILE", "")
+    selected_profile = args.profile or active_profile_name
+    run_id = ""
+    snapshot_path = ""
+
+    if args.profile:
+        log_info(f"应用配置 profile：{args.profile}")
+        rc, _ = _call_envsnap(["apply", "--profile", args.profile], dry_run=args.dry_run)
+        if rc != 0:
+            return rc
+        active_profile = _load_active_profile_env()
+        active_profile_name = args.profile
+    elif active_profile_name:
+        log_info(f"沿用当前激活的 profile：{active_profile_name}")
+    else:
+        log_warn("尚未检测到激活的 profile，请确认已运行 envsnap.py apply。")
+
+    rc, _ = _call_envsnap(["export-remote"], dry_run=args.dry_run)
+    if rc != 0:
+        return rc
+
+    if not args.dry_run:
+        snapshot_args = ["snapshot"]
+        if args.note:
+            snapshot_args.extend(["--note", args.note])
+        snap_rc, snap_stdout = _call_envsnap(snapshot_args, capture=True, dry_run=False)
+        if snap_rc != 0:
+            return snap_rc
+        run_id, snapshot_path = _parse_snapshot_output(snap_stdout)
+        if not run_id:
+            log_warn("未能从快照输出解析 RUN_ID，将继续流程。")
+    else:
+        log_warn("dry-run 模式：不会生成快照或触发远端作业。")
+
     steps: List[Tuple[str, List[str]]] = []
     steps.append(("切换 provider 为 sync", [sys.executable, str(script), "provider", "--set", "sync"]))
 
@@ -751,18 +879,130 @@ def cmd_asr_bridge(args: argparse.Namespace) -> int:
 
     overall_rc = 0
     for name, cmd in steps:
-        rc = _run_step(name, cmd, dry_run=args.dry_run)
+        extra_env = None
+        if name == "远端执行 ASR" and run_id and not args.dry_run:
+            extra_env = {"ENV_RUN_ID": run_id, "ENV_SNAPSHOT_PATH": snapshot_path}
+        rc = _run_step(name, cmd, dry_run=args.dry_run, extra_env=extra_env)
         if rc >= 2:
             return 2
         if rc == 1 and overall_rc == 0:
             overall_rc = 1
         if rc != 0 and name == "校验 JSON words 字段":
             overall_rc = max(overall_rc, rc)
+
     if overall_rc == 0:
         log_ok("云端⇄本地互通桥完成。")
     elif overall_rc == 1:
         log_warn("流程完成但存在警告，请查看日志。")
+
+    if not args.dry_run and run_id:
+        log_info(f"本次 run_id：{run_id}（profile={selected_profile or '<未设置>'}）")
+        if _prompt_bool("是否立即进入 watch 模式查看实时事件?", True):
+            watch_args = argparse.Namespace(run=run_id, interval=3)
+            return cmd_watch(watch_args)
     return overall_rc
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    section("远程 ASR 实时镜像")
+    try:
+        state, env = _ensure_state_for_sync()
+    except (RuntimeError, VultrError, FileNotFoundError) as exc:
+        log_err(_format_exception(exc))
+        return 2
+
+    host = state.get("main_ip")
+    if not host:
+        log_err("state.json 中缺少 main_ip。")
+        return 2
+    user = env.get("SSH_USER", "ubuntu")
+    key_value = env.get("SSH_PRIVATE_KEY_RESOLVED") or env.get("SSH_PRIVATE_KEY", "")
+    key_path = _expand_path(key_value)
+    if not key_path.exists():
+        log_err(f"SSH 私钥不存在：{key_path}")
+        return 2
+
+    remote_dir = env.get("REMOTE_DIR") or env.get("VPS_REMOTE_DIR") or SYNC_DEFAULTS["VPS_REMOTE_DIR"]
+    remote_dir = remote_dir.rstrip("/")
+    run_id = getattr(args, "run", "") or ""
+
+    if not run_id:
+        rc, stdout = _ssh_read_text(host, user, key_path, f"{remote_dir}/out/state.json")
+        if rc != 0 or not stdout.strip():
+            log_err("无法从远端 state.json 获取当前 run_id。")
+            return 2
+        try:
+            state_data = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            log_err(f"解析远端 state.json 失败：{exc}")
+            return 2
+        run_id = str(state_data.get("run_id", "")).strip()
+        if not run_id:
+            log_err("state.json 中缺少 run_id。")
+            return 2
+
+    remote_run_dir = f"{remote_dir}/out/_runs/{run_id}"
+    remote_events = f"{remote_run_dir}/events.ndjson"
+    remote_state = f"{remote_run_dir}/state.json"
+    remote_manifest = f"{remote_run_dir}/manifest.json"
+
+    mirror_dir = PROJ_ROOT / "out" / "remote_mirror" / run_id
+    mirror_dir.mkdir(parents=True, exist_ok=True)
+    local_events = mirror_dir / "events.ndjson"
+    local_state = mirror_dir / "state.json"
+    local_manifest = mirror_dir / "manifest.json"
+
+    interval = max(1, int(getattr(args, "interval", 3)))
+    header_printed = False
+    last_line_count = 0
+    manifest_announced = False
+    status = ""
+    lines: List[str] = []
+
+    try:
+        while True:
+            events_ok = _scp_remote_file(host, user, key_path, remote_events, local_events)
+            if events_ok and local_events.exists():
+                content = local_events.read_text(encoding="utf-8")
+                lines = content.splitlines()
+                if len(lines) > last_line_count:
+                    for line in lines[last_line_count:]:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(line)
+                        else:
+                            print(_format_watch_event(event))
+                    last_line_count = len(lines)
+
+            state_ok = _scp_remote_file(host, user, key_path, remote_state, local_state)
+            if state_ok and local_state.exists():
+                try:
+                    state_data = json.loads(local_state.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    state_data = {}
+                profile_name = state_data.get("profile", "")
+                run_mode = state_data.get("run_mode", "")
+                status = str(state_data.get("status", status or ""))
+                if not header_printed and (profile_name or run_mode):
+                    log_info(
+                        f"监控 run_id={run_id} · profile={profile_name or '-'} · run_mode={run_mode or '-'}"
+                    )
+                    header_printed = True
+
+            if _scp_remote_file(host, user, key_path, remote_manifest, local_manifest) and not manifest_announced:
+                log_ok(f"已镜像 manifest 至 {local_manifest.relative_to(PROJ_ROOT)}")
+                manifest_announced = True
+
+            if status.lower() in {"succeeded", "failed", "cancelled"}:
+                if len(lines) == last_line_count and events_ok:
+                    log_info(f"远端作业状态：{status}")
+                    break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        log_warn("用户中断了 watch。")
+        return 1
+    return 0
 
 
 def _prompt_confirm(instance_id: str, dry_run: bool) -> bool:
@@ -1066,8 +1306,15 @@ def build_parser() -> argparse.ArgumentParser:
     bridge_parser.add_argument("--pattern", help="音频匹配模式 (CSV)", default=None)
     bridge_parser.add_argument("--overwrite", action="store_true", help="覆盖已存在 JSON")
     bridge_parser.add_argument("--no-delete", action="store_true", help="上传时保留远端多余文件")
+    bridge_parser.add_argument("--profile", help="指定运行 profile", default=None)
+    bridge_parser.add_argument("--note", help="快照备注", default="")
     _add_dry_run(bridge_parser)
     bridge_parser.set_defaults(func=cmd_asr_bridge)
+
+    watch_parser = sub.add_parser("watch", help="实时镜像远端 ASR 事件")
+    watch_parser.add_argument("--run", help="指定 run_id（默认取远端最新一次）", default=None)
+    watch_parser.add_argument("--interval", type=int, default=3, help="轮询间隔秒")
+    watch_parser.set_defaults(func=cmd_watch)
 
     delete_parser = sub.add_parser("delete", help="删除指定实例")
     delete_parser.add_argument("--id", required=True, help="实例 ID")

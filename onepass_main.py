@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -88,14 +89,68 @@ def _run_deploy_cli(args: list[str], heartbeat: float = 45.0) -> int:
     return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
 
 
-def _run_vultr_cli(subcommand: str, heartbeat: float = 45.0) -> int:
+def _run_vultr_cli(subcommand: str, *, args: list[str] | None = None, heartbeat: float = 45.0) -> int:
     script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
     if not script.exists():
         log_err(f"未找到脚本：{_rel_to_root(script)}，请确认已更新仓库。")
         return 2
     cmd = [sys.executable, str(script), subcommand]
+    if args:
+        cmd.extend(args)
     _print_command(cmd)
     return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
+
+
+def _run_envsnap(args: list[str], *, capture: bool = False) -> tuple[int, str]:
+    script = PROJ_ROOT / "scripts" / "envsnap.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}")
+        return 2, ""
+    cmd = [sys.executable, str(script), *args]
+    _print_command(cmd)
+    if capture:
+        result = subprocess.run(cmd, cwd=PROJ_ROOT, capture_output=True, text=True)
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode, result.stdout
+    rc = run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
+    return rc, ""
+
+
+def _list_profiles() -> list[str]:
+    profiles_dir = PROJ_ROOT / "deploy" / "profiles"
+    if not profiles_dir.exists():
+        return []
+    return sorted(
+        p.stem for p in profiles_dir.glob("*.env") if p.name not in {".env.active", ".gitkeep"}
+    )
+
+
+def _select_profile(default: str | None = None) -> str | None:
+    profiles = _list_profiles()
+    if not profiles:
+        log_warn("未找到任何 deploy/profiles/*.env 配置。")
+        return None
+    print("可选 Profiles：")
+    for idx, name in enumerate(profiles, 1):
+        print(f"  {idx}. {name}")
+    if default and default in profiles:
+        default_idx = profiles.index(default) + 1
+    else:
+        default_idx = 1
+    choice = input(f"请选择 Profile [默认 {default_idx}]: ").strip()
+    if not choice:
+        choice = str(default_idx)
+    if choice.isdigit():
+        index = int(choice)
+        if 1 <= index <= len(profiles):
+            return profiles[index - 1]
+    if choice in profiles:
+        return choice
+    log_warn("输入无效，已取消。")
+    return None
 
 
 def _ensure_sync_env() -> bool:
@@ -1244,13 +1299,15 @@ def _interactive_vultr_wizard() -> None:
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
         print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
+        print("P) 选择配置 Profile 并应用")
+        print("R) 查看当前激活配置 / 最近快照")
         print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
         print("Q) 返回主菜单")
         choice = input("选择（1-5/X / Q 返回）: ").strip().lower()
         if choice in {"q", ""}:
             log_info("已返回主菜单。")
             return
-        if choice not in {"1", "2", "3", "4", "5", "x"}:
+        if choice not in {"1", "2", "3", "4", "5", "p", "r", "x"}:
             log_warn("无效选项，请重新输入。")
             continue
         if choice == "x":
@@ -1269,13 +1326,49 @@ def _interactive_vultr_wizard() -> None:
                 "未检测到 vultr.env，请先复制 deploy/cloud/vultr/vultr.env.example 并填写后再试。"
             )
             continue
+        if choice == "p":
+            default_profile = None
+            active_env_path = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
+            if active_env_path.exists():
+                for line in active_env_path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("ENV_PROFILE="):
+                        default_profile = line.split("=", 1)[1].strip()
+                        break
+            selected = _select_profile(default_profile)
+            if not selected:
+                continue
+            rc, _ = _run_envsnap(["apply", "--profile", selected])
+            if rc == 0:
+                log_ok(f"已应用 profile：{selected}")
+            continue
+        if choice == "r":
+            _run_envsnap(["show-active"])
+            _run_envsnap(["list"])
+            continue
         if choice == "5":
             if not env_file.exists():
                 log_err("缺少 vultr.env，无法运行一键桥接。")
                 continue
             if not _ensure_sync_env():
                 continue
-            rc = _run_vultr_cli("asr-bridge", heartbeat=90.0)
+            active_env_path = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
+            active_profile = None
+            if active_env_path.exists():
+                for line in active_env_path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("ENV_PROFILE="):
+                        active_profile = line.split("=", 1)[1].strip()
+                        break
+            extra_args: list[str] = []
+            if _prompt_bool("是否指定 profile?", True):
+                selected = _select_profile(active_profile)
+                if not selected:
+                    log_warn("未选择 profile，已取消一键桥接。")
+                    continue
+                extra_args.extend(["--profile", selected])
+            note = _prompt("快照备注（可留空）", "").strip()
+            if note:
+                extra_args.extend(["--note", note])
+            rc = _run_vultr_cli("asr-bridge", args=extra_args, heartbeat=90.0)
             if rc == 0:
                 log_ok("一键桥接完成，verify_asr_words.py 返回 OK。")
             elif rc == 1:

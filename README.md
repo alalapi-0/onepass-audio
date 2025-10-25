@@ -579,3 +579,40 @@ python scripts/retake_keep_last.py --json data/asr-json/001.json \
 - 音频导出渲染管线
 - 批处理流程与汇总报告
 - 文档完善与示例/自检集
+
+## 环境变量快照 & 配置 Profiles
+
+`deploy/profiles/` 目录下提供了可直接套用的运行配置（Profile），并配套 `scripts/envsnap.py` 命令行工具完成应用、快照与远端导出。典型流程如下：
+
+```bash
+# 选定配置（例如 24GB GPU 的 prod_l4_24g）并应用到 .env.active
+python scripts/envsnap.py apply --profile prod_l4_24g
+
+# 将当前激活配置上传到远端 deploy/profiles/.env.active
+python scripts/envsnap.py export-remote
+
+# 按该配置运行一键桥接，并记录快照备注
+python deploy/cloud/vultr/cloud_vultr_cli.py asr-bridge --profile prod_l4_24g --note "book full run"
+
+# 运行期间进入 watch 模式，实时镜像事件流与 manifest
+python deploy/cloud/vultr/cloud_vultr_cli.py watch
+
+# 小样测试可改用 test_subset，并只处理 001* 前缀
+python scripts/envsnap.py apply --profile test_subset
+python deploy/cloud/vultr/cloud_vultr_cli.py asr-bridge --profile test_subset --note "subset dry run"
+```
+
+使用要点：
+
+- `.env.active` 为临时文件，请勿纳入版本控制；切换 profile 后可随时运行 `scripts/envsnap.py snapshot --note ...` 记录当前环境，快照会落在 `out/_runs/<run_id>/env.snapshot.json`。
+- `prod_l4_24g` 默认采用 whisper large-v3 + float16 + workers=2，适合 24GB 显存实例；如显存不足，可改为 `ASR_COMPUTE=int8_float16` 或 `ASR_WORKERS=1`。
+- `test_subset` 针对 001* 前缀，便于快速演练事件流、watch 镜像与回收逻辑；确认链路正常后再切换到生产配置。
+- 远端 `deploy/sync/remote_run_asr.sh` 会依据 `.env.active` 生成 `out/_runs/<run_id>/manifest.json`、`events.ndjson` 与 `state.json`，watch 命令会自动镜像到本地 `out/remote_mirror/<run_id>/` 并实时展示。
+- `deploy/cloud/vultr/cloud_vultr_cli.py watch` 支持 `--run <id>` 指定历史任务，也会在 asr-bridge 结束后询问是否立即进入 watch 模式。
+
+在 `python onepass_main.py` 的“云端部署（Vultr）向导”面板中，新增了快捷选项：
+
+- **P)** 列出可用 profile 并应用（等价于 `envsnap.py apply --profile ...`）；
+- **R)** 显示当前激活配置与最近快照；
+- **5)** 一键桥接时可选择 profile 并填写快照备注，命令会自动传递 `--profile/--note` 参数给 `asr-bridge`。
+
