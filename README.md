@@ -212,6 +212,19 @@ python deploy/cloud/vultr/cloud_vultr_cli.py plans --region nrt --os ubuntu-22.0
 
 若命令输出空表，说明东京暂时无库存，可切换到 `sgp`、`lax`、`fra` 等其他区域，或稍后再试。
 
+### Quickstart 一步到位
+
+```powershell
+# 一步到位（默认：nrt + ubuntu-22.04；先看 plan → 选中 → 创建 → 跑 ASR）
+python deploy/cloud/vultr/cloud_vultr_cli.py quickstart --family "A40|L40S" --min-vram 24
+
+# 非交互（默认选列表第 1 项计划、默认进入 watch）
+python deploy/cloud/vultr/cloud_vultr_cli.py quickstart --family "A40|L40S" --min-vram 24 --yes
+
+# 指定 profile（例如 24GB 显存的生产跑）
+python deploy/cloud/vultr/cloud_vultr_cli.py quickstart --profile prod_24g --family "A40|L40S" --min-vram 24
+```
+
 4. **安全提示**：
    - Vultr API Key 仅保存在本地 `deploy/cloud/vultr/vultr.env`，请勿上传或共享；
    - 根据预算及时关停/删除不再使用的实例；`cloud_vultr_cli.py` 支持在列表中确认当前实例信息；

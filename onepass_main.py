@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1294,40 +1295,75 @@ def _interactive_vultr_wizard() -> None:
         return
     while True:
         print("\n==================== 云端部署（Vultr）向导 ====================")
-        print("1) 检查本机环境（Windows/macOS）")
-        print("2) 创建 VPS（Vultr）")
-        print("3) 准备本机接入 VPS 网络")
-        print("4) 检查账户中的 Vultr 实例")
-        print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
-        print("L) 仅查看东京(nrt)+Ubuntu 22.04 可用的 GPU 计划")
-        print("P) 选择配置 Profile 并应用")
-        print("R) 查看当前激活配置 / 最近快照")
-        print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
-        print("Q) 返回主菜单")
-        choice = input("选择（1-5/L/X / Q 返回）: ").strip().lower()
+        print("1) 快速开始（先看 plan → 选中 → 创建 → 写连接 → 选配置 → 上传 → ASR → 回收 → Watch）")
+        print("2) 仅查看东京(nrt)+Ubuntu 22.04 的 GPU 套餐")
+        print("3) 创建实例（高级）")
+        print("4) 写入连接（sync.env）")
+        print("5) 选择配置 Profile / 查看当前配置")
+        print("6) 一键桥接（使用当前配置）")
+        print("7) 进入实时镜像 Watch")
+        print("H) 环境检查 / 自动修复")
+        print("Q) 返回")
+        choice = input("选择（1-7/H/Q）: ").strip().lower()
         if choice in {"q", ""}:
             log_info("已返回主菜单。")
             return
-        if choice not in {"1", "2", "3", "4", "5", "l", "p", "r", "x"}:
+        if choice not in {"1", "2", "3", "4", "5", "6", "7", "h"}:
             log_warn("无效选项，请重新输入。")
             continue
-        if choice == "x":
-            _run_auto_fix_env(auto_confirm=True)
-            log_info("自动修复完成后，重新执行环境自检……")
+        if choice == "h":
             rc_env = _run_vultr_cli("env-check")
             if rc_env == 0:
                 log_ok("环境自检通过。")
             elif rc_env == 1:
-                log_warn("环境自检仍有警告，请查看输出。")
+                log_warn("环境自检存在警告，请查看输出。")
             else:
-                log_err("环境自检仍未通过，请根据日志手动处理。")
+                log_err("环境自检失败，请根据日志手动处理。")
+            if input("是否运行自动修复？(y/N): ").strip().lower() in {"y", "yes"}:
+                _run_auto_fix_env(auto_confirm=True)
             continue
-        if choice in {"2", "3", "4"} and not env_file.exists():
+        if choice in {"1", "3", "4", "6", "7"} and not env_file.exists():
             log_err(
                 "未检测到 vultr.env，请先复制 deploy/cloud/vultr/vultr.env.example 并填写后再试。"
             )
             continue
-        if choice == "p":
+        if choice == "1":
+            extra_args: List[str] = []
+            advanced = input("打开高级参数面板？(y/N): ").strip().lower()
+            if advanced in {"y", "yes"}:
+                print(
+                    "可追加参数示例：--family \"A40|L40S\" --min-vram 24 --profile prod_24g --workers 4 --model large-v3 "
+                    "--pattern \"*.wav\" --stems \"001,002\" --overwrite --yes --no-watch"
+                )
+                raw = input("请输入附加参数（回车跳过）: ").strip()
+                if raw:
+                    try:
+                        extra_args = shlex.split(raw)
+                    except ValueError as exc:
+                        log_warn(f"解析附加参数失败：{exc}，已忽略。")
+                        extra_args = []
+            rc = _run_vultr_cli("quickstart", args=extra_args)
+            if rc != 0:
+                log_warn(f"Quickstart 返回码：{rc}，请检查日志。")
+            continue
+        if choice == "2":
+            rc = _run_vultr_cli("plans-nrt")
+            if rc != 0:
+                log_warn(f"命令返回码：{rc}，请根据日志检查。")
+            continue
+        if choice == "3":
+            rc = _run_vultr_cli("create")
+            if rc != 0:
+                log_warn(f"创建实例返回码：{rc}")
+            continue
+        if choice == "4":
+            rc = _run_vultr_cli("write-sync-env")
+            if rc != 0:
+                log_warn(f"写入 sync.env 返回码：{rc}")
+            continue
+        if choice == "5":
+            _run_envsnap(["show-active"])
+            _run_envsnap(["list"])
             default_profile = None
             active_env_path = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
             if active_env_path.exists():
@@ -1341,56 +1377,25 @@ def _interactive_vultr_wizard() -> None:
             rc, _ = _run_envsnap(["apply", "--profile", selected])
             if rc == 0:
                 log_ok(f"已应用 profile：{selected}")
+                _run_envsnap(["export-remote"])
             continue
-        if choice == "r":
-            _run_envsnap(["show-active"])
-            _run_envsnap(["list"])
-            continue
-        if choice == "l":
-            rc = _run_vultr_cli("plans-nrt")
-            if rc != 0:
-                log_warn(f"命令返回码：{rc}，请根据日志检查。")
-            continue
-        if choice == "5":
-            if not env_file.exists():
-                log_err("缺少 vultr.env，无法运行一键桥接。")
-                continue
+        if choice == "6":
             if not _ensure_sync_env():
                 continue
-            active_env_path = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
-            active_profile = None
-            if active_env_path.exists():
-                for line in active_env_path.read_text(encoding="utf-8").splitlines():
-                    if line.startswith("ENV_PROFILE="):
-                        active_profile = line.split("=", 1)[1].strip()
-                        break
-            extra_args: list[str] = []
-            if _prompt_bool("是否指定 profile?", True):
-                selected = _select_profile(active_profile)
-                if not selected:
-                    log_warn("未选择 profile，已取消一键桥接。")
-                    continue
-                extra_args.extend(["--profile", selected])
-            note = _prompt("快照备注（可留空）", "").strip()
-            if note:
-                extra_args.extend(["--note", note])
-            rc = _run_vultr_cli("asr-bridge", args=extra_args, heartbeat=90.0)
+            rc = _run_vultr_cli("asr-bridge", heartbeat=90.0)
             if rc == 0:
                 log_ok("一键桥接完成，verify_asr_words.py 返回 OK。")
             elif rc == 1:
-                log_warn("一键桥接完成但存在警告（可能部分 JSON 缺少 words）。请检查日志。")
+                log_warn("一键桥接完成但存在警告，请检查日志。")
             else:
                 log_err(f"一键桥接失败（返回码 {rc}）。")
             continue
-        subcommand = {
-            "1": "env-check",
-            "2": "create",
-            "3": "prepare-local",
-            "4": "list",
-        }[choice]
-        rc = _run_vultr_cli(subcommand)
-        if rc != 0:
-            log_warn(f"命令返回码：{rc}，请根据日志检查。")
+        if choice == "7":
+            if not _ensure_sync_env():
+                continue
+            rc = _run_vultr_cli("watch")
+            if rc != 0:
+                log_warn(f"watch 返回码：{rc}")
 
 
 def _interactive_rollback() -> int:
