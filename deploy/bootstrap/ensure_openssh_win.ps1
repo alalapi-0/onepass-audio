@@ -70,7 +70,7 @@ function Ensure-Service {
         try {
             Set-Service -Name $Name -StartupType Automatic -ErrorAction Stop
         } catch {
-            Write-Warn "Failed to set startup type for $Name: $($_.Exception.Message)"
+            Write-Warn "Failed to set startup type for ${Name}: $($_.Exception.Message)"
         }
     }
 
@@ -79,7 +79,7 @@ function Ensure-Service {
         try {
             Start-Service -Name $Name -ErrorAction Stop
         } catch {
-            Write-Warn "Failed to start service $Name: $($_.Exception.Message)"
+            Write-Warn "Failed to start service ${Name}: $($_.Exception.Message)"
         }
     }
 }

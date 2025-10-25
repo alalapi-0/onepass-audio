@@ -54,19 +54,23 @@ try {
     $args = @('install', '--id', 'MSYS2.MSYS2', '-e', '--source', 'winget')
     Write-Info 'Installing MSYS2 via winget (required for rsync)...'
 
+    $successExitCodes = @(0, -1978335189)
     if (Is-Admin) {
         & $winget.Source @args
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warn "MSYS2 installation failed (winget exit code $LASTEXITCODE)."
-            exit 1
-        }
+        $exitCode = $LASTEXITCODE
     } else {
         $proc = Start-Process -FilePath $winget.Source -ArgumentList ($args -join ' ') -Verb RunAs -PassThru
         $proc.WaitForExit()
-        if ($proc.ExitCode -ne 0) {
-            Write-Warn "MSYS2 installation failed with exit code $($proc.ExitCode)."
-            exit 1
+        $exitCode = $proc.ExitCode
+    }
+
+    if ($successExitCodes -contains $exitCode) {
+        if ($exitCode -ne 0) {
+            Write-Info 'MSYS2 already installed and up to date according to winget.'
         }
+    } else {
+        Write-Warn "MSYS2 installation failed (winget exit code $exitCode)."
+        exit 1
     }
 
     $msysBash = 'C:\\msys64\\usr\\bin\\bash.exe'
