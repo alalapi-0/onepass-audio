@@ -630,3 +630,15 @@ python deploy/cloud/vultr/cloud_vultr_cli.py asr-bridge --profile test_subset --
 - **R)** 显示当前激活配置与最近快照；
 - **5)** 一键桥接时可选择 profile 并填写快照备注，命令会自动传递 `--profile/--note` 参数给 `asr-bridge`。
 
+### 先看可用计划，再创建实例
+
+```bash
+# 仅查看东京(nrt)+Ubuntu 22.04 的 GPU 计划
+python deploy/cloud/vultr/cloud_vultr_cli.py plans-nrt
+
+# 自定义筛选：仅看 A40/L40S 且 vRAM≥24GB
+python deploy/cloud/vultr/cloud_vultr_cli.py plans --region nrt --os ubuntu-22.04 --family "A40|L40S" --min-vram 24
+```
+
+若输出为空，表示东京（nrt）当前暂未提供符合条件的库存，可改用 `--region sgp`、`--region lax`、`--region fra` 等其它数据中心后再试。
+
