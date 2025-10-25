@@ -53,6 +53,22 @@ ENV_FILE = CUR_DIR / "vultr.env"
 STATE_FILE = CUR_DIR / "state.json"
 SYNC_ENV_FILE = PROJ_ROOT / "deploy" / "sync" / "sync.env"
 ACTIVE_PROFILE_PATH = PROJ_ROOT / "deploy" / "profiles" / ".env.active"
+
+ENV_RUNTIME_PREFIXES: Tuple[str, ...] = (
+    "VULTR_",
+    "SSH_",
+    "REMOTE_",
+    "INSTANCE_",
+    "CREATE_",
+    "POLL_",
+    "VPS_",
+    "ASR_",
+    "USE_",
+    "BWLIMIT_",
+    "CHECKSUM_",
+    "AUDIO_",
+)
+ENV_RUNTIME_EXPLICIT_KEYS: Tuple[str, ...] = ("TAG",)
 SYNC_DEFAULTS: Dict[str, str] = {
     "VPS_HOST": "",
     "VPS_USER": "ubuntu",
@@ -104,15 +120,30 @@ def _parse_env_text(text: str) -> Dict[str, str]:
     return data
 
 
+def _collect_runtime_env() -> Dict[str, str]:
+    runtime_env: Dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in ENV_RUNTIME_EXPLICIT_KEYS:
+            runtime_env[key] = value
+            continue
+        if any(key.startswith(prefix) for prefix in ENV_RUNTIME_PREFIXES):
+            runtime_env[key] = value
+    return runtime_env
+
+
 def _read_env_file(optional: bool = False) -> Dict[str, str]:
-    if not ENV_FILE.exists():
-        if optional:
-            log_warn("未找到 vultr.env，将使用默认值并跳过部分检查。")
-            return {}
+    data: Dict[str, str] = {}
+    if ENV_FILE.exists():
+        data.update(_parse_env_text(ENV_FILE.read_text(encoding="utf-8")))
+    runtime_env = _collect_runtime_env()
+    if runtime_env:
+        data.update(runtime_env)
+    if not data and not optional:
         raise FileNotFoundError(
-            "未找到 vultr.env。请复制 deploy/cloud/vultr/vultr.env.example 并填写后重试。"
+            "未找到 vultr.env，且系统环境变量中也未检测到 Vultr 配置。"
+            "请设置相关环境变量或复制 deploy/cloud/vultr/vultr.env.example 并填写后重试。"
         )
-    return _parse_env_text(ENV_FILE.read_text(encoding="utf-8"))
+    return data
 
 
 def _read_custom_env(path: Path) -> Dict[str, str]:
@@ -259,10 +290,10 @@ def _ensure_env_and_key() -> Dict[str, str]:
     env = _read_env_file(optional=False)
     api_key = env.get("VULTR_API_KEY", "").strip()
     if not api_key:
-        raise VultrError("VULTR_API_KEY 未配置。")
+        raise VultrError("VULTR_API_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
     key_path_value = env.get("SSH_PRIVATE_KEY")
     if not key_path_value:
-        raise VultrError("SSH_PRIVATE_KEY 未在 vultr.env 中配置。")
+        raise VultrError("SSH_PRIVATE_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
     private_key = _expand_path(key_path_value)
     if not private_key.exists():
         raise VultrError(f"未找到 SSH 私钥：{private_key}")
@@ -359,10 +390,18 @@ def cmd_env_check(args: argparse.Namespace) -> int:
         status_warn: List[str] = []
 
         env = _read_env_file(optional=True)
+        runtime_env = _collect_runtime_env()
 
         if first_run:
             log_info(f"操作系统：{platform.system()} {platform.release()}")
             log_info(f"Python 版本：{platform.python_version()}")
+            sources: List[str] = []
+            if ENV_FILE.exists():
+                sources.append("vultr.env")
+            if runtime_env:
+                sources.append("系统环境变量")
+            if sources:
+                log_info(f"加载 Vultr 配置来源：{', '.join(sources)}")
         first_run = False
 
         ok, message, code = _check_command(sys.executable, ["--version"])
@@ -428,11 +467,11 @@ def cmd_env_check(args: argparse.Namespace) -> int:
                     log_warn(f"未找到私钥 {priv_path}，可使用 ssh-keygen -t ed25519 生成。")
                     status_warn.append("ssh-key-missing")
             else:
-                log_warn("vultr.env 中未配置 SSH_PRIVATE_KEY，将跳过私钥检查。")
+                log_warn("未在配置中检测到 SSH_PRIVATE_KEY，将跳过私钥检查。")
                 status_warn.append("ssh-key-config")
         else:
-            log_warn("未找到 vultr.env，将使用默认值并跳过部分检查。")
-            status_warn.append("vultr.env")
+            log_warn("未检测到任何 Vultr 配置，将跳过私钥检查。")
+            status_warn.append("vultr-config")
 
         ps_script = CUR_DIR / "cloud_env_check.ps1"
         pwsh_path = shutil.which("pwsh")
@@ -501,6 +540,38 @@ def cmd_env_check(args: argparse.Namespace) -> int:
         return 1
     log_ok("环境检测通过。")
     return 0
+
+
+def cmd_install_deps(args: argparse.Namespace) -> int:
+    if args.yes and args.no:
+        log_err("--yes 与 --no 不能同时使用。")
+        return 2
+
+    section("安装/修复本地部署依赖")
+    auto_fix_script = PROJ_ROOT / "scripts" / "auto_fix_env.py"
+    if not auto_fix_script.exists():
+        log_err(f"未找到自动修复脚本：{auto_fix_script}")
+        return 2
+
+    cmd = [sys.executable, str(auto_fix_script)]
+    if args.only:
+        cmd.extend(["--only", args.only])
+    if args.yes:
+        cmd.append("--yes")
+    if args.no:
+        cmd.append("--no")
+    if args.dry_run:
+        cmd.append("--dry-run")
+
+    log_info(f"执行依赖安装：{format_cmd(cmd)}")
+    rc = run_streamed(cmd, cwd=PROJ_ROOT, heartbeat_s=30.0, show_cmd=False)
+    if rc == 0:
+        log_ok("依赖安装脚本执行完成。")
+    elif rc == 1:
+        log_warn("依赖安装脚本返回警告，请查看输出确认状态。")
+    else:
+        log_err("依赖安装脚本执行失败。")
+    return rc
 
 
 def cmd_create(args: argparse.Namespace) -> int:
@@ -1280,6 +1351,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="拒绝自动修复安装操作，仅查看建议",
     )
     env_parser.set_defaults(func=cmd_env_check)
+
+    install_parser = sub.add_parser("install-deps", help="自动安装/修复部署依赖")
+    _add_dry_run(install_parser)
+    install_parser.add_argument("--only", help="仅运行指定组件 (逗号分隔)", default="")
+    install_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="自动确认安装脚本中的提示",
+    )
+    install_parser.add_argument(
+        "--no",
+        action="store_true",
+        help="拒绝安装脚本中的提示，仅查看命令",
+    )
+    install_parser.set_defaults(func=cmd_install_deps)
 
     create_parser = sub.add_parser("create", help="创建 VPS 实例")
     _add_dry_run(create_parser)
