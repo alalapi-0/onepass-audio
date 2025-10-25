@@ -67,12 +67,20 @@ function Ensure-Service {
 
     if ($service.StartType -ne 'Automatic') {
         Write-Info "Setting $Name startup type to Automatic..."
-        Set-Service -Name $Name -StartupType Automatic -ErrorAction Stop
+        try {
+            Set-Service -Name $Name -StartupType Automatic -ErrorAction Stop
+        } catch {
+            Write-Warn "Failed to set startup type for $Name: $($_.Exception.Message)"
+        }
     }
 
     if ($service.Status -ne 'Running') {
         Write-Info "Starting service $Name..."
-        Start-Service -Name $Name -ErrorAction Stop
+        try {
+            Start-Service -Name $Name -ErrorAction Stop
+        } catch {
+            Write-Warn "Failed to start service $Name: $($_.Exception.Message)"
+        }
     }
 }
 
