@@ -1469,8 +1469,8 @@ def cmd_regions(args: argparse.Namespace) -> int:
 
 
 def cmd_plans(args: argparse.Namespace) -> int:
-    gpu_only = True if args.gpu_only is None else args.gpu_only
-    only_available = True if args.only_available is None else args.only_available
+    gpu_only = False if args.gpu_only is None else args.gpu_only
+    only_available = False if args.only_available is None else args.only_available
     region = args.region or "nrt"
     try:
         env = _ensure_env_with_api_key(require_ssh=False)
@@ -1822,7 +1822,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plans_parser.add_argument("--filter", help="对名称/描述模糊匹配", default=None)
     _add_dry_run(plans_parser)
-    plans_parser.set_defaults(func=cmd_plans, gpu_only=None, only_available=None)
+    plans_parser.set_defaults(func=cmd_plans, gpu_only=False, only_available=False)
 
     plans_nrt_parser = sub.add_parser(
         "plans-nrt",
