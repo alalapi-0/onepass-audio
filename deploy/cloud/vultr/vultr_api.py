@@ -21,6 +21,14 @@ API_BASE = "https://api.vultr.com/v2"
 
 GPU_KEYWORDS: tuple[str, ...] = ("GPU", "A40", "A16", "L40S", "A100", "L4")
 
+# ``resolve_os_id`` 可能会遇到 Vultr 在不同 API 版本之间调整 OS slug 的情况，
+# 例如 Ubuntu 22.04 在部分接口中标记为 ``ubuntu-jammy``。为了保持 CLI 的
+# 默认值 ``ubuntu-22.04`` 可用，这里维护一份 normalized slug 的兼容映射。
+OS_SLUG_ALIASES: dict[str, tuple[str, ...]] = {
+    # ``ubuntu-22.04`` 传统 slug 映射到 ``ubuntu-jammy`` 系列。
+    "ubuntu2204": ("ubuntujammy", "ubuntujammyx64", "jammy", "jammyx64"),
+}
+
 
 class VultrError(RuntimeError):
     """HTTP 调用失败时抛出的异常。"""
@@ -258,6 +266,7 @@ def resolve_os_id(slug: str, *, api_key: str) -> str:
     target = normalized.lower()
     normalized_target = _normalize(normalized)
     os_list = list_os(api_key)
+    normalized_map: dict[str, str] = {}
     for item in os_list:
         candidates = [
             item.get("slug"),
@@ -275,12 +284,16 @@ def resolve_os_id(slug: str, *, api_key: str) -> str:
             normalized_value = _normalize(str(value))
             if not normalized_value:
                 continue
+            normalized_map.setdefault(normalized_value, str(item.get("id")))
             if normalized_value == normalized_target or (
                 normalized_target and normalized_value.startswith(normalized_target)
             ) or (
                 normalized_value and normalized_target.startswith(normalized_value)
             ):
                 return str(item.get("id"))
+    for alias in OS_SLUG_ALIASES.get(normalized_target, ()):  # pragma: no branch - 常量分支
+        if alias in normalized_map:
+            return normalized_map[alias]
     raise VultrError(f"未找到匹配的操作系统：{slug}")
 
 
