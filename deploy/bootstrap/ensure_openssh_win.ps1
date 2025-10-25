@@ -84,6 +84,24 @@ function Ensure-Service {
     }
 }
 
+function Capture-CommandOutput {
+    param(
+        [string]$Command,
+        [string[]]$Arguments
+    )
+
+    $result = & $Command @Arguments 2>&1
+    if ($null -eq $result) {
+        return ''
+    }
+
+    if ($result -is [Array]) {
+        $result = $result -join [Environment]::NewLine
+    }
+
+    return $result.Trim()
+}
+
 try {
     Ensure-Capability -CapabilityName 'OpenSSH.Client~~~~0.0.1.0'
 
@@ -104,16 +122,24 @@ try {
 
     Ensure-Service -Name 'ssh-agent'
 
-    $sshVersion = (& ssh -V 2>&1).Trim()
+    $sshVersion = Capture-CommandOutput -Command 'ssh' -Arguments @('-V')
     if ($LASTEXITCODE -ne 0) {
-        Write-Warn "ssh -V exited with code $LASTEXITCODE. Output: $sshVersion"
+        if ($sshVersion) {
+            Write-Warn "ssh -V exited with code $LASTEXITCODE. Output: $sshVersion"
+        } else {
+            Write-Warn "ssh -V exited with code $LASTEXITCODE and produced no output."
+        }
     } else {
         Write-Info "ssh version: $sshVersion"
     }
 
-    $scpVersion = (& scp -V 2>&1).Trim()
+    $scpVersion = Capture-CommandOutput -Command 'scp' -Arguments @('-V')
     if ($LASTEXITCODE -ne 0) {
-        Write-Warn "scp -V exited with code $LASTEXITCODE. Output: $scpVersion"
+        if ($scpVersion) {
+            Write-Warn "scp -V exited with code $LASTEXITCODE. Output: $scpVersion"
+        } else {
+            Write-Warn "scp -V exited with code $LASTEXITCODE and produced no output. This is expected for the Windows OpenSSH build, which does not support -V."
+        }
     } else {
         Write-Info "scp version: $scpVersion"
     }
