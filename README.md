@@ -88,6 +88,36 @@ python scripts/sync_fetch_win.py --since 2025-10-25T00:00:00
 
 说明：无 rsync 时脚本会自动回退到 scp，但不支持删除远端冗余文件；如需删除，请安装 rsync 或在远端手动清理。
 
+## Vultr 云端部署（Python CLI）
+
+> 旧版 PowerShell 菜单仍保留在仓库中（标注为 **DEPRECATED** 作为回退方案）。
+
+核心命令（默认仅显示 Windows 相关提示；如需恢复全平台说明，请设置 `WIN_ONLY=false`）：
+
+```powershell
+# 查询东京（nrt）GPU 套餐
+python deploy/cloud/vultr/cloud_vultr_cli.py plans-nrt
+python deploy/cloud/vultr/cloud_vultr_cli.py plans-nrt --quiet
+python deploy/cloud/vultr/cloud_vultr_cli.py plans --region nrt --family "A40|L40S" --min-vram 24 --json
+
+# 一步快速创建（默认 nrt + ubuntu-22.04）
+python deploy/cloud/vultr/cloud_vultr_cli.py quickstart --family "A40|L40S" --min-vram 24 --yes
+
+# 使用上次配置
+python deploy/cloud/vultr/cloud_vultr_cli.py quickstart --use-last --yes
+
+# 环境检查与 OpenSSH（Windows 专用）
+python scripts/env_check_win.py
+python scripts/install_openssh_win.py
+
+# 切换 WIN_ONLY 提示（默认 true，仅展示 Windows 文案）
+$env:WIN_ONLY="false"   # PowerShell
+set WIN_ONLY=false      # CMD
+export WIN_ONLY=false   # Unix/macOS
+```
+
+CLI 命令遵循统一的退出码约定：成功返回 `0`，无结果或用户取消返回 `1`，异常失败返回 `2`。
+
 ## 自动修复环境（Windows/macOS）
 
 若想一键修复常见缺失项，可运行：

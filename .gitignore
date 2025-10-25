@@ -29,3 +29,6 @@ Thumbs.db
 *.m4a
 *.flac
 deploy/vps.env
+deploy/cloud/vultr/state.json
+*.env
+!*.env.example
