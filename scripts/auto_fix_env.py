@@ -184,7 +184,17 @@ def _run_self_check_windows() -> List[TaskResult]:
         results.append(TaskResult("pwsh", "FAIL", "未检测到 pwsh"))
 
     results.append(_command_status(["ssh", "-V"], "ssh", "ssh 可用"))
-    results.append(_command_status(["scp", "-V"], "scp", "scp 可用"))
+
+    scp_path = shutil.which("scp")
+    if not scp_path:
+        results.append(TaskResult("scp", "FAIL", "未检测到 scp"))
+    else:
+        scp_check_cmd = [scp_path, "-V"]
+        scp_result = _command_status(scp_check_cmd, "scp", "scp 可用")
+        if scp_result.status == "WARN" and "unknown option -- V" in scp_result.detail:
+            detail = f"检测到 {scp_path} (Windows OpenSSH 不支持 -V 参数)"
+            scp_result = TaskResult("scp", "OK", detail)
+        results.append(scp_result)
 
     if shutil.which("git"):
         git_res = _command_status(["git", "--version"], "git", "git 可用")
