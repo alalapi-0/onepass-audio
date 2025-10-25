@@ -1299,15 +1299,16 @@ def _interactive_vultr_wizard() -> None:
         print("3) 准备本机接入 VPS 网络")
         print("4) 检查账户中的 Vultr 实例")
         print("5) 一键桥接：上传 → 远端 ASR → 回收 → 校验")
+        print("L) 列出东京(nrt)+Ubuntu 22.04 可用的 GPU 计划")
         print("P) 选择配置 Profile 并应用")
         print("R) 查看当前激活配置 / 最近快照")
         print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
         print("Q) 返回主菜单")
-        choice = input("选择（1-5/X / Q 返回）: ").strip().lower()
+        choice = input("选择（1-5/L/X / Q 返回）: ").strip().lower()
         if choice in {"q", ""}:
             log_info("已返回主菜单。")
             return
-        if choice not in {"1", "2", "3", "4", "5", "p", "r", "x"}:
+        if choice not in {"1", "2", "3", "4", "5", "l", "p", "r", "x"}:
             log_warn("无效选项，请重新输入。")
             continue
         if choice == "x":
@@ -1344,6 +1345,11 @@ def _interactive_vultr_wizard() -> None:
         if choice == "r":
             _run_envsnap(["show-active"])
             _run_envsnap(["list"])
+            continue
+        if choice == "l":
+            rc = _run_vultr_cli("plans-nrt")
+            if rc != 0:
+                log_warn(f"命令返回码：{rc}，请根据日志检查。")
             continue
         if choice == "5":
             if not env_file.exists():
