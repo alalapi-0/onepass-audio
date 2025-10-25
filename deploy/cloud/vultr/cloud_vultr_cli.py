@@ -16,12 +16,13 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import textwrap
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 CUR_DIR = Path(__file__).resolve().parent
 PROJ_ROOT = CUR_DIR.parents[2]
@@ -116,6 +117,76 @@ SYNC_KEY_ORDER: List[str] = [
     "ASR_WORKERS",
     "AUDIO_PATTERN",
 ]
+
+
+# ==== BEGIN: OnePass Patch · R4.4 (state helpers) ====
+_STATE_PATH = os.path.join("deploy", "cloud", "vultr", "state.json")
+
+
+def _now_iso() -> str:
+    """UTC ISO8601（无小数秒），示例：2025-10-25T12:00:00Z"""
+
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _state_load() -> Dict[str, Any]:
+    """读 state.json；不存在或损坏时返回 {}。不抛异常。"""
+
+    try:
+        if not os.path.exists(_STATE_PATH):
+            return {}
+        with open(_STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def _state_save(obj: Dict[str, Any]) -> None:
+    """原子写 state.json（先写临时文件，再 os.replace）；异常向上抛。"""
+
+    os.makedirs(os.path.dirname(_STATE_PATH), exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix="state.", suffix=".json", dir=os.path.dirname(_STATE_PATH)
+    )
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _STATE_PATH)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _state_get_last_used() -> Dict[str, Any]:
+    """返回 state['last_used']，若无返回 {}。字段：region/os/plan_id/profile/ts"""
+
+    st = _state_load()
+    last = st.get("last_used") or {}
+    allow = {k: last.get(k) for k in ("region", "os", "plan_id", "profile", "ts")}
+    return {k: v for k, v in allow.items() if v}
+
+
+def _state_update_last_used(**kwargs: Any) -> None:
+    """
+    更新 last_used 的若干字段；仅写入非空值。自动写入 ts。
+    用法：_state_update_last_used(region="nrt", os="ubuntu-22.04", plan_id="vcg-...", profile="prod_24g")
+    """
+
+    st = _state_load()
+    last = st.get("last_used") or {}
+    for k in ("region", "os", "plan_id", "profile"):
+        v = kwargs.get(k, None)
+        if v not in (None, ""):
+            last[k] = v
+    last["ts"] = _now_iso()
+    st["last_used"] = last
+    _state_save(st)
+
+
+# ==== END: OnePass Patch · R4.4 (state helpers) ====
 
 
 def _parse_env_text(text: str) -> Dict[str, str]:
@@ -370,10 +441,32 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     if not api_key:
         return _qs_step_fail(summary, "解析 Vultr 配置", step, "请在 deploy/cloud/vultr/vultr.env 中填写 VULTR_API_KEY。", 2)
 
-    region = (args.region or base_env.get("VULTR_REGION") or "nrt").strip() or "nrt"
-    os_slug = (args.os or base_env.get("VULTR_OS") or "ubuntu-22.04").strip() or "ubuntu-22.04"
+    # ==== BEGIN: OnePass Patch · R4.4 (quickstart use-last) ====
+    last = _state_get_last_used() if getattr(args, "use_last", False) else {}
+    region = (
+        (args.region or "")
+        or str(last.get("region") or "")
+        or base_env.get("VULTR_REGION")
+        or "nrt"
+    )
+    region = region.strip() or "nrt"
+    os_slug = (
+        (args.os or "")
+        or str(last.get("os") or "")
+        or base_env.get("VULTR_OS")
+        or "ubuntu-22.04"
+    )
+    os_slug = os_slug.strip() or "ubuntu-22.04"
     label = (args.label or base_env.get("INSTANCE_LABEL") or "onepass-asr").strip() or "onepass-asr"
-    plan_override = (args.plan or "").strip()
+    plan_override = (args.plan or str(last.get("plan_id") or "")).strip()
+    profile_override = args.profile if args.profile is not None else last.get("profile")
+    profile_value = (
+        str(profile_override).strip() if profile_override not in (None, "") else ""
+    )
+    args.region = region
+    args.os = os_slug
+    args.plan = plan_override or None
+    args.profile = profile_value or None
     try:
         min_vram = int(args.min_vram) if args.min_vram is not None else None
     except (TypeError, ValueError):
@@ -401,7 +494,7 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     ctx["region"] = region
     ctx["os_slug"] = os_slug
     ctx["label"] = label
-    ctx["profile"] = args.profile or ""
+    ctx["profile"] = profile_value
     ctx["pattern"] = args.pattern or None
     ctx["stems"] = args.stems or None
     ctx["model"] = args.model or None
@@ -411,7 +504,7 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     ctx["min_vram"] = min_vram
     ctx["family_pattern"] = family_pattern
     ctx["plan_info"] = {}
-    ctx["plan_id"] = plan_override
+    ctx["plan_id"] = (plan_override or "").strip()
     ctx["summary"] = summary
     _qs_step_ok(summary, "解析 Vultr 配置", step)
 
@@ -426,8 +519,9 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
         ctx["plan_info"] = plan_entry
         _qs_step_ok(summary, "筛选 GPU 套餐", step)
     else:
-        ctx["plan_id"] = plan_override
-        ctx["plan_info"] = {"plan_id": plan_override, "family": "-", "gpu_vram": None}
+        ctx["plan_id"] = (plan_override or "").strip()
+        ctx["plan_info"] = {"plan_id": ctx["plan_id"], "family": "-", "gpu_vram": None}
+    # ==== END: OnePass Patch · R4.4 (quickstart use-last) ====
 
     step = _qs_step_start("最终确认")
     plan_info = ctx.get("plan_info", {})
@@ -667,6 +761,17 @@ def cmd_quickstart(args: argparse.Namespace) -> int:
     outputs_dir = PROJ_ROOT / "data" / "asr-json"
     log_info(f"转写产物目录：{outputs_dir.relative_to(PROJ_ROOT)}")
     log_ok(f"总耗时 {total_elapsed:.1f}s")
+    # ==== BEGIN: OnePass Patch · R4.4 (quickstart use-last) ====
+    try:
+        _state_update_last_used(
+            region=region,
+            os=os_slug,
+            plan_id=ctx.get("plan_id"),
+            profile=ctx.get("profile") or None,
+        )
+    except Exception:
+        pass
+    # ==== END: OnePass Patch · R4.4 (quickstart use-last) ====
     return 0
 
 
@@ -1146,10 +1251,31 @@ def cmd_create(args: argparse.Namespace) -> int:
         return 2
 
     api_key = env.get("VULTR_API_KEY", "").strip()
-    plan_id = getattr(args, "plan", None) or env.get("VULTR_PLAN") or "vc2-2c-4gb"
-    region = getattr(args, "region", None) or env.get("VULTR_REGION") or "nrt"
-    os_slug = getattr(args, "os", None) or env.get("VULTR_OS") or "ubuntu-22.04"
+    # ==== BEGIN: OnePass Patch · R4.4 (create use-last) ====
+    last = _state_get_last_used() if getattr(args, "use_last", False) else {}
+    plan_id = (
+        getattr(args, "plan", None)
+        or last.get("plan_id")
+        or env.get("VULTR_PLAN")
+        or "vc2-2c-4gb"
+    )
+    region = (
+        getattr(args, "region", None)
+        or last.get("region")
+        or env.get("VULTR_REGION")
+        or "nrt"
+    )
+    os_slug = (
+        getattr(args, "os", None)
+        or last.get("os")
+        or env.get("VULTR_OS")
+        or "ubuntu-22.04"
+    )
     label = getattr(args, "label", None) or env.get("INSTANCE_LABEL", "onepass-asr")
+    plan_id = str(plan_id).strip()
+    region = str(region).strip() or "nrt"
+    os_slug = str(os_slug).strip() or "ubuntu-22.04"
+    # ==== END: OnePass Patch · R4.4 (create use-last) ====
     assume_yes = getattr(args, "yes", False)
     tag = env.get("TAG") or None
 
@@ -1279,6 +1405,12 @@ def cmd_create(args: argparse.Namespace) -> int:
         ux.ok(
             f"已创建实例：ID={instance_id}  IP={main_ip}  Region={region}  Plan={plan_id}"
         )
+    # ==== BEGIN: OnePass Patch · R4.4 (create use-last) ====
+    try:
+        _state_update_last_used(region=region, os=os_slug, plan_id=plan_id)
+    except Exception:
+        pass
+    # ==== END: OnePass Patch · R4.4 (create use-last) ====
     return 0
 
 
@@ -2136,8 +2268,24 @@ def cmd_plans(args: argparse.Namespace) -> int:
     if getattr(args, "legacy", False):
         return _cmd_plans_r1(args)
 
-    region = (getattr(args, "region", None) or "nrt").strip().lower() or "nrt"
-    os_slug = (getattr(args, "os", None) or "ubuntu-22.04").strip() or "ubuntu-22.04"
+    # ==== BEGIN: OnePass Patch · R4.4 (plans use-last) ====
+    last = _state_get_last_used() if getattr(args, "use_last", False) else {}
+    region_arg = getattr(args, "region", None)
+    os_arg = getattr(args, "os", None)
+    region = (
+        (str(region_arg).strip() if region_arg not in (None, "") else "")
+        or str(last.get("region") or "")
+        or "nrt"
+    )
+    region = region.strip().lower() or "nrt"
+    os_slug = (
+        (str(os_arg).strip() if os_arg not in (None, "") else "")
+        or str(last.get("os") or "")
+        or "ubuntu-22.04"
+    )
+    os_slug = os_slug.strip() or "ubuntu-22.04"
+    args.region = region
+    args.os = os_slug
     family_re = getattr(args, "family", None)
     min_vram = getattr(args, "min_vram", None)
     only_available = getattr(args, "only_available", True)
@@ -2210,7 +2358,13 @@ def cmd_plans(args: argparse.Namespace) -> int:
 
     if as_json:
         print(json.dumps(plans, ensure_ascii=False, indent=2))
-        return 0 if plans else 1
+        if plans:
+            try:
+                _state_update_last_used(region=region, os=os_slug)
+            except Exception:
+                pass
+            return 0
+        return 1
 
     if not plans:
         ux.warn(f"{region} 暂无满足条件的 GPU 套餐；可试试 --region sgp / lax / fra")
@@ -2219,6 +2373,10 @@ def cmd_plans(args: argparse.Namespace) -> int:
     if quiet:
         for plan in plans:
             print(plan.get("plan_id", ""))
+        try:
+            _state_update_last_used(region=region, os=os_slug)
+        except Exception:
+            pass
         return 0
 
     rows = []
@@ -2253,6 +2411,11 @@ def cmd_plans(args: argparse.Namespace) -> int:
         + f"› 设置示例：VULTR_PLAN=<plan_id>  VULTR_REGION={region}  VULTR_OS={os_slug}"
         + ux.RESET
     )
+    try:
+        _state_update_last_used(region=region, os=os_slug)
+    except Exception:
+        pass
+    # ==== END: OnePass Patch · R4.4 (plans use-last) ====
     return 0
 
 
@@ -2260,8 +2423,11 @@ def cmd_plans(args: argparse.Namespace) -> int:
 def cmd_plans_nrt(args: argparse.Namespace) -> int:
     if getattr(args, "legacy", False):
         return _cmd_plans_nrt_r1(args)
-    args.region = getattr(args, "region", None) or "nrt"
-    args.os = getattr(args, "os", None) or "ubuntu-22.04"
+    if not getattr(args, "use_last", False):
+        if getattr(args, "region", None) in (None, ""):
+            args.region = "nrt"
+        if getattr(args, "os", None) in (None, ""):
+            args.os = "ubuntu-22.04"
     return cmd_plans(args)
 
 
@@ -2644,11 +2810,11 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--dry-run", action="store_true", help="仅展示将执行的操作")
 
     quick_parser = sub.add_parser("quickstart", help="快速创建实例并执行完整 ASR 流程")
-    quick_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
+    quick_parser.add_argument("--region", default=None, help="Region ID（默认 nrt）")
     quick_parser.add_argument(
         "--os",
         dest="os",
-        default="ubuntu-22.04",
+        default=None,
         help="操作系统 slug（默认 ubuntu-22.04）",
     )
     quick_parser.add_argument("--family", help="GPU 家族正则（如 A40|L40S|A16）", default=None)
@@ -2665,6 +2831,13 @@ def build_parser() -> argparse.ArgumentParser:
     quick_parser.add_argument("--no-watch", action="store_true", help="流程结束后跳过 watch")
     quick_parser.add_argument("--verbose", action="store_true", help="打印底层命令与参数")
     quick_parser.add_argument("--quiet", action="store_true", help="仅输出关键节点信息")
+    # ==== BEGIN: OnePass Patch · R4.4 (arg flags) ====
+    quick_parser.add_argument(
+        "--use-last",
+        action="store_true",
+        help="Prefill missing region/os/plan_id/profile from last_used",
+    )
+    # ==== END: OnePass Patch · R4.4 (arg flags) ====
     quick_parser.set_defaults(func=cmd_quickstart)
 
     env_parser = sub.add_parser("env-check", help="检查本机环境")
@@ -2715,6 +2888,13 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--yes", action="store_true", help="在交互提示中默认选择 Yes")
     create_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
     create_parser.add_argument("--quiet", action="store_true", help="仅输出关键结果")
+    # ==== BEGIN: OnePass Patch · R4.4 (arg flags) ====
+    create_parser.add_argument(
+        "--use-last",
+        action="store_true",
+        help="Prefill missing region/os/plan_id/profile from last_used",
+    )
+    # ==== END: OnePass Patch · R4.4 (arg flags) ====
     create_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
     create_parser.set_defaults(func=cmd_create, legacy=False)
 
@@ -2764,8 +2944,8 @@ def build_parser() -> argparse.ArgumentParser:
     regions_parser.set_defaults(func=cmd_regions)
 
     plans_parser = sub.add_parser("plans", help="列出可选 Plan")
-    plans_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
-    plans_parser.add_argument("--os", default="ubuntu-22.04", help="操作系统 slug（默认 ubuntu-22.04）")
+    plans_parser.add_argument("--region", default=None, help="Region ID（默认 nrt）")
+    plans_parser.add_argument("--os", default=None, help="操作系统 slug（默认 ubuntu-22.04）")
     plans_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
     plans_parser.add_argument("--min-vram", type=int, help="最小 GPU 显存 (GB)", default=None)
     plans_parser.add_argument(
@@ -2785,6 +2965,13 @@ def build_parser() -> argparse.ArgumentParser:
     plans_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
     plans_parser.add_argument("--quiet", action="store_true", help="仅输出 plan_id")
     plans_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
+    # ==== BEGIN: OnePass Patch · R4.4 (arg flags) ====
+    plans_parser.add_argument(
+        "--use-last",
+        action="store_true",
+        help="Prefill missing region/os from last_used cache",
+    )
+    # ==== END: OnePass Patch · R4.4 (arg flags) ====
     _add_dry_run(plans_parser)
     plans_parser.set_defaults(func=cmd_plans, legacy=False)
 
@@ -2792,11 +2979,11 @@ def build_parser() -> argparse.ArgumentParser:
         "plans-nrt",
         help="一键列出东京 nrt + Ubuntu 22.04 可用 GPU 套餐",
     )
-    plans_nrt_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
+    plans_nrt_parser.add_argument("--region", default=None, help="Region ID（默认 nrt）")
     plans_nrt_parser.add_argument(
         "--os",
         dest="os",
-        default="ubuntu-22.04",
+        default=None,
         help="操作系统 slug（默认 ubuntu-22.04）",
     )
     plans_nrt_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
@@ -2818,6 +3005,13 @@ def build_parser() -> argparse.ArgumentParser:
     plans_nrt_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
     plans_nrt_parser.add_argument("--quiet", action="store_true", help="仅输出 plan_id")
     plans_nrt_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
+    # ==== BEGIN: OnePass Patch · R4.4 (arg flags) ====
+    plans_nrt_parser.add_argument(
+        "--use-last",
+        action="store_true",
+        help="Prefill missing params from last_used cache",
+    )
+    # ==== END: OnePass Patch · R4.4 (arg flags) ====
     _add_dry_run(plans_nrt_parser)
     plans_nrt_parser.set_defaults(func=cmd_plans_nrt, legacy=False)
 
