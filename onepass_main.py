@@ -56,10 +56,19 @@ def _py_exe() -> str:
     """返回当前 Python 解释器路径，确保子进程和本进程一致。"""
     return sys.executable or "python"
 
-
-
+# ==== BEGIN: OnePass Patch · R4.5 (win-only flag) ====
 def _is_windows() -> bool:
     return os.name == "nt" or platform.system().lower().startswith("win")
+
+
+def _win_only_enabled() -> bool:
+    """WIN_ONLY 环境变量，默认 true；当为 'false'（忽略大小写）时视为关闭。"""
+
+    v = os.environ.get("WIN_ONLY", "true").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+# ==== END: OnePass Patch · R4.5 (win-only flag) ====
 
 
 def _run_cmd(title: str, cmd: List[str]) -> int:
@@ -1382,6 +1391,7 @@ def _interactive_snapshot() -> int:
     return handle_snapshot(args)
 
 
+# ==== BEGIN: OnePass Patch · R4.5 (menu hide non-win) ====
 def menu_vultr_slim() -> None:
     """
     Vultr 向导（简洁版）：
@@ -1394,6 +1404,7 @@ def menu_vultr_slim() -> None:
     7) 进入实时镜像 Watch
     H) Windows 环境检查（仅 Windows 显示）
     V) 切换详细模式（当前：开/关）
+    W) 切换 WIN_ONLY（提示如何通过环境变量关闭）
     Q) 返回
     """
     global _MENU_VERBOSE
@@ -1404,6 +1415,7 @@ def menu_vultr_slim() -> None:
         return
 
     while True:
+        win_only = _win_only_enabled()
         ux.hr()
         ux.out("==================== Vultr 向导（简洁版） ====================")
         ux.out("1) 快速开始（先看 plan → 选中 → 创建 → 写连接 → 选配置 → 上传 → ASR → 回收 → Watch）")
@@ -1416,6 +1428,7 @@ def menu_vultr_slim() -> None:
         if _is_windows():
             ux.out("H) Windows 环境检查")
         ux.out(f"V) 切换详细模式（当前：{'开' if _MENU_VERBOSE else '关'}）")
+        ux.out(f"W) 切换 WIN_ONLY（当前：{'开' if win_only else '关'}）")
         ux.out("Q) 返回")
         choice = input("选择：").strip().upper()
 
@@ -1459,6 +1472,14 @@ def menu_vultr_slim() -> None:
             cmd = [_py_exe(), str(PROJ_ROOT / "scripts" / "env_check_win.py")]
             _run_cmd("Windows 环境检查", cmd)
 
+        elif choice == "W":
+            ux.warn(
+                (
+                    "WIN_ONLY 由环境变量控制：Windows PowerShell `$env:WIN_ONLY='false'`；"
+                    "CMD `set WIN_ONLY=false`；Unix `export WIN_ONLY=false`。"
+                )
+            )
+
         elif choice == "V":
             _MENU_VERBOSE = not _MENU_VERBOSE
             ux.ok(f"详细模式现已{'开启' if _MENU_VERBOSE else '关闭'}")
@@ -1469,6 +1490,9 @@ def menu_vultr_slim() -> None:
 
         else:
             ux.warn("无效选择，请重试。")
+
+
+# ==== END: OnePass Patch · R4.5 (menu hide non-win) ====
 
 
 def menu_vultr_legacy() -> None:
@@ -1624,6 +1648,7 @@ def _interactive_rollback() -> int:
 def interactive_menu() -> int:
     section("OnePass Audio · 主菜单")
     while True:
+        win_only = _win_only_enabled()
         print("V) 云端部署（Vultr）向导（简洁版）")
         print("0) 批量转写音频（本地/云端一键流程）")
         print("1) 环境自检")
@@ -1631,7 +1656,8 @@ def interactive_menu() -> int:
         if _is_windows():
             print("H) Windows 环境检查 /（可选）一键安装 OpenSSH")
         # ==== END: OnePass Patch · R3 (menu: win env check) ====
-        print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
+        label = "Windows" if win_only else "Windows/macOS"
+        print(f"X) 一键自动修复环境（缺啥装啥；{label}）")
         print("2) 素材检查")
         print("3) 单章处理（去口癖 + 保留最后一遍 + 字幕/EDL/标记）")
         print("4) 仅渲染音频（按 EDL）")

@@ -1,5 +1,13 @@
 # OnePass Audio — 录完即净，一遍过
 
+> 平台支持（重要）
+- 当前分支为 **Windows 优先**：默认仅展示 Windows 路径与脚本。
+- macOS/PowerShell 脚本 **未删除**，仅被“软弃用”隐藏。
+- 如需显示所有平台提示，请在运行前设置环境变量：
+  - Windows PowerShell: `$env:WIN_ONLY="false"`
+  - Windows CMD: `set WIN_ONLY=false`
+  - Unix/macOS: `export WIN_ONLY=false`
+
 本项目是一键生成**去口癖、保留“同句最后一遍”**的干净字幕，并可选按剪辑清单导出干净音频的工具集（MVP）。
 
 ## 功能清单（当前与计划）
@@ -197,6 +205,9 @@ pwsh -File .\scripts\bulk_process.ps1 -AutoASR
 ## 云端部署（Vultr）向导：四步式
 
 Vultr 云端部署向导将常见的 VPS 创建与接入流程拆解为四个步骤，并集成在 `python onepass_main.py` 的交互式菜单中：
+
+- 建议在 Windows 上使用 `quickstart` 或 “Vultr 向导（简洁版）”。
+- macOS 流程仍可手工调用对应脚本，但默认菜单不展示（WIN_ONLY=true）。
 
 1. **准备配置文件**：复制 `deploy/cloud/vultr/vultr.env.example` 为 `deploy/cloud/vultr/vultr.env`，填写 API Key、区域、实例规格、SSH 私钥路径等信息。切记不要把 `vultr.env` 提交到 Git。
 2. **主菜单运行四步式**：在主菜单中选择 “V) 云端部署（Vultr）向导”，依次执行：
