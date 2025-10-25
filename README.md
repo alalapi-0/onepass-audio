@@ -198,6 +198,20 @@ Vultr 云端部署向导将常见的 VPS 创建与接入流程拆解为四个步
    python scripts/verify_asr_words.py
    ```
 
+### 快速选择东京可用 GPU 计划
+
+在填写 `deploy/cloud/vultr/vultr.env` 前，可先用以下命令快速查看东京（nrt）地区、Ubuntu 22.04 模板下的可用 GPU 套餐：
+
+```bash
+# 固定 nrt + ubuntu-22.04，一键列出可用 GPU 套餐
+python deploy/cloud/vultr/cloud_vultr_cli.py plans-nrt
+
+# 自定义更多过滤（例如只看 24GB+ 且 A40/L40S）
+python deploy/cloud/vultr/cloud_vultr_cli.py plans --region nrt --os ubuntu-22.04 --family "A40|L40S" --min-vram 24
+```
+
+若命令输出空表，说明东京暂时无库存，可切换到 `sgp`、`lax`、`fra` 等其他区域，或稍后再试。
+
 4. **安全提示**：
    - Vultr API Key 仅保存在本地 `deploy/cloud/vultr/vultr.env`，请勿上传或共享；
    - 根据预算及时关停/删除不再使用的实例；`cloud_vultr_cli.py` 支持在列表中确认当前实例信息；

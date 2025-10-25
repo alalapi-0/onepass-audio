@@ -11,11 +11,13 @@ import argparse
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -31,11 +33,14 @@ from deploy.cloud.vultr.vultr_api import (  # noqa: E402
     create_ssh_key,
     delete_instance,
     get_instance,
+    extract_region_availability,
+    list_gpu_plans,
     list_instances,
     list_os,
     list_plans,
     list_regions,
     list_ssh_keys,
+    resolve_os_id,
     wait_for_instance_active,
 )
 from onepass.ux import (  # noqa: E402
@@ -286,11 +291,14 @@ def _write_state(data: Dict[str, str]) -> None:
     STATE_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _ensure_env_and_key() -> Dict[str, str]:
+def _ensure_env_with_api_key(*, require_ssh: bool) -> Dict[str, str]:
     env = _read_env_file(optional=False)
     api_key = env.get("VULTR_API_KEY", "").strip()
     if not api_key:
         raise VultrError("VULTR_API_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
+    env["VULTR_API_KEY"] = api_key
+    if not require_ssh:
+        return env
     key_path_value = env.get("SSH_PRIVATE_KEY")
     if not key_path_value:
         raise VultrError("SSH_PRIVATE_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
@@ -309,6 +317,10 @@ def _ensure_env_and_key() -> Dict[str, str]:
     else:
         raise VultrError(f"未找到公钥 {public_key}，请执行 ssh-keygen 生成后重试。")
     return env
+
+
+def _ensure_env_and_key() -> Dict[str, str]:
+    return _ensure_env_with_api_key(require_ssh=True)
 
 
 def _match_item(items: Iterable[dict], value: str, *fields: str) -> Optional[dict]:
@@ -340,19 +352,9 @@ def _resolve_plan(value: str, api_key: str) -> str:
 
 
 def _resolve_os(value: str, api_key: str) -> int:
+    os_id = resolve_os_id(value, api_key=api_key)
     try:
-        return int(value)
-    except ValueError:
-        pass
-    os_list = list_os(api_key)
-    match = _match_item(os_list, value, "id", "name", "family", "slug", "description")
-    if not match:
-        raise VultrError(f"无法匹配操作系统：{value}")
-    os_id = match.get("id")
-    if isinstance(os_id, int):
-        return os_id
-    try:
-        return int(str(os_id))
+        return int(os_id)
     except ValueError as exc:  # pragma: no cover
         raise VultrError(f"无法解析 OS ID：{os_id}") from exc
 
@@ -1168,16 +1170,220 @@ def _filter_items(items: List[dict], text: Optional[str]) -> List[dict]:
     return result
 
 
-def _print_table(headers: List[str], rows: List[List[str]]) -> None:
+_GPU_FAMILY_PATTERN = re.compile(r"(A40|A16|L40S|A100|L4)", re.IGNORECASE)
+
+
+def _parse_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace(",", "").replace("$", "")
+    match = re.search(r"(-?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _format_number(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _extract_gpu_family(plan: dict) -> str:
+    text = f"{plan.get('name', '')} {plan.get('description', '')}"
+    match = _GPU_FAMILY_PATTERN.search(text)
+    if match:
+        return match.group(1).upper()
+    if "GPU" in text.upper():
+        return "GPU"
+    return "-"
+
+
+def _extract_gpu_vram_gb(plan: dict) -> Optional[float]:
+    candidates = [
+        plan.get("gpu_vram_gb"),
+        plan.get("gpu_vram"),
+        plan.get("gpu_memory"),
+        plan.get("gpu_memory_gb"),
+    ]
+    for value in candidates:
+        amount = _parse_float(value)
+        if amount is None:
+            continue
+        if amount > 512:
+            return round(amount / 1024, 2)
+        return round(amount, 2)
+    return None
+
+
+def _extract_vcpu(plan: dict) -> Optional[float]:
+    for key in ("vcpu_count", "vcpu", "vcpus", "cpu_count", "cpu"):
+        amount = _parse_float(plan.get(key))
+        if amount is not None:
+            return amount
+    return None
+
+
+def _extract_ram_gb(plan: dict) -> Optional[float]:
+    for key in ("ram", "memory", "ram_gb", "memory_mb"):
+        amount = _parse_float(plan.get(key))
+        if amount is None:
+            continue
+        if amount > 1024:
+            return round(amount / 1024, 2)
+        return round(amount, 2)
+    return None
+
+
+def _extract_storage(plan: dict) -> str:
+    amount = None
+    for key in ("disk", "storage", "disk_gb"):
+        amount = _parse_float(plan.get(key))
+        if amount is not None:
+            break
+    storage_text = ""
+    if amount is not None:
+        storage_text = f"{_format_number(amount)}GB"
+    else:
+        for key in ("disk", "storage"):
+            raw = plan.get(key)
+            if isinstance(raw, str) and raw.strip():
+                storage_text = raw.strip()
+                break
+    disk_type = plan.get("disk_type") or plan.get("storage_type")
+    if disk_type:
+        storage_text = f"{storage_text} {disk_type}".strip()
+    return storage_text or "-"
+
+
+def _extract_bandwidth(plan: dict) -> str:
+    amount = None
+    unit = "TB"
+    for key in ("bandwidth", "bandwidth_tb", "transfer", "transfer_tb", "monthly_bandwidth_tb"):
+        amount = _parse_float(plan.get(key))
+        if amount is not None:
+            break
+    if amount is None:
+        for key in ("bandwidth_gb", "transfer_gb"):
+            amount = _parse_float(plan.get(key))
+            if amount is not None:
+                unit = "GB"
+                break
+    if amount is None:
+        text = str(plan.get("bandwidth") or plan.get("transfer") or "").strip()
+        return text or "-"
+    return f"{_format_number(amount)}{unit}"
+
+
+def _extract_price_per_hour(plan: dict) -> Optional[float]:
+    for key in ("price_per_hour", "price_hourly", "hourly_cost", "hourly"):
+        amount = _parse_float(plan.get(key))
+        if amount is not None:
+            return amount
+    for key in ("price", "price_monthly", "monthly_cost"):
+        monthly = _parse_float(plan.get(key))
+        if monthly is not None:
+            return monthly / (30 * 24)
+    return None
+
+
+def _format_price(per_hour: Optional[float]) -> str:
+    if per_hour is None:
+        return "-"
+    return f"${per_hour:.3f}"
+
+
+def _plan_supports_os(plan: dict, os_id: str) -> bool:
+    if not os_id:
+        return True
+    str_id = str(os_id)
+    candidates = [
+        plan.get("available_os"),
+        plan.get("available_os_ids"),
+        plan.get("allowed_os"),
+        plan.get("operating_systems"),
+        plan.get("os"),
+        plan.get("os_id"),
+    ]
+    seen = False
+    for candidate in candidates:
+        if not candidate:
+            continue
+        seen = True
+        if isinstance(candidate, list):
+            for item in candidate:
+                if isinstance(item, dict):
+                    value = item.get("id") or item.get("os_id") or item.get("value")
+                    if value and str(value) == str_id:
+                        return True
+                elif str(item) == str_id:
+                    return True
+        else:
+            if str(candidate) == str_id:
+                return True
+    return not seen
+
+
+def _is_region_available(availability: Dict[str, bool], region: str) -> bool:
+    region_lower = region.lower()
+    for code, available in availability.items():
+        if str(code).lower() == region_lower:
+            return bool(available)
+    return False
+
+
+def _format_regions(availability: Dict[str, bool], region: Optional[str], highlight: bool) -> str:
+    regions = sorted(k for k, available in availability.items() if available)
+    if not regions:
+        regions_text = "-"
+    else:
+        entries: List[str] = []
+        region_lower = region.lower() if region else None
+        for code in regions:
+            entry = str(code)
+            if region_lower and str(code).lower() == region_lower:
+                entry = f"[{entry}]"
+            entries.append(entry)
+        regions_text = ", ".join(entries)
+    if highlight and regions_text != "-":
+        regions_text = f"{regions_text} *"
+    return regions_text
+
+def _print_table(headers: List[str], rows: List[List[str]], *, max_col_width: int = 36) -> None:
+    wrapped_rows: List[List[List[str]]] = []
     widths = [len(h) for h in headers]
     for row in rows:
+        wrapped_row: List[List[str]] = []
         for idx, cell in enumerate(row):
-            widths[idx] = max(widths[idx], len(str(cell)))
+            text = str(cell)
+            cell_lines: List[str] = []
+            for segment in text.splitlines() or [""]:
+                wrapped = textwrap.wrap(segment, width=max_col_width) or [segment[:max_col_width]]
+                cell_lines.extend(wrapped)
+            widths[idx] = min(max(max(widths[idx], *(len(line) for line in cell_lines)), len(headers[idx])), max_col_width)
+            wrapped_row.append(cell_lines)
+        wrapped_rows.append(wrapped_row)
     header_line = " | ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers)))
     print(header_line)
     print("-+-".join("-" * w for w in widths))
-    for row in rows:
-        print(" | ".join(str(row[idx]).ljust(widths[idx]) for idx in range(len(headers))))
+    for wrapped_row in wrapped_rows:
+        row_height = max(len(cell_lines) for cell_lines in wrapped_row)
+        for line_idx in range(row_height):
+            parts: List[str] = []
+            for col_idx, cell_lines in enumerate(wrapped_row):
+                value = cell_lines[line_idx] if line_idx < len(cell_lines) else ""
+                parts.append(value.ljust(widths[col_idx]))
+            print(" | ".join(parts))
 
 
 def cmd_regions(args: argparse.Namespace) -> int:
@@ -1211,34 +1417,150 @@ def cmd_regions(args: argparse.Namespace) -> int:
 
 
 def cmd_plans(args: argparse.Namespace) -> int:
+    gpu_only = True if args.gpu_only is None else args.gpu_only
+    only_available = True if args.only_available is None else args.only_available
+    region = args.region or "nrt"
     try:
-        env = _ensure_env_and_key()
+        env = _ensure_env_with_api_key(require_ssh=False)
     except (VultrError, FileNotFoundError) as exc:
         log_err(_format_exception(exc))
         return 2
+    api_key = env["VULTR_API_KEY"].strip()
+    if args.dry_run:
+        log_info(
+            "[DryRun] 将列出 Vultr 计划："
+            f"region={region}, os={args.os}, gpu_only={gpu_only}, only_available={only_available}"
+        )
+        return 0
     try:
-        items = list_plans(env["VULTR_API_KEY"].strip())
+        os_id = resolve_os_id(args.os, api_key=api_key)
     except VultrError as exc:
         log_err(_format_exception(exc))
         return 2
-    filtered = _filter_items(items, args.filter)
-    if not filtered:
-        log_warn("未找到匹配的 plan。")
-        return 1
-    headers = ["ID", "Description", "vCPUs", "RAM", "Disk", "Bandwidth"]
-    rows = []
-    for item in filtered:
+    try:
+        if gpu_only:
+            plans = list_gpu_plans(region=region if only_available else None, api_key=api_key)
+        else:
+            plans = list_plans(api_key)
+    except VultrError as exc:
+        log_err(_format_exception(exc))
+        return 2
+
+    entries: List[dict] = []
+    filter_text = args.filter.lower() if args.filter else None
+    try:
+        family_pattern = re.compile(args.family, re.IGNORECASE) if args.family else None
+    except re.error as exc:
+        log_err(f"无效的 --family 正则：{exc}")
+        return 2
+    min_vram = args.min_vram
+    os_id_str = str(os_id)
+    for plan in plans:
+        availability = extract_region_availability(plan)
+        if region and only_available and not _is_region_available(availability, region):
+            continue
+        if not _plan_supports_os(plan, os_id_str):
+            continue
+        plan_id = str(plan.get("id", "")).strip()
+        name = str(plan.get("name") or "").strip()
+        description = str(plan.get("description") or "").strip()
+        family = _extract_gpu_family(plan)
+        searchable = f"{plan_id} {name} {description} {family}"
+        if filter_text and filter_text not in searchable.lower():
+            continue
+        if family_pattern and not (
+            family_pattern.search(family) or family_pattern.search(searchable)
+        ):
+            continue
+        gpu_vram = _extract_gpu_vram_gb(plan)
+        if min_vram is not None and (gpu_vram is None or gpu_vram < min_vram):
+            continue
+        vcpu = _extract_vcpu(plan)
+        ram_gb = _extract_ram_gb(plan)
+        storage = _extract_storage(plan)
+        bandwidth = _extract_bandwidth(plan)
+        price_hour = _extract_price_per_hour(plan)
+        highlight = bool(min_vram is not None and gpu_vram is not None and gpu_vram >= min_vram)
+        regions_display = _format_regions(availability, region, highlight)
         row = [
-            str(item.get("id", "")),
-            str(item.get("description") or item.get("name", "")),
-            str(item.get("vcpu_count") or item.get("vcpus", "")),
-            str(item.get("ram") or item.get("memory", "")),
-            str(item.get("disk", "")),
-            str(item.get("bandwidth", "")),
+            plan_id or "-",
+            family,
+            _format_number(gpu_vram),
+            _format_number(vcpu),
+            _format_number(ram_gb),
+            storage,
+            bandwidth,
+            _format_price(price_hour),
+            regions_display,
         ]
-        rows.append(row)
+        entries.append(
+            {
+                "row": row,
+                "plan_id": plan_id,
+                "price": price_hour if price_hour is not None else float("inf"),
+                "vram": gpu_vram if gpu_vram is not None else -1.0,
+                "vcpu": vcpu if vcpu is not None else -1.0,
+                "highlight": highlight,
+            }
+        )
+
+    if not entries:
+        msg = "未找到符合条件的计划。"
+        if region:
+            msg += f" 尝试 plans --region <other>（例如 sgp、lax、fra）。"
+        log_warn(msg)
+        return 1
+
+    sort_key = args.sort
+    if sort_key == "price":
+        entries.sort(key=lambda item: (item["price"], item["plan_id"]))
+    elif sort_key == "vram":
+        entries.sort(key=lambda item: (-item["vram"], item["plan_id"]))
+    elif sort_key == "vcpu":
+        entries.sort(key=lambda item: (-item["vcpu"], item["plan_id"]))
+
+    headers = [
+        "plan_id",
+        "family",
+        "gpu_vram(GB)",
+        "vCPU",
+        "RAM(GB)",
+        "Storage",
+        "Bandwidth",
+        "Price(/h)",
+        "Regions",
+    ]
+    rows = [entry["row"] for entry in entries]
     _print_table(headers, rows)
+
+    if min_vram is not None:
+        highlights = sum(1 for entry in entries if entry["highlight"])
+        if highlights:
+            print(f"* 推荐：满足 --min-vram={min_vram}")
+        else:
+            print(f"未找到满足 --min-vram={min_vram} 的计划。")
+    print("选中后可写入：")
+    print("  VULTR_PLAN=<plan_id>")
+    print(f"  VULTR_REGION={region}")
+    print(f"  VULTR_OS={args.os}")
+    print("将某个 plan_id 填入 deploy/cloud/vultr/vultr.env 的 VULTR_PLAN= 后，再执行 create")
+    print("或直接： python deploy/cloud/vultr/cloud_vultr_cli.py create --plan <plan_id>（若支持覆盖 env）")
     return 0
+
+
+def cmd_plans_nrt(args: argparse.Namespace) -> int:
+    merged = argparse.Namespace(
+        region="nrt",
+        os="ubuntu-22.04",
+        gpu_only=True,
+        only_available=True,
+        family=None,
+        min_vram=None,
+        filter=None,
+        sort="price",
+        dry_run=args.dry_run,
+    )
+    return cmd_plans(merged)
 
 
 def cmd_os(args: argparse.Namespace) -> int:
@@ -1417,9 +1739,45 @@ def build_parser() -> argparse.ArgumentParser:
     regions_parser.set_defaults(func=cmd_regions)
 
     plans_parser = sub.add_parser("plans", help="列出可选 Plan")
-    plans_parser.add_argument("--filter", help="过滤关键词", default=None)
+    plans_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
+    plans_parser.add_argument("--os", default="ubuntu-22.04", help="操作系统 slug 或 ID")
+    plans_parser.add_argument("--gpu-only", dest="gpu_only", action="store_true", help="仅显示 GPU 套餐")
+    plans_parser.add_argument(
+        "--no-gpu-only",
+        dest="gpu_only",
+        action="store_false",
+        help="显示所有套餐（包含非 GPU）",
+    )
+    plans_parser.add_argument(
+        "--only-available",
+        dest="only_available",
+        action="store_true",
+        help="仅显示指定 region 当前可用的套餐",
+    )
+    plans_parser.add_argument(
+        "--include-unavailable",
+        dest="only_available",
+        action="store_false",
+        help="包含暂不可用的套餐",
+    )
+    plans_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
+    plans_parser.add_argument("--min-vram", type=float, help="最小 GPU 显存 (GB)", default=None)
+    plans_parser.add_argument(
+        "--sort",
+        choices=["price", "vram", "vcpu"],
+        default="price",
+        help="排序字段 (price/vram/vcpu)",
+    )
+    plans_parser.add_argument("--filter", help="对名称/描述模糊匹配", default=None)
     _add_dry_run(plans_parser)
-    plans_parser.set_defaults(func=cmd_plans)
+    plans_parser.set_defaults(func=cmd_plans, gpu_only=None, only_available=None)
+
+    plans_nrt_parser = sub.add_parser(
+        "plans-nrt",
+        help="一键列出东京 nrt + Ubuntu 22.04 可用 GPU 套餐",
+    )
+    _add_dry_run(plans_nrt_parser)
+    plans_nrt_parser.set_defaults(func=cmd_plans_nrt)
 
     os_parser = sub.add_parser("os", help="列出操作系统模板")
     os_parser.add_argument("--filter", help="过滤关键词", default=None)
