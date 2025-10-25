@@ -218,6 +218,23 @@ def _expand_path(value: str) -> Path:
     return Path(expanded).expanduser()
 
 
+def _detect_default_private_key() -> Optional[Path]:
+    """Try to locate a commonly used SSH private key on the current host."""
+
+    candidates: List[Path] = []
+    home = Path.home()
+    if home:
+        ssh_dir = home / ".ssh"
+        candidates.extend(
+            ssh_dir / name for name in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa")
+        )
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _ssh_read_text(host: str, user: str, key_path: Path, remote_path: str) -> Tuple[int, str]:
     cmd = [
         "ssh",
@@ -299,12 +316,26 @@ def _ensure_env_with_api_key(*, require_ssh: bool) -> Dict[str, str]:
     env["VULTR_API_KEY"] = api_key
     if not require_ssh:
         return env
-    key_path_value = env.get("SSH_PRIVATE_KEY")
+    key_path_value = (env.get("SSH_PRIVATE_KEY") or "").strip()
+    fallback_key = _detect_default_private_key()
     if not key_path_value:
-        raise VultrError("SSH_PRIVATE_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
-    private_key = _expand_path(key_path_value)
-    if not private_key.exists():
-        raise VultrError(f"未找到 SSH 私钥：{private_key}")
+        if not fallback_key:
+            raise VultrError("SSH_PRIVATE_KEY 未配置，请设置环境变量或在 vultr.env 中提供。")
+        private_key = fallback_key
+        env["SSH_PRIVATE_KEY"] = str(private_key)
+        log_info(f"未配置 SSH_PRIVATE_KEY，自动使用 {private_key}")
+    else:
+        private_key = _expand_path(key_path_value)
+        if not private_key.exists():
+            if fallback_key and fallback_key != private_key:
+                log_warn(
+                    "未找到配置的 SSH 私钥 %s，自动回退到 %s"
+                    % (private_key, fallback_key)
+                )
+                private_key = fallback_key
+                env["SSH_PRIVATE_KEY"] = str(private_key)
+            else:
+                raise VultrError(f"未找到 SSH 私钥：{private_key}")
     env["SSH_PRIVATE_KEY_RESOLVED"] = str(private_key)
     public_key = (
         private_key.with_suffix(private_key.suffix + ".pub")
@@ -428,8 +459,10 @@ def cmd_env_check(args: argparse.Namespace) -> int:
                 log_warn(f"pwsh 返回码 {code}：{message}")
                 status_warn.append("pwsh")
         else:
-            log_err("未找到 PowerShell 7 (pwsh)，请安装 https://aka.ms/powershell 并重启终端。")
-            status_fail.append("pwsh")
+            log_warn(
+                "未找到 PowerShell 7 (pwsh)，推荐安装 https://aka.ms/powershell 以使用补充功能。"
+            )
+            status_warn.append("pwsh-missing")
 
         for cmd in ("ssh", "scp"):
             ok, message, code = _check_command(cmd, ["-V"])
@@ -452,8 +485,9 @@ def cmd_env_check(args: argparse.Namespace) -> int:
             log_warn("未检测到 rsync，缺少时将回退到 scp。")
             status_warn.append("rsync-missing")
 
+        fallback_key = _detect_default_private_key()
         if env:
-            key_path_value = env.get("SSH_PRIVATE_KEY")
+            key_path_value = (env.get("SSH_PRIVATE_KEY") or "").strip()
             if key_path_value:
                 priv_path = _expand_path(key_path_value)
                 if priv_path.exists():
@@ -466,14 +500,32 @@ def cmd_env_check(args: argparse.Namespace) -> int:
                     except OSError as exc:  # pragma: no cover
                         log_warn(f"无法检查私钥权限：{exc}")
                 else:
-                    log_warn(f"未找到私钥 {priv_path}，可使用 ssh-keygen -t ed25519 生成。")
-                    status_warn.append("ssh-key-missing")
+                    if fallback_key and fallback_key != priv_path:
+                        log_warn(
+                            f"未找到配置的私钥 {priv_path}，将尝试使用默认私钥 {fallback_key}。"
+                        )
+                        log_ok(f"检测到默认私钥：{fallback_key}")
+                    else:
+                        log_warn(
+                            f"未找到私钥 {priv_path}，可使用 ssh-keygen -t ed25519 生成。"
+                        )
+                        status_warn.append("ssh-key-missing")
             else:
-                log_warn("未在配置中检测到 SSH_PRIVATE_KEY，将跳过私钥检查。")
-                status_warn.append("ssh-key-config")
+                if fallback_key:
+                    log_warn(
+                        f"未在配置中检测到 SSH_PRIVATE_KEY，已发现默认私钥 {fallback_key}。"
+                    )
+                else:
+                    log_warn("未在配置中检测到 SSH_PRIVATE_KEY，将跳过私钥检查。")
+                    status_warn.append("ssh-key-config")
         else:
-            log_warn("未检测到任何 Vultr 配置，将跳过私钥检查。")
-            status_warn.append("vultr-config")
+            if fallback_key:
+                log_warn(
+                    f"未检测到 Vultr 配置，但已发现默认私钥 {fallback_key}。"
+                )
+            else:
+                log_warn("未检测到任何 Vultr 配置，将跳过私钥检查。")
+                status_warn.append("vultr-config")
 
         ps_script = CUR_DIR / "cloud_env_check.ps1"
         pwsh_path = shutil.which("pwsh")
