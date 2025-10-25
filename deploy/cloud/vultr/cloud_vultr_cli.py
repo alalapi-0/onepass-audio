@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import textwrap
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -27,6 +28,7 @@ PROJ_ROOT = CUR_DIR.parents[2]
 if str(PROJ_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJ_ROOT))
 
+from deploy.cloud.vultr import vultr_api  # noqa: E402
 from deploy.cloud.vultr.vultr_api import (  # noqa: E402
     VultrError,
     create_instance,
@@ -44,6 +46,7 @@ from deploy.cloud.vultr.vultr_api import (  # noqa: E402
     resolve_os_id,
     wait_for_instance_active,
 )
+from onepass import ux  # noqa: E402
 from onepass.ux import (  # noqa: E402
     Spinner,
     format_cmd,
@@ -1127,7 +1130,160 @@ def cmd_install_deps(args: argparse.Namespace) -> int:
     return rc
 
 
+# ==== BEGIN: OnePass Patch · R4.2 (create UX) ====
 def cmd_create(args: argparse.Namespace) -> int:
+    if getattr(args, "legacy", False):
+        return _cmd_create_r1(args)
+
+    verbose = getattr(args, "verbose", False)
+    quiet = getattr(args, "quiet", False)
+
+    try:
+        env = _ensure_env_and_key()
+    except (VultrError, FileNotFoundError) as exc:
+        message = _format_exception(exc) if isinstance(exc, VultrError) else str(exc)
+        ux.err(message)
+        return 2
+
+    api_key = env.get("VULTR_API_KEY", "").strip()
+    plan_id = getattr(args, "plan", None) or env.get("VULTR_PLAN") or "vc2-2c-4gb"
+    region = getattr(args, "region", None) or env.get("VULTR_REGION") or "nrt"
+    os_slug = getattr(args, "os", None) or env.get("VULTR_OS") or "ubuntu-22.04"
+    label = getattr(args, "label", None) or env.get("INSTANCE_LABEL", "onepass-asr")
+    assume_yes = getattr(args, "yes", False)
+    tag = env.get("TAG") or None
+
+    family = "-"
+    vram = "-"
+    try:
+        plans = vultr_api.list_gpu_plans(region=region, os_slug=os_slug, api_key=api_key)
+        for plan in plans:
+            if str(plan.get("plan_id")) == str(plan_id):
+                family = plan.get("family", "-") or "-"
+                vram_value = plan.get("gpu_vram_gb")
+                vram = f"{vram_value}GB" if vram_value is not None else "-"
+                break
+    except Exception as exc:
+        if verbose and not quiet:
+            ux.warn(f"调试：拉取 plan 详情失败：{exc}")
+
+    step_ctx = ux.step("校验 API Key") if not quiet else nullcontext()
+    try:
+        with step_ctx:
+            vultr_api.get_account_info(api_key=api_key)
+    except Exception as exc:
+        ux.err("API Key 无效或无权限（请检查 deploy/cloud/vultr/vultr.env 的 VULTR_API_KEY）")
+        if verbose and not quiet:
+            ux.warn(f"调试：{type(exc).__name__}: {exc}")
+        return 2
+
+    if not assume_yes and not quiet:
+        ux.out("即将创建实例：")
+        ux.out(f"  计划: {family} {vram}")
+        ux.out(f"  区域: {region}    OS: {os_slug}")
+        ux.out(f"  标签: {label}")
+        ans = input("确认？ [Y/n]: ").strip().lower()
+        if ans in ("n", "no"):
+            ux.warn("已取消")
+            return 1
+
+    if getattr(args, "dry_run", False):
+        if not quiet:
+            ux.warn("[DryRun] 已跳过实例创建，仅展示参数。")
+        return 0
+
+    try:
+        resolved_region = _resolve_region(region, api_key)
+        resolved_plan = _resolve_plan(plan_id, api_key)
+        resolved_os = _resolve_os(os_slug, api_key)
+    except VultrError as exc:
+        ux.err(_format_exception(exc))
+        return 2
+
+    def _prepare_ssh_key() -> Tuple[str, str]:
+        public_key = env["SSH_PUBLIC_KEY"]
+        key_name = env.get("INSTANCE_LABEL", "onepass") + "-ssh"
+        try:
+            existing = vultr_api.list_ssh_keys(api_key)
+        except Exception as exc:
+            raise VultrError(str(exc))
+        for item in existing:
+            remote_key = (item.get("ssh_key") or "").strip()
+            if remote_key == public_key:
+                if verbose and not quiet:
+                    ux.warn(
+                        f"调试：复用已存在的 SSH Key：{item.get('name')} ({item.get('id')})"
+                    )
+                return str(item.get("id")), str(item.get("name"))
+        created = vultr_api.create_ssh_key(key_name, public_key, api_key)
+        key_info = created.get("ssh_key", created)
+        if verbose and not quiet:
+            ux.warn(
+                f"调试：上传 SSH Key：{key_info.get('name')} ({key_info.get('id')})"
+            )
+        return str(key_info.get("id")), str(key_info.get("name"))
+
+    try:
+        ssh_key_id, _ssh_key_name = _prepare_ssh_key()
+    except VultrError as exc:
+        ux.err(_format_exception(exc))
+        return 2
+
+    timeout_s = int(env.get("CREATE_TIMEOUT_SEC", "900") or "900")
+    poll_s = int(env.get("POLL_INTERVAL_SEC", "8") or "8")
+
+    step_ctx = ux.step("创建实例") if not quiet else nullcontext()
+    try:
+        with step_ctx:
+            response = vultr_api.create_instance(
+                resolved_region,
+                resolved_plan,
+                resolved_os,
+                label,
+                [ssh_key_id],
+                api_key,
+                tag=tag,
+            )
+            instance = response.get("instance", response)
+            instance_id = instance.get("id") or instance.get("instance_id") or "-"
+            main_ip = instance.get("main_ip") or instance.get("ip") or "-"
+            if not instance_id or instance_id == "-":
+                raise VultrError("API 未返回实例 ID")
+            vultr_api.wait_for_instance_active(instance_id, timeout_s, poll_s, api_key)
+            info = vultr_api.get_instance(instance_id, api_key)
+            instance_info = info.get("instance", info)
+            main_ip = instance_info.get("main_ip") or main_ip
+            state = {
+                "instance_id": instance_id,
+                "main_ip": main_ip,
+                "ssh_key_id": ssh_key_id,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_state(state)
+    except Exception as exc:
+        if quiet:
+            if isinstance(exc, VultrError):
+                ux.err(_format_exception(exc))
+            else:
+                ux.err(f"创建失败：{type(exc).__name__}: {exc}")
+        elif verbose:
+            if isinstance(exc, VultrError):
+                ux.warn(f"调试：{_format_exception(exc)}")
+            else:
+                ux.warn(f"调试：创建失败：{type(exc).__name__}: {exc}")
+        return 2
+
+    if quiet:
+        print(main_ip if main_ip not in {None, "", "-"} else instance_id)
+    else:
+        ux.ok(
+            f"已创建实例：ID={instance_id}  IP={main_ip}  Region={region}  Plan={plan_id}"
+        )
+    return 0
+
+
+# ==== END: OnePass Patch · R4.2 (create UX) ====
+def _cmd_create_r1(args: argparse.Namespace) -> int:
     section("步骤②：创建 Vultr VPS")
     try:
         env = _ensure_env_and_key()
@@ -1975,6 +2131,144 @@ def cmd_regions(args: argparse.Namespace) -> int:
     return 0
 
 
+# ==== BEGIN: OnePass Patch · R4.2 (plans UX) ====
+def cmd_plans(args: argparse.Namespace) -> int:
+    if getattr(args, "legacy", False):
+        return _cmd_plans_r1(args)
+
+    region = (getattr(args, "region", None) or "nrt").strip().lower() or "nrt"
+    os_slug = (getattr(args, "os", None) or "ubuntu-22.04").strip() or "ubuntu-22.04"
+    family_re = getattr(args, "family", None)
+    min_vram = getattr(args, "min_vram", None)
+    only_available = getattr(args, "only_available", True)
+    as_json = getattr(args, "json", False)
+    verbose = getattr(args, "verbose", False)
+    quiet = getattr(args, "quiet", False)
+
+    if getattr(args, "dry_run", False):
+        if not quiet:
+            ux.warn(
+                f"[DryRun] 将获取 GPU 计划：region={region} os={os_slug} only_available={only_available}"
+            )
+        return 0
+
+    try:
+        env = _ensure_env_with_api_key(require_ssh=False)
+    except (VultrError, FileNotFoundError) as exc:
+        message = _format_exception(exc) if isinstance(exc, VultrError) else str(exc)
+        ux.err(message)
+        return 2
+
+    api_key = env.get("VULTR_API_KEY", "").strip()
+
+    if family_re:
+        try:
+            family_re_compiled = re.compile(family_re, re.IGNORECASE)
+        except re.error as exc:
+            ux.err(f"无效的 --family 正则：{exc}")
+            return 2
+    else:
+        family_re_compiled = None
+
+    step_ctx = ux.step(f"查询 {region} 可用 GPU 计划") if not quiet else nullcontext()
+    try:
+        with step_ctx:
+            plans = vultr_api.list_gpu_plans(
+                region=region if only_available else None,
+                os_slug=os_slug,
+                api_key=api_key,
+            )
+    except Exception as exc:
+        if quiet:
+            if isinstance(exc, VultrError):
+                ux.err(_format_exception(exc))
+            else:
+                ux.err(str(exc))
+        elif verbose:
+            if isinstance(exc, VultrError):
+                ux.warn(f"调试：{_format_exception(exc)}")
+            else:
+                ux.warn(f"调试：获取计划失败：{exc}")
+        return 2
+
+    if family_re_compiled:
+        plans = [
+            p
+            for p in plans
+            if family_re_compiled.search(str(p.get("family", "")) or str(p.get("name", "")) or "")
+        ]
+    if min_vram is not None:
+        try:
+            mv = int(min_vram)
+        except (TypeError, ValueError):
+            ux.err("--min-vram 需要整数值")
+            return 2
+        plans = [p for p in plans if (p.get("gpu_vram_gb") or 0) >= mv]
+
+    if verbose and not quiet:
+        ux.warn(f"调试：筛后条数 = {len(plans)}")
+
+    if as_json:
+        print(json.dumps(plans, ensure_ascii=False, indent=2))
+        return 0 if plans else 1
+
+    if not plans:
+        ux.warn(f"{region} 暂无满足条件的 GPU 套餐；可试试 --region sgp / lax / fra")
+        return 1
+
+    if quiet:
+        for plan in plans:
+            print(plan.get("plan_id", ""))
+        return 0
+
+    rows = []
+    for plan in plans:
+        price = plan.get("price_hour")
+        if isinstance(price, (int, float)):
+            price_display = f"${price:.3f}"
+        else:
+            price_display = "-"
+        regions = plan.get("available_regions")
+        regions_display = ",".join(regions) if regions else "?"
+        rows.append(
+            [
+                plan.get("plan_id", ""),
+                plan.get("family", "-"),
+                plan.get("gpu_vram_gb", "-"),
+                plan.get("vcpu", "-"),
+                plan.get("ram_gb", "-"),
+                plan.get("storage", "-"),
+                price_display,
+                regions_display,
+            ]
+        )
+
+    ux.table(
+        rows,
+        headers=["plan_id", "family", "vRAM", "vCPU", "RAM", "Storage", "Price/h", "Regions"],
+        maxw=100,
+    )
+    ux.out(
+        ux.DIM
+        + f"› 设置示例：VULTR_PLAN=<plan_id>  VULTR_REGION={region}  VULTR_OS={os_slug}"
+        + ux.RESET
+    )
+    return 0
+
+
+# ==== BEGIN: OnePass Patch · R4.2 (plans-nrt alias) ====
+def cmd_plans_nrt(args: argparse.Namespace) -> int:
+    if getattr(args, "legacy", False):
+        return _cmd_plans_nrt_r1(args)
+    args.region = getattr(args, "region", None) or "nrt"
+    args.os = getattr(args, "os", None) or "ubuntu-22.04"
+    return cmd_plans(args)
+
+
+# ==== END: OnePass Patch · R4.2 (plans-nrt alias) ====
+
+
+# ==== END: OnePass Patch · R4.2 (plans UX) ====
 # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
 def _cmd_plans_legacy(args: argparse.Namespace) -> int:
     gpu_only = getattr(args, "gpu_only", False)
@@ -2115,7 +2409,7 @@ def _cmd_plans_legacy(args: argparse.Namespace) -> int:
 
 
 
-def cmd_plans(args: argparse.Namespace) -> int:
+def _cmd_plans_r1(args: argparse.Namespace) -> int:
     # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
     if getattr(args, "legacy", False):
         return _cmd_plans_legacy(args)
@@ -2236,7 +2530,7 @@ def cmd_plans(args: argparse.Namespace) -> int:
     # ==== END: OnePass Patch · R1 ====
     return 0
 
-def cmd_plans_nrt(args: argparse.Namespace) -> int:
+def _cmd_plans_nrt_r1(args: argparse.Namespace) -> int:
     # ==== BEGIN: OnePass Patch · R1 (plans & version check) ====
     merged = argparse.Namespace(
         region="nrt",
@@ -2249,7 +2543,7 @@ def cmd_plans_nrt(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         legacy=False,
     )
-    return cmd_plans(merged)
+    return _cmd_plans_r1(merged)
     # ==== END: OnePass Patch · R1 ====
 
 
@@ -2339,6 +2633,10 @@ def cmd_tail_log(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Vultr 云端部署向导 CLI")
+    # ==== BEGIN: OnePass Patch · R4.2 (CLI flags) ====
+    parser.add_argument("--verbose", action="store_true", help="Print verbose debug details")
+    parser.add_argument("--quiet", action="store_true", help="Minimal output (only key results)")
+    # ==== END: OnePass Patch · R4.2 (CLI flags) ====
     sub = parser.add_subparsers(dest="command")
     sub.required = True
 
@@ -2405,7 +2703,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     create_parser = sub.add_parser("create", help="创建 VPS 实例")
     _add_dry_run(create_parser)
-    create_parser.set_defaults(func=cmd_create)
+    create_parser.add_argument("--plan", help="指定 plan_id（覆盖 vultr.env）", default=None)
+    create_parser.add_argument("--region", help="Region ID（默认 nrt）", default=None)
+    create_parser.add_argument(
+        "--os",
+        dest="os",
+        help="操作系统 slug（默认 ubuntu-22.04）",
+        default=None,
+    )
+    create_parser.add_argument("--label", help="实例标签（默认 onepass-asr）", default=None)
+    create_parser.add_argument("--yes", action="store_true", help="在交互提示中默认选择 Yes")
+    create_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
+    create_parser.add_argument("--quiet", action="store_true", help="仅输出关键结果")
+    create_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
+    create_parser.set_defaults(func=cmd_create, legacy=False)
 
     prepare_parser = sub.add_parser("prepare-local", help="准备本机接入 VPS")
     _add_dry_run(prepare_parser)
@@ -2472,6 +2783,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plans_parser.add_argument("--json", action="store_true", help="以 JSON 形式输出")
     plans_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
+    plans_parser.add_argument("--quiet", action="store_true", help="仅输出 plan_id")
     plans_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
     _add_dry_run(plans_parser)
     plans_parser.set_defaults(func=cmd_plans, legacy=False)
@@ -2480,18 +2792,34 @@ def build_parser() -> argparse.ArgumentParser:
         "plans-nrt",
         help="一键列出东京 nrt + Ubuntu 22.04 可用 GPU 套餐",
     )
+    plans_nrt_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
+    plans_nrt_parser.add_argument(
+        "--os",
+        dest="os",
+        default="ubuntu-22.04",
+        help="操作系统 slug（默认 ubuntu-22.04）",
+    )
     plans_nrt_parser.add_argument("--family", help="GPU 家族正则 (如 A40|L40S|A16)", default=None)
     plans_nrt_parser.add_argument("--min-vram", type=int, help="最小 GPU 显存 (GB)", default=None)
     plans_nrt_parser.add_argument(
-        "--include-unavailable",
-        dest="include_unavailable",
+        "--only-available",
+        dest="only_available",
         action="store_true",
+        default=True,
+        help="仅显示指定 region 当前标记为可用的套餐（默认启用）",
+    )
+    plans_nrt_parser.add_argument(
+        "--include-unavailable",
+        dest="only_available",
+        action="store_false",
         help="包含暂未标记为可用的套餐",
     )
     plans_nrt_parser.add_argument("--json", action="store_true", help="以 JSON 形式输出")
     plans_nrt_parser.add_argument("--verbose", action="store_true", help="打印调试信息")
+    plans_nrt_parser.add_argument("--quiet", action="store_true", help="仅输出 plan_id")
+    plans_nrt_parser.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
     _add_dry_run(plans_nrt_parser)
-    plans_nrt_parser.set_defaults(func=cmd_plans_nrt)
+    plans_nrt_parser.set_defaults(func=cmd_plans_nrt, legacy=False)
 
     os_parser = sub.add_parser("os", help="列出操作系统模板")
     os_parser.add_argument("--filter", help="过滤关键词", default=None)
