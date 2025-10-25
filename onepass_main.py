@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -26,6 +27,7 @@ import time
 from pathlib import Path
 from typing import Iterable, List
 
+from onepass import ux
 from onepass.deploy_api import (
     get_current_provider_name as deploy_get_current_provider_name,
     load_provider_config as deploy_load_provider_config,
@@ -46,10 +48,40 @@ PROJ_ROOT = Path(__file__).resolve().parent
 CONFIG_DEFAULT = PROJ_ROOT / "config" / "default_config.json"
 OUT_DIR = PROJ_ROOT / "out"
 
+# 菜单内的详细模式（仅本轮新菜单使用）
+_MENU_VERBOSE = False
+
+
+def _py_exe() -> str:
+    """返回当前 Python 解释器路径，确保子进程和本进程一致。"""
+    return sys.executable or "python"
+
 
 
 def _is_windows() -> bool:
-    return sys.platform.startswith('win')
+    return os.name == "nt" or platform.system().lower().startswith("win")
+
+
+def _run_cmd(title: str, cmd: List[str]) -> int:
+    """
+    统一的子命令执行包装：进入前打印[进行中]，结束打印[成功]或[错误]。
+    根据 _MENU_VERBOSE 自动追加 --verbose。
+    """
+    if _MENU_VERBOSE and "--verbose" not in cmd:
+        cmd = [*cmd, "--verbose"]
+
+    rc = 0
+    try:
+        with ux.step(title):
+            proc = subprocess.run(cmd, cwd=PROJ_ROOT, check=False)
+            rc = proc.returncode
+            if rc != 0:
+                raise RuntimeError(f"返回码 {rc}")
+    except RuntimeError:
+        return rc or 1
+    except Exception:
+        return 2
+    return rc
 
 def _determine_verbose(args: argparse.Namespace) -> bool:
     env_verbose = os.environ.get("ONEPASS_VERBOSE", "1") != "0"
@@ -1350,7 +1382,97 @@ def _interactive_snapshot() -> int:
     return handle_snapshot(args)
 
 
-def _interactive_vultr_wizard() -> None:
+def menu_vultr_slim() -> None:
+    """
+    Vultr 向导（简洁版）：
+    1) 快速开始（推荐）
+    2) 仅查看东京(nrt)+Ubuntu 22.04 的 GPU 套餐
+    3) 创建实例（高级）
+    4) 写入连接（sync.env）
+    5) 选择配置 Profile / 查看当前配置
+    6) 一键桥接（使用当前配置）
+    7) 进入实时镜像 Watch
+    H) Windows 环境检查（仅 Windows 显示）
+    V) 切换详细模式（当前：开/关）
+    Q) 返回
+    """
+    global _MENU_VERBOSE
+
+    cli_script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
+    if not cli_script.exists():
+        ux.err(f"未找到 Vultr 向导脚本：{_rel_to_root(cli_script)}")
+        return
+
+    while True:
+        ux.hr()
+        ux.out("==================== Vultr 向导（简洁版） ====================")
+        ux.out("1) 快速开始（先看 plan → 选中 → 创建 → 写连接 → 选配置 → 上传 → ASR → 回收 → Watch）")
+        ux.out("2) 仅查看东京 (nrt) + Ubuntu 22.04 的 GPU 套餐")
+        ux.out("3) 创建实例（高级）")
+        ux.out("4) 写入连接（sync.env）")
+        ux.out("5) 选择配置 Profile / 查看当前配置")
+        ux.out("6) 一键桥接（使用当前配置）")
+        ux.out("7) 进入实时镜像 Watch")
+        if _is_windows():
+            ux.out("H) Windows 环境检查")
+        ux.out(f"V) 切换详细模式（当前：{'开' if _MENU_VERBOSE else '关'}）")
+        ux.out("Q) 返回")
+        choice = input("选择：").strip().upper()
+
+        if choice == "1":
+            cmd = [_py_exe(), str(cli_script), "quickstart"]
+            _run_cmd("快速开始", cmd)
+
+        elif choice == "2":
+            cmd = [_py_exe(), str(cli_script), "plans-nrt"]
+            _run_cmd("查询东京可用 GPU 计划", cmd)
+
+        elif choice == "3":
+            cmd = [_py_exe(), str(cli_script), "create"]
+            _run_cmd("创建实例（高级）", cmd)
+
+        elif choice == "4":
+            cmd = [_py_exe(), str(cli_script), "write-sync-env"]
+            _run_cmd("写入连接（sync.env）", cmd)
+
+        elif choice == "5":
+            path = PROJ_ROOT / "scripts" / "envsnap.py"
+            if not path.exists():
+                ux.warn(
+                    "未检测到 scripts/envsnap.py，无法提供 Profile 列表/应用；你可稍后通过 quickstart 或文档中的命令配置。"
+                )
+            else:
+                cmd = [_py_exe(), str(path), "menu"]
+                rc = _run_cmd("选择/应用 Profile", cmd)
+                if rc != 0:
+                    ux.warn("Profile 操作未完成或已取消。")
+
+        elif choice == "6":
+            cmd = [_py_exe(), str(cli_script), "asr-bridge"]
+            _run_cmd("一键桥接（上传→远端 ASR→回收）", cmd)
+
+        elif choice == "7":
+            cmd = [_py_exe(), str(cli_script), "watch"]
+            _run_cmd("进入实时镜像 Watch", cmd)
+
+        elif choice == "H" and _is_windows():
+            cmd = [_py_exe(), str(PROJ_ROOT / "scripts" / "env_check_win.py")]
+            _run_cmd("Windows 环境检查", cmd)
+
+        elif choice == "V":
+            _MENU_VERBOSE = not _MENU_VERBOSE
+            ux.ok(f"详细模式现已{'开启' if _MENU_VERBOSE else '关闭'}")
+
+        elif choice in {"Q", "QUIT", "EXIT"}:
+            ux.ok("已返回上级菜单")
+            break
+
+        else:
+            ux.warn("无效选择，请重试。")
+
+
+def menu_vultr_legacy() -> None:
+    """旧版 Vultr 菜单（保留回退）。"""
     script = PROJ_ROOT / "deploy" / "cloud" / "vultr" / "cloud_vultr_cli.py"
     env_file = script.with_name("vultr.env")
     if not script.exists():
@@ -1461,6 +1583,11 @@ def _interactive_vultr_wizard() -> None:
                 log_warn(f"watch 返回码：{rc}")
 
 
+def _interactive_vultr_wizard() -> None:  # DEPRECATED: 保留回退
+    ux.warn("已切换到新的『Vultr 向导（简洁版）』。如需旧版，请调用 menu_vultr_legacy()。")
+    return menu_vultr_slim()
+
+
 def _interactive_rollback() -> int:
     recent = _list_recent_snapshots()
     if recent:
@@ -1497,7 +1624,7 @@ def _interactive_rollback() -> int:
 def interactive_menu() -> int:
     section("OnePass Audio · 主菜单")
     while True:
-        print("V) 云端部署（Vultr）向导（四步式）")
+        print("V) 云端部署（Vultr）向导（简洁版）")
         print("0) 批量转写音频（本地/云端一键流程）")
         print("1) 环境自检")
         # ==== BEGIN: OnePass Patch · R3 (menu: win env check) ====
