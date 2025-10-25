@@ -172,6 +172,504 @@ def _write_env_file(path: Path, data: Dict[str, str], order: Iterable[str]) -> N
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+# ==== BEGIN: OnePass Patch · R2 (quickstart) ====
+class _QuickstartAbort(RuntimeError):
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _qs_step_start(title: str) -> float:
+    log_info(f"[进行中] {title}")
+    return time.perf_counter()
+
+
+def _qs_step_ok(summary: List[Tuple[str, str]], title: str, start: float, status: str = "OK") -> None:
+    elapsed = time.perf_counter() - start
+    summary.append((title, status))
+    if status == "Skip":
+        log_info(f"[跳过] {title}（耗时 {elapsed:.1f}s）")
+    else:
+        log_ok(f"[成功] {title}（耗时 {elapsed:.1f}s）")
+
+
+def _qs_step_fail(summary: List[Tuple[str, str]], title: str, start: float, message: str, code: int) -> int:
+    elapsed = time.perf_counter() - start
+    summary.append((title, "Fail"))
+    log_err(f"[错误] {title}：{message}（耗时 {elapsed:.1f}s）")
+    return code
+
+
+def _qs_run_command(
+    ctx: Dict[str, object],
+    cmd: List[str],
+    *,
+    capture: bool = False,
+    extra_env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str]:
+    verbose = bool(ctx.get("verbose"))
+    env = None
+    if extra_env:
+        env = os.environ.copy()
+        env.update({k: str(v) for k, v in extra_env.items() if v is not None})
+    if capture:
+        result = subprocess.run(
+            cmd,
+            cwd=PROJ_ROOT,
+            text=True,
+            capture_output=True,
+            env=env,
+        )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result.returncode, result.stdout
+    rc = run_streamed(cmd, cwd=PROJ_ROOT, env=env, show_cmd=verbose)
+    return rc, ""
+
+
+def _qs_format_regions(region: str, plan: dict) -> str:
+    target = region.lower()
+    available = plan.get("available_regions")
+    if isinstance(available, dict):
+        availability: Dict[str, bool] = {}
+        for key, value in available.items():
+            availability[str(key)] = bool(value)
+        return _format_regions(availability, region, False)
+    if isinstance(available, list):
+        entries: List[str] = []
+        for item in available:
+            code = str(item)
+            if code.lower() == target:
+                entries.append(f"[{code}]")
+            else:
+                entries.append(code)
+        return ", ".join(entries) if entries else "-"
+    text = str(available or "").strip()
+    if not text:
+        return "-"
+    if target and target in text.lower():
+        return text.replace(region, f"[{region}]")
+    return text
+
+
+def _qs_collect_plans(
+    ctx: Dict[str, object],
+    api_key: str,
+    region: str,
+    os_slug: str,
+    family_pattern: Optional[re.Pattern[str]],
+    min_vram: Optional[int],
+) -> List[dict]:
+    try:
+        plans = list_gpu_plans(region=region or None, os_slug=os_slug, api_key=api_key)
+    except VultrError as exc:  # pragma: no cover - network path
+        raise _QuickstartAbort(_format_exception(exc), 2) from exc
+    if ctx.get("verbose"):
+        log_info(f"[详细] 套餐原始条目：{len(plans)}")
+    region_lower = region.lower()
+    entries: List[dict] = []
+    for plan in plans:
+        plan_id = str(plan.get("id") or plan.get("plan_id") or plan.get("product_id") or plan.get("slug") or "").strip()
+        if not plan_id:
+            continue
+        available = plan.get("available_regions") or []
+        if region and available:
+            normalized = {str(item).lower() for item in available} if not isinstance(available, dict) else {str(k).lower() for k, v in available.items() if v}
+            if normalized and region_lower not in normalized:
+                continue
+        family = str(plan.get("family") or _extract_gpu_family(plan) or "-")
+        if family_pattern and not family_pattern.search(family):
+            continue
+        gpu_vram = _extract_gpu_vram_gb(plan)
+        if min_vram is not None and (gpu_vram is None or gpu_vram < min_vram):
+            continue
+        vcpu = _extract_vcpu(plan)
+        ram_gb = _extract_ram_gb(plan)
+        price_hour = _extract_price_per_hour(plan)
+        regions_text = _qs_format_regions(region, plan)
+        entries.append(
+            {
+                "plan_id": plan_id,
+                "family": family,
+                "gpu_vram": gpu_vram,
+                "vcpu": vcpu,
+                "ram_gb": ram_gb,
+                "price": price_hour,
+                "regions": regions_text,
+                "raw": plan,
+            }
+        )
+    entries.sort(key=lambda item: (float("inf") if item["price"] is None else item["price"], item["plan_id"]))
+    return entries
+
+
+def _qs_display_plans(entries: List[dict]) -> None:
+    headers = ["#", "plan_id", "family", "GPU(GB)", "vCPU", "RAM(GB)", "Price(/h)", "Regions"]
+    rows: List[List[str]] = []
+    for idx, entry in enumerate(entries, 1):
+        gpu = _format_number(entry["gpu_vram"])
+        vcpu = _format_number(entry["vcpu"])
+        ram = _format_number(entry["ram_gb"])
+        price = _format_price(entry["price"])
+        rows.append([
+            str(idx),
+            entry["plan_id"],
+            entry["family"],
+            gpu,
+            vcpu,
+            ram,
+            price,
+            entry["regions"],
+        ])
+    _print_table(headers, rows)
+
+
+def _qs_select_plan(
+    ctx: Dict[str, object],
+    entries: List[dict],
+) -> Tuple[str, dict]:
+    if not entries:
+        raise _QuickstartAbort("未找到符合条件的计划，可尝试更换 --region 或放宽过滤条件。", 1)
+    _qs_display_plans(entries)
+    auto_yes = bool(ctx.get("auto_yes"))
+    if auto_yes:
+        selection = 1
+    else:
+        while True:
+            choice = input("请选择计划序号 [默认 1]: ").strip()
+            if not choice:
+                selection = 1
+                break
+            if choice.isdigit():
+                selection = int(choice)
+                if 1 <= selection <= len(entries):
+                    break
+            log_warn("输入无效，请输入列表中的序号。")
+    chosen = entries[selection - 1]
+    log_ok(f"已选择 plan：{chosen['plan_id']} ({chosen['family']} · GPU { _format_number(chosen['gpu_vram']) }GB)")
+    return chosen["plan_id"], chosen
+
+
+def cmd_quickstart(args: argparse.Namespace) -> int:
+    ctx: Dict[str, object] = {
+        "verbose": bool(args.verbose and not args.quiet),
+        "quiet": bool(args.quiet),
+        "auto_yes": bool(args.yes),
+    }
+    summary: List[Tuple[str, str]] = []
+    overall_start = time.perf_counter()
+
+    step = _qs_step_start("解析 Vultr 配置")
+    base_env = _read_env_file(optional=True)
+    api_key = (base_env.get("VULTR_API_KEY") or "").strip()
+    if not api_key:
+        return _qs_step_fail(summary, "解析 Vultr 配置", step, "请在 deploy/cloud/vultr/vultr.env 中填写 VULTR_API_KEY。", 2)
+
+    region = (args.region or base_env.get("VULTR_REGION") or "nrt").strip() or "nrt"
+    os_slug = (args.os or base_env.get("VULTR_OS") or "ubuntu-22.04").strip() or "ubuntu-22.04"
+    label = (args.label or base_env.get("INSTANCE_LABEL") or "onepass-asr").strip() or "onepass-asr"
+    plan_override = (args.plan or "").strip()
+    try:
+        min_vram = int(args.min_vram) if args.min_vram is not None else None
+    except (TypeError, ValueError):
+        return _qs_step_fail(summary, "解析 Vultr 配置", step, "--min-vram 需为整数。", 2)
+    family_pattern: Optional[re.Pattern[str]] = None
+    if args.family:
+        try:
+            family_pattern = re.compile(args.family, re.IGNORECASE)
+        except re.error as exc:
+            return _qs_step_fail(summary, "解析 Vultr 配置", step, f"无效的 --family 正则：{exc}", 2)
+    try:
+        env = _ensure_env_with_api_key(require_ssh=True)
+    except (VultrError, FileNotFoundError) as exc:  # pragma: no cover - runtime path
+        return _qs_step_fail(summary, "解析 Vultr 配置", step, _format_exception(exc), 2)
+
+    env.update(
+        {
+            "INSTANCE_LABEL": label,
+            "VULTR_REGION": region,
+            "VULTR_OS": os_slug,
+        }
+    )
+    ctx["env"] = env
+    ctx["api_key"] = api_key
+    ctx["region"] = region
+    ctx["os_slug"] = os_slug
+    ctx["label"] = label
+    ctx["profile"] = args.profile or ""
+    ctx["pattern"] = args.pattern or None
+    ctx["stems"] = args.stems or None
+    ctx["model"] = args.model or None
+    ctx["workers"] = args.workers
+    ctx["overwrite"] = bool(args.overwrite)
+    ctx["no_watch"] = bool(args.no_watch)
+    ctx["min_vram"] = min_vram
+    ctx["family_pattern"] = family_pattern
+    ctx["plan_info"] = {}
+    ctx["plan_id"] = plan_override
+    ctx["summary"] = summary
+    _qs_step_ok(summary, "解析 Vultr 配置", step)
+
+    if not plan_override:
+        step = _qs_step_start("筛选 GPU 套餐")
+        try:
+            plans = _qs_collect_plans(ctx, api_key, region, os_slug, family_pattern, min_vram)
+            plan_id, plan_entry = _qs_select_plan(ctx, plans)
+        except _QuickstartAbort as exc:
+            return _qs_step_fail(summary, "筛选 GPU 套餐", step, str(exc), exc.code)
+        ctx["plan_id"] = plan_id
+        ctx["plan_info"] = plan_entry
+        _qs_step_ok(summary, "筛选 GPU 套餐", step)
+    else:
+        ctx["plan_id"] = plan_override
+        ctx["plan_info"] = {"plan_id": plan_override, "family": "-", "gpu_vram": None}
+
+    step = _qs_step_start("最终确认")
+    plan_info = ctx.get("plan_info", {})
+    plan_label = plan_info.get("plan_id", ctx.get("plan_id", ""))
+    family_text = plan_info.get("family", "-")
+    gpu_text = _format_number(plan_info.get("gpu_vram")) if plan_info else "-"
+    summary_line = f"Plan: {plan_label} ({family_text} · GPU {gpu_text}GB) · Region: {region} · OS: {os_slug} · Label: {label}"
+    log_info(summary_line)
+    if not ctx.get("auto_yes"):
+        answer = input("确认创建？ [Y/n]: ").strip().lower()
+        if answer in {"n", "no"}:
+            log_warn("用户取消了创建流程。")
+            return _qs_step_fail(summary, "最终确认", step, "用户取消", 1)
+    _qs_step_ok(summary, "最终确认", step)
+
+    step = _qs_step_start("创建 Vultr 实例")
+    env = ctx["env"]
+    env["VULTR_PLAN"] = str(ctx["plan_id"])
+    try:
+        get_account_info(api_key)
+    except VultrError as exc:  # pragma: no cover - network path
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, _format_exception(exc), 2)
+    try:
+        ssh_key_id, ssh_key_name = _ensure_ssh_key(env)
+    except VultrError as exc:
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, _format_exception(exc), 2)
+    try:
+        region_id = _resolve_region(region, api_key)
+        os_id = _resolve_os(os_slug, api_key)
+    except VultrError as exc:
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, _format_exception(exc), 2)
+    tag = env.get("TAG") or None
+    try:
+        resp = create_instance(region_id, ctx["plan_id"], os_id, label, [ssh_key_id], api_key, tag=tag)
+    except VultrError as exc:
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, _format_exception(exc), 2)
+    instance = resp.get("instance", resp)
+    instance_id = str(instance.get("id", "")).strip()
+    main_ip = str(instance.get("main_ip") or instance.get("ip") or "").strip()
+    if not instance_id:
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, "API 未返回实例 ID。", 2)
+    spinner = Spinner()
+    spinner.start("等待实例进入 active 状态")
+    try:
+        wait_for_instance_active(instance_id, int(env.get("CREATE_TIMEOUT_SEC", "900") or "900"), int(env.get("POLL_INTERVAL_SEC", "8") or "8"), api_key)
+    except VultrError as exc:  # pragma: no cover - network path
+        spinner.stop_err("实例未在限定时间内就绪。")
+        return _qs_step_fail(summary, "创建 Vultr 实例", step, _format_exception(exc), 2)
+    spinner.stop_ok("实例已就绪")
+    info = get_instance(instance_id, api_key)
+    inst_info = info.get("instance", info)
+    main_ip = str(inst_info.get("main_ip") or main_ip or "").strip()
+    state = {
+        "instance_id": instance_id,
+        "main_ip": main_ip,
+        "ssh_key_id": ssh_key_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "region": region,
+        "plan": ctx["plan_id"],
+    }
+    _write_state(state)
+    ctx["instance"] = state
+    log_ok(f"实例创建完成：{instance_id} · IP {main_ip or '-'} · SSH Key {ssh_key_name}")
+    _qs_step_ok(summary, "创建 Vultr 实例", step)
+
+    step = _qs_step_start("写入 sync.env 连接配置")
+    try:
+        existing = _read_custom_env(SYNC_ENV_FILE)
+    except OSError as exc:
+        return _qs_step_fail(summary, "写入 sync.env 连接配置", step, f"读取 sync.env 失败：{exc}", 2)
+    new_data = dict(existing or SYNC_DEFAULTS)
+    for key, value in SYNC_DEFAULTS.items():
+        new_data.setdefault(key, value)
+    active_profile = _load_active_profile_env()
+    default_remote_dir = active_profile.get("REMOTE_DIR", SYNC_DEFAULTS["VPS_REMOTE_DIR"])
+    remote_dir = env.get("REMOTE_DIR") or env.get("VPS_REMOTE_DIR") or default_remote_dir
+    remote_dir = remote_dir.rstrip("/") or SYNC_DEFAULTS["VPS_REMOTE_DIR"]
+    new_data.update(
+        {
+            "VPS_HOST": state.get("main_ip", ""),
+            "VPS_USER": env.get("SSH_USER", "ubuntu"),
+            "VPS_SSH_KEY": env.get("SSH_PRIVATE_KEY", ""),
+            "VPS_REMOTE_DIR": remote_dir,
+            "REMOTE_AUDIO": f"{remote_dir}/data/audio",
+            "REMOTE_ASR_JSON": f"{remote_dir}/data/asr-json",
+            "REMOTE_LOG_DIR": f"{remote_dir}/out",
+        }
+    )
+    diff_lines: List[str] = []
+    for key in ["VPS_HOST", "VPS_USER", "VPS_SSH_KEY", "VPS_REMOTE_DIR"]:
+        before = existing.get(key) if existing else None
+        after = new_data.get(key, "")
+        if before != after:
+            diff_lines.append(f"{key}: {before or '<未设置>'} -> {after}")
+    try:
+        _write_env_file(SYNC_ENV_FILE, new_data, SYNC_KEY_ORDER)
+    except OSError as exc:
+        return _qs_step_fail(summary, "写入 sync.env 连接配置", step, f"写入失败：{exc}", 2)
+    if diff_lines:
+        log_info("sync.env 更新字段：")
+        for line in diff_lines:
+            log_info(f"  - {line}")
+    else:
+        log_info("连接字段无需更新。")
+    _qs_step_ok(summary, "写入 sync.env 连接配置", step)
+
+    step = _qs_step_start("应用运行配置 Profile")
+    envsnap_script = PROJ_ROOT / "scripts" / "envsnap.py"
+    selected_profile = ctx.get("profile") or ""
+    if not envsnap_script.exists():
+        log_warn("[建议] 未找到 scripts/envsnap.py，可稍后手动运行 envsnap apply。")
+        _qs_step_ok(summary, "应用运行配置 Profile", step, status="Skip")
+    else:
+        if selected_profile:
+            log_info(f"将应用指定 profile：{selected_profile}")
+        else:
+            profiles_dir = PROJ_ROOT / "deploy" / "profiles"
+            default_profile = "prod_24g" if (profiles_dir / "prod_24g.env").exists() else None
+            test_profile = "test_subset" if (profiles_dir / "test_subset.env").exists() else None
+            if default_profile or test_profile:
+                if ctx.get("auto_yes") and default_profile:
+                    selected_profile = default_profile
+                    log_info(f"已默认选择 profile：{selected_profile}")
+                else:
+                    selected_profile = _select_profile(default_profile)
+                    if not selected_profile and test_profile and ctx.get("auto_yes"):
+                        selected_profile = test_profile
+            if not selected_profile:
+                log_warn("[建议] 未选择 profile，可稍后运行 envsnap.py apply。")
+                _qs_step_ok(summary, "应用运行配置 Profile", step, status="Skip")
+                selected_profile = ""
+        if selected_profile:
+            cmd = [sys.executable, str(envsnap_script), "apply", "--profile", selected_profile]
+            rc, _ = _qs_run_command(ctx, cmd)
+            if rc != 0:
+                return _qs_step_fail(summary, "应用运行配置 Profile", step, f"envsnap apply 返回码 {rc}", 2)
+            cmd = [sys.executable, str(envsnap_script), "export-remote"]
+            rc, _ = _qs_run_command(ctx, cmd)
+            if rc != 0:
+                return _qs_step_fail(summary, "应用运行配置 Profile", step, f"envsnap export-remote 返回码 {rc}", 2)
+            ctx["profile"] = selected_profile
+            _qs_step_ok(summary, "应用运行配置 Profile", step)
+
+    step = _qs_step_start("一键链路：上传 → ASR → 回收 → 校验")
+    deploy_cli = PROJ_ROOT / "scripts" / "deploy_cli.py"
+    if not deploy_cli.exists():
+        return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, "未找到 scripts/deploy_cli.py", 2)
+    run_id = ""
+    snapshot_path = ""
+    if envsnap_script.exists():
+        snap_cmd = [sys.executable, str(envsnap_script), "snapshot"]
+        rc, stdout = _qs_run_command(ctx, snap_cmd, capture=True)
+        if rc == 0:
+            run_id, snapshot_path = _parse_snapshot_output(stdout)
+            if run_id:
+                log_info(f"已生成快照：run_id={run_id}")
+        else:
+            return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"envsnap snapshot 返回码 {rc}", 2)
+    provider_cmd = [sys.executable, str(deploy_cli), "provider", "--set", "sync"]
+    rc, _ = _qs_run_command(ctx, provider_cmd)
+    if rc != 0:
+        return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"provider --set sync 返回码 {rc}", 2)
+    upload_cmd = [sys.executable, str(deploy_cli), "upload_audio"]
+    rc, _ = _qs_run_command(ctx, upload_cmd)
+    if rc != 0:
+        return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"upload_audio 返回码 {rc}", 2)
+    run_cmd = [sys.executable, str(deploy_cli), "run_asr"]
+    if ctx.get("pattern"):
+        run_cmd.extend(["--pattern", str(ctx["pattern"])])
+    if ctx.get("model"):
+        run_cmd.extend(["--model", str(ctx["model"])])
+    if ctx.get("workers") is not None:
+        run_cmd.extend(["--workers", str(ctx.get("workers"))])
+    if ctx.get("overwrite"):
+        run_cmd.append("--overwrite")
+    extra_env: Dict[str, str] = {}
+    if ctx.get("stems"):
+        extra_env["ASR_STEMS"] = str(ctx["stems"])
+    if run_id:
+        extra_env["ENV_RUN_ID"] = run_id
+    if snapshot_path:
+        extra_env["ENV_SNAPSHOT_PATH"] = snapshot_path
+    rc, _ = _qs_run_command(ctx, run_cmd, extra_env=extra_env or None)
+    if rc != 0:
+        return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"run_asr 返回码 {rc}", 2)
+    fetch_cmd = [sys.executable, str(deploy_cli), "fetch_outputs"]
+    rc, _ = _qs_run_command(ctx, fetch_cmd)
+    if rc != 0:
+        return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"fetch_outputs 返回码 {rc}", 2)
+    verify_script = PROJ_ROOT / "scripts" / "verify_asr_words.py"
+    if verify_script.exists():
+        verify_cmd = [sys.executable, str(verify_script)]
+        rc, _ = _qs_run_command(ctx, verify_cmd)
+        if rc != 0:
+            return _qs_step_fail(summary, "一键链路：上传 → ASR → 回收 → 校验", step, f"verify_asr_words 返回码 {rc}", 2)
+    else:
+        log_warn("[建议] 未找到 verify_asr_words.py，建议完成后手动校验 JSON。")
+    ctx["run_id"] = run_id
+    _qs_step_ok(summary, "一键链路：上传 → ASR → 回收 → 校验", step)
+
+    step = _qs_step_start("实时镜像 Watch")
+    if ctx.get("no_watch"):
+        _qs_step_ok(summary, "实时镜像 Watch", step, status="Skip")
+    else:
+        watch_choice = ""
+        if not ctx.get("auto_yes"):
+            watch_choice = input("回车进入实时镜像（watch），或输入 n 跳过: ").strip().lower()
+        if watch_choice in {"n", "no"}:
+            log_info("已跳过 watch。")
+            _qs_step_ok(summary, "实时镜像 Watch", step, status="Skip")
+        else:
+            watch_args = argparse.Namespace(run=str(ctx.get("run_id", "")), interval=3)
+            rc = cmd_watch(watch_args)
+            if rc > 1:
+                return _qs_step_fail(summary, "实时镜像 Watch", step, f"watch 返回码 {rc}", 2)
+            if rc == 1:
+                log_warn("watch 已被用户中断。")
+                _qs_step_ok(summary, "实时镜像 Watch", step, status="Skip")
+            else:
+                _qs_step_ok(summary, "实时镜像 Watch", step)
+
+    total_elapsed = time.perf_counter() - overall_start
+    print("\n步骤状态：")
+    for title, status in summary:
+        print(f"[{status:<4}] {title}")
+    instance = ctx.get("instance", {})
+    plan_label = ctx.get("plan_id", "")
+    family_text = ctx.get("plan_info", {}).get("family", "-")
+    gpu_text = _format_number(ctx.get("plan_info", {}).get("gpu_vram")) if ctx.get("plan_info") else "-"
+    log_ok(
+        f"Quickstart 完成：plan={plan_label} ({family_text} · GPU {gpu_text}GB) · region={region} · instance={instance.get('instance_id', '-')}")
+    log_info(f"主 IP：{instance.get('main_ip', '-')}")
+    if ctx.get("profile"):
+        log_info(f"运行配置：{ctx['profile']}")
+    if ctx.get("run_id"):
+        log_info(f"最新 run_id：{ctx['run_id']}")
+    outputs_dir = PROJ_ROOT / "data" / "asr-json"
+    log_info(f"转写产物目录：{outputs_dir.relative_to(PROJ_ROOT)}")
+    log_ok(f"总耗时 {total_elapsed:.1f}s")
+    return 0
+
+
+# ==== END: OnePass Patch · R2 ==== 
+
+
 def _load_active_profile_env() -> Dict[str, str]:
     if not ACTIVE_PROFILE_PATH.exists():
         return {}
@@ -1846,6 +2344,30 @@ def build_parser() -> argparse.ArgumentParser:
 
     def _add_dry_run(p: argparse.ArgumentParser) -> None:
         p.add_argument("--dry-run", action="store_true", help="仅展示将执行的操作")
+
+    quick_parser = sub.add_parser("quickstart", help="快速创建实例并执行完整 ASR 流程")
+    quick_parser.add_argument("--region", default="nrt", help="Region ID（默认 nrt）")
+    quick_parser.add_argument(
+        "--os",
+        dest="os",
+        default="ubuntu-22.04",
+        help="操作系统 slug（默认 ubuntu-22.04）",
+    )
+    quick_parser.add_argument("--family", help="GPU 家族正则（如 A40|L40S|A16）", default=None)
+    quick_parser.add_argument("--min-vram", type=int, help="最小 GPU 显存 (GB)", default=None)
+    quick_parser.add_argument("--plan", help="直接指定 plan_id（跳过筛选）", default=None)
+    quick_parser.add_argument("--label", help="实例标签（默认 onepass-asr）", default=None)
+    quick_parser.add_argument("--profile", help="运行 profile 名称", default=None)
+    quick_parser.add_argument("--workers", type=int, help="ASR 并发 workers 数", default=None)
+    quick_parser.add_argument("--model", help="Whisper 模型名称", default=None)
+    quick_parser.add_argument("--pattern", help="音频匹配模式 (CSV)", default=None)
+    quick_parser.add_argument("--stems", help="限定 stems (CSV)", default=None)
+    quick_parser.add_argument("--overwrite", action="store_true", help="覆盖已有 JSON")
+    quick_parser.add_argument("--yes", action="store_true", help="在交互提示中默认选择 Yes")
+    quick_parser.add_argument("--no-watch", action="store_true", help="流程结束后跳过 watch")
+    quick_parser.add_argument("--verbose", action="store_true", help="打印底层命令与参数")
+    quick_parser.add_argument("--quiet", action="store_true", help="仅输出关键节点信息")
+    quick_parser.set_defaults(func=cmd_quickstart)
 
     env_parser = sub.add_parser("env-check", help="检查本机环境")
     _add_dry_run(env_parser)
