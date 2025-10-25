@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -45,6 +46,10 @@ PROJ_ROOT = Path(__file__).resolve().parent
 CONFIG_DEFAULT = PROJ_ROOT / "config" / "default_config.json"
 OUT_DIR = PROJ_ROOT / "out"
 
+
+
+def _is_windows() -> bool:
+    return sys.platform.startswith('win')
 
 def _determine_verbose(args: argparse.Namespace) -> bool:
     env_verbose = os.environ.get("ONEPASS_VERBOSE", "1") != "0"
@@ -100,6 +105,64 @@ def _run_vultr_cli(subcommand: str, *, args: list[str] | None = None, heartbeat:
         cmd.extend(args)
     _print_command(cmd)
     return run_streamed(cmd, heartbeat_s=heartbeat, show_cmd=False)
+
+# ==== BEGIN: OnePass Patch · R3 (menu: win env check) ====
+def _run_windows_env_check(verbose: bool = False) -> int:
+    script = PROJ_ROOT / "scripts" / "env_check_win.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}")
+        return 2
+    cmd = [sys.executable, str(script)]
+    if verbose:
+        cmd.append("--verbose")
+    _print_command(cmd)
+    return run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
+
+
+def _load_windows_env_summary() -> dict | None:
+    script = PROJ_ROOT / "scripts" / "env_check_win.py"
+    if not script.exists():
+        return None
+    cmd = [sys.executable, str(script), "--json"]
+    result = subprocess.run(cmd, cwd=PROJ_ROOT, capture_output=True, text=True)
+    if not result.stdout:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log_warn("无法解析 env_check_win.py --json 输出。")
+        return None
+
+
+def _run_windows_openssh_install() -> int:
+    script = PROJ_ROOT / "scripts" / "install_openssh_win.py"
+    if not script.exists():
+        log_err(f"未找到脚本：{_rel_to_root(script)}")
+        return 2
+    cmd = [sys.executable, str(script)]
+    _print_command(cmd)
+    return run_streamed(cmd, heartbeat_s=30.0, show_cmd=False)
+
+
+def _interactive_windows_env_check() -> None:
+    _run_windows_env_check()
+    summary = _load_windows_env_summary()
+    missing_openssh = False
+    if summary:
+        for item in summary.get("checks", []):
+            name = item.get("name", "")
+            status = item.get("status", "")
+            if name.startswith("ssh") or name.startswith("scp"):
+                if status.upper() == "FAIL":
+                    missing_openssh = True
+    if missing_openssh:
+        if _prompt_bool("检测到缺少 OpenSSH，是否立即安装?", False):
+            install_rc = _run_windows_openssh_install()
+            if install_rc == 0:
+                log_ok("OpenSSH 安装完成，重新检查……")
+                _run_windows_env_check()
+    log_info("可继续 Quickstart / 一键桥接。")
+# ==== END: OnePass Patch · R3 (menu: win env check) ====
 
 
 def _run_envsnap(args: list[str], *, capture: bool = False) -> tuple[int, str]:
@@ -1437,6 +1500,10 @@ def interactive_menu() -> int:
         print("V) 云端部署（Vultr）向导（四步式）")
         print("0) 批量转写音频（本地/云端一键流程）")
         print("1) 环境自检")
+        # ==== BEGIN: OnePass Patch · R3 (menu: win env check) ====
+        if _is_windows():
+            print("H) Windows 环境检查 /（可选）一键安装 OpenSSH")
+        # ==== END: OnePass Patch · R3 (menu: win env check) ====
         print("X) 一键自动修复环境（缺啥装啥；Windows/macOS）")
         print("2) 素材检查")
         print("3) 单章处理（去口癖 + 保留最后一遍 + 字幕/EDL/标记）")
@@ -1451,6 +1518,11 @@ def interactive_menu() -> int:
         if choice.lower() == "v":
             _interactive_vultr_wizard()
             continue
+        # ==== BEGIN: OnePass Patch · R3 (menu: win env check) ====
+        if _is_windows() and choice.lower() == "h":
+            _interactive_windows_env_check()
+            continue
+        # ==== END: OnePass Patch · R3 (menu: win env check) ====
         if choice == "0":
             _interactive_deploy_asr()
             continue

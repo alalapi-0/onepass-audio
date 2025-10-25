@@ -63,6 +63,23 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 `scripts/install_deps.ps1` 会优先使用 `winget`（备用：Chocolatey）安装 ffmpeg，并调用 `python -m pip install -r requirements.txt`。该脚本可多次执行，若依赖已满足会提示“已安装”。ffmpeg 是后续音频渲染及切片脚本的基础工具，缺失会导致相关命令无法运行；转写 JSON 建议由 faster-whisper（或兼容工具）生成后放入 `data/asr-json/`。
 
+## Windows 同步与环境检查（纯 Python）
+
+安装/检查：
+```bash
+python scripts/env_check_win.py
+# 缺 OpenSSH（可选）：
+python scripts/install_openssh_win.py
+```
+
+上传/回收（Python 版脚本）：
+```bash
+python scripts/sync_upload_win.py --verbose
+python scripts/sync_fetch_win.py --since 2025-10-25T00:00:00
+```
+
+说明：无 rsync 时脚本会自动回退到 scp，但不支持删除远端冗余文件；如需删除，请安装 rsync 或在远端手动清理。
+
 ## 自动修复环境（Windows/macOS）
 
 若想一键修复常见缺失项，可运行：

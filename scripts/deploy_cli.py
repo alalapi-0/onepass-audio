@@ -24,8 +24,47 @@ from onepass.ux import enable_ansi, log_err, log_info, log_ok, log_warn
 PROJ_ROOT = Path(__file__).resolve().parent.parent
 
 
+# ==== BEGIN: OnePass Patch · R3 (deploy_cli routing) ====
+def _is_windows() -> bool:
+    return sys.platform.startswith('win')
+
+
+def _run_windows_script(script_name: str, verbose: bool, extra_args: list[str]) -> int | None:
+    script = PROJ_ROOT / 'scripts' / script_name
+    if not script.exists():
+        log_warn(f"未找到 {script.name}，将回退到旧版脚本。")
+        log_warn('[建议] 推荐安装 Python 版依赖（OpenSSH）以获得更好体验')
+        return None
+    cmd = [sys.executable, str(script), *extra_args]
+    if verbose:
+        log_info(f"执行：{format_cmd(cmd)}")
+    try:
+        result = subprocess.run(cmd, cwd=PROJ_ROOT)
+    except FileNotFoundError as exc:
+        log_err(str(exc))
+        log_warn('[建议] 推荐安装 Python 版依赖（OpenSSH）以获得更好体验')
+        return None
+    if result.returncode == 127:
+        log_warn('[建议] 推荐安装 Python 版依赖（OpenSSH）以获得更好体验')
+        return None
+    return result.returncode
+# ==== END: OnePass Patch · R3 (deploy_cli routing) ====
+
+
+def _run_env_check_fallback(verbose: bool) -> int:
+    script = PROJ_ROOT / 'deploy' / 'cloud' / 'vultr' / 'cloud_vultr_cli.py'
+    if not script.exists():
+        log_err(f"未找到 {script}")
+        return 2
+    cmd = [sys.executable, str(script), 'env-check']
+    if verbose:
+        log_info(f"执行：{format_cmd(cmd)}")
+    result = subprocess.run(cmd, cwd=PROJ_ROOT)
+    return result.returncode
+
 def _add_common_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true", help="仅打印命令，不实际执行")
+    parser.add_argument("--verbose", action="store_true", help="打印详细日志")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,6 +93,9 @@ def _build_parser() -> argparse.ArgumentParser:
     fetch = subparsers.add_parser("fetch_outputs", help="下载远端 data/asr-json/")
     fetch.add_argument("--since", help="仅同步该 ISO 时间之后的产物", default=None)
     _add_common_options(fetch)
+
+    env_check = subparsers.add_parser("env-check", help="检查本机环境")
+    env_check.add_argument("--verbose", action="store_true", help="打印详细日志")
 
     status = subparsers.add_parser("status", help="查看远端作业状态")
 
@@ -94,8 +136,22 @@ def handle_provision(args: argparse.Namespace) -> int:
 
 
 def handle_upload(args: argparse.Namespace) -> int:
+    # ==== BEGIN: OnePass Patch · R3 (deploy_cli routing) ====
+    if _is_windows():
+        extra: list[str] = []
+        if args.dry_run:
+            extra.append('--dry-run')
+        if args.no_delete:
+            extra.append('--no-delete')
+        if getattr(args, 'verbose', False):
+            extra.append('--verbose')
+        rc = _run_windows_script('sync_upload_win.py', getattr(args, 'verbose', False), extra)
+        if rc is not None:
+            return rc
+        log_warn('回退至旧版 PowerShell 同步脚本。')
+    # ==== END: OnePass Patch · R3 (deploy_cli routing) ====
     provider = get_provider()
-    audio_dir = PROJ_ROOT / "data" / "audio"
+    audio_dir = PROJ_ROOT / 'data' / 'audio'
     return provider.upload_audio(audio_dir, dry_run=args.dry_run, no_delete=args.no_delete)
 
 
@@ -125,18 +181,35 @@ def handle_run(args: argparse.Namespace) -> int:
 
 
 def handle_fetch(args: argparse.Namespace) -> int:
+    def _maybe_verify(rc: int) -> int:
+        if rc == 0 and not args.dry_run:
+            verify_script = PROJ_ROOT / 'scripts' / 'verify_asr_words.py'
+            if verify_script.exists():
+                log_info('自动校验 ASR JSON words 字段……')
+                result = subprocess.run([sys.executable, str(verify_script)], cwd=PROJ_ROOT)
+                if result.returncode != 0:
+                    log_warn(f"verify_asr_words 返回码 {result.returncode}。")
+        return rc
+
+    # ==== BEGIN: OnePass Patch · R3 (deploy_cli routing) ====
+    if _is_windows() and not args.dry_run:
+        extra: list[str] = []
+        if args.since:
+            extra.extend(['--since', args.since])
+        if getattr(args, 'verbose', False):
+            extra.append('--verbose')
+        rc = _run_windows_script('sync_fetch_win.py', getattr(args, 'verbose', False), extra)
+        if rc is not None:
+            return _maybe_verify(rc)
+        log_warn('回退至旧版 PowerShell 拉取脚本。')
+    elif _is_windows() and args.dry_run:
+        log_warn('Windows Python 版暂不支持 --dry-run，回退旧版脚本。')
+    # ==== END: OnePass Patch · R3 (deploy_cli routing) ====
+
     provider = get_provider()
-    local_dir = PROJ_ROOT / "data" / "asr-json"
-    since = args.since
-    rc = provider.fetch_outputs(local_dir, since_iso=since, dry_run=args.dry_run)
-    if rc == 0 and not args.dry_run:
-        verify_script = PROJ_ROOT / "scripts" / "verify_asr_words.py"
-        if verify_script.exists():
-            log_info("自动校验 ASR JSON words 字段……")
-            result = subprocess.run([sys.executable, str(verify_script)], cwd=PROJ_ROOT)
-            if result.returncode != 0:
-                log_warn(f"verify_asr_words 返回码 {result.returncode}。")
-    return rc
+    local_dir = PROJ_ROOT / 'data' / 'asr-json'
+    rc = provider.fetch_outputs(local_dir, since_iso=args.since, dry_run=args.dry_run)
+    return _maybe_verify(rc)
 
 
 def handle_cloud_bridge(args: argparse.Namespace) -> int:
@@ -164,6 +237,21 @@ def handle_cloud_bridge(args: argparse.Namespace) -> int:
     log_info(f"执行：{format_cmd(cmd)}")
     result = subprocess.run(cmd, cwd=PROJ_ROOT)
     return result.returncode
+
+
+def handle_env_check(args: argparse.Namespace) -> int:
+    # ==== BEGIN: OnePass Patch · R3 (deploy_cli routing) ====
+    if _is_windows():
+        extra: list[str] = []
+        if getattr(args, 'verbose', False):
+            extra.append('--verbose')
+        rc = _run_windows_script('env_check_win.py', getattr(args, 'verbose', False), extra)
+        if rc is not None:
+            return rc
+        log_warn('回退至旧版环境检查脚本。')
+        return _run_env_check_fallback(getattr(args, 'verbose', False))
+    # ==== END: OnePass Patch · R3 (deploy_cli routing) ====
+    return _run_env_check_fallback(getattr(args, 'verbose', False))
 
 
 def handle_status(args: argparse.Namespace) -> int:
