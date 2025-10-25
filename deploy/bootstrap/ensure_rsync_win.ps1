@@ -80,8 +80,8 @@ try {
     }
 
     Write-Info 'Installing rsync via pacman...'
-    $pacmanCmd = "pacman -S --noconfirm rsync"
-    $process = Start-Process -FilePath $msysBash -ArgumentList @('-lc', $pacmanCmd) -NoNewWindow -PassThru
+    $pacmanCmd = '/usr/bin/pacman -S --needed --noconfirm rsync'
+    $process = Start-Process -FilePath $msysBash -ArgumentList @('-l', '-c', $pacmanCmd) -NoNewWindow -PassThru
     $process.WaitForExit()
     if ($process.ExitCode -ne 0) {
         Write-Warn "pacman failed with exit code $($process.ExitCode)."
