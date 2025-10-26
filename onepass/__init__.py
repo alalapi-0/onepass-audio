@@ -1,13 +1,32 @@
 """OnePass Audio package initializer.
 
-用途：提供从词级 JSON 与原文 TXT 生成 AU 标记与 EDL 的工具集命名空间。
-示例调用：
-    from onepass import asr_loader  # 后续轮次将提供具体实现
+Provides convenient shortcuts to the core modules that implement the "keep
+last take" workflow.
+
+Example
+-------
+>>> from onepass import load_words, textnorm  # doctest: +SKIP
 """
 
-# 预留模块占位：
-# - asr_loader.py
-# - textnorm.py
-# - align.py
-# - edl.py
-# - markers.py
+from .align import AlignResult, MatchWindow, align_sentences
+from .asr_loader import Word, load_words
+from .edl import EDL, EDLAction, build_keep_last_edl, merge_intervals
+from .markers import write_audition_markers
+from .textnorm import Sentence, normalize_sentence, split_sentences, tokenize_for_match
+
+__all__ = [
+    "AlignResult",
+    "MatchWindow",
+    "align_sentences",
+    "Word",
+    "load_words",
+    "EDL",
+    "EDLAction",
+    "build_keep_last_edl",
+    "merge_intervals",
+    "write_audition_markers",
+    "Sentence",
+    "normalize_sentence",
+    "split_sentences",
+    "tokenize_for_match",
+]
