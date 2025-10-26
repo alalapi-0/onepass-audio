@@ -31,6 +31,18 @@ python scripts/make_markers.py --json data/asr-json/001.json --original data/ori
 python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
 ```
 
+## 素材自检
+
+```
+python scripts/validate_assets.py
+```
+
+若输出 `both` 的数量大于 0，选择其中任意一个 stem，即可继续执行对齐并生成标记。
+
+## 最小演示
+
+`examples/demo.txt` 展示了中英文混排的极简文本示例，`examples/demo.edl.json` 提供了结构化的虚拟 EDL（含两段裁剪动作）。它们仅用于理解格式，不包含任何音频。
+
 ## 隐私与合规
 
 仅处理拥有使用权的文本与音频，不上传任何隐私数据。
