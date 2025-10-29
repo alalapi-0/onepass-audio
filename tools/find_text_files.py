@@ -211,7 +211,7 @@ def run_search(
 # =========================
 if __name__ == "__main__":
     # 根目录
-    ROOT_DIR = r"E:\nexus\18fea68d-6e7e-485d-b4c9-f7be19605dc0\20251028-234646"           # 例：r"E:\docs" 或 "/path/to/dir"
+    ROOT_DIR = r"E:\nexus\e8e1c84d-4b46-4bd0-857f-f8cb9fa5ff52\20251029-205427"           # 例：r"E:\docs" 或 "/path/to/dir"
 
     # 匹配内容
     PATTERN = ".words"               # 当 USE_REGEX=False 时为普通文本；True 时为正则表达式
