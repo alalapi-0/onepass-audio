@@ -1,136 +1,375 @@
 """Entry point for the OnePass Audio interactive helper."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from textwrap import dedent
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from onepass import __version__
+from onepass.align import align_sentences
+from onepass.asr_loader import Word, load_words
+from onepass.edl import EDL, build_keep_last_edl
+from onepass.markers import write_audition_markers
+from onepass.pipeline import PreparedSentences, prepare_sentences
+from onepass.textnorm import Sentence
 from onepass.ux import (
     print_error,
     print_header,
     print_info,
     print_success,
-    prompt_choice,
+    print_warning,
     prompt_existing_directory,
-    prompt_existing_file,
     prompt_yes_no,
 )
+
+
+ROOT_DIR = Path(__file__).resolve().parent
+DEFAULT_MATERIALS_DIR = ROOT_DIR / "materials"
+DEFAULT_OUT_DIR = ROOT_DIR / "out"
+DEFAULT_SCORE_THRESHOLD = 80
+AUDIO_PRIORITY = {
+    ".wav": 0,
+    ".flac": 1,
+    ".m4a": 2,
+    ".aac": 3,
+    ".mp3": 4,
+    ".ogg": 5,
+    ".wma": 6,
+}
 
 
 @dataclass
 class ChapterResources:
     """Collection of paths pointing to the required resources for a chapter."""
 
+    stem: str
     asr_json: Path
     original_txt: Path
     audio_file: Path | None
 
 
+@dataclass
+class ChapterSummary:
+    """Information about generated artefacts for a single chapter."""
+
+    stem: str
+    subtitle_path: Path
+    transcript_path: Path
+    edl_path: Path
+    markers_path: Path
+    audio_path: Path | None
+    kept_sentences: int
+    duplicate_windows: int
+    unaligned_sentences: int
+    cut_seconds: float
+
+
 def _print_banner() -> None:
     print_header("OnePass Audio — 录完即净，一遍过")
     print_info(f"版本: {__version__}")
-    print_info("本向导将帮助你收集运行脚本所需的文件路径，并给出建议命令。\n")
+    print_info("本程序将自动匹配素材并批量生成字幕、EDL 等文件。\n")
 
 
-def _collect_chapter_resources() -> ChapterResources:
-    print_header("素材路径")
-    asr_json = prompt_existing_file("ASR 词级时间戳 JSON 文件路径")
-    original_txt = prompt_existing_file("原稿 TXT 文件路径")
-
-    has_audio = prompt_yes_no("是否同时准备好了原始音频文件?", default=True)
-    audio_file: Path | None = None
-    if has_audio:
-        audio_file = prompt_existing_file("原始音频文件路径")
-
-    return ChapterResources(asr_json=asr_json, original_txt=original_txt, audio_file=audio_file)
-
-
-def _collect_output_directory() -> Path:
-    print_header("输出目录")
-    outdir = prompt_existing_directory("输出文件夹 (会在其中生成字幕/EDL 等)")
-    return outdir
-
-
-def _build_summary(resources: ChapterResources, outdir: Path) -> str:
-    commands = [
-        dedent(
-            f"""
-            生成去口癖字幕 + 保留最后一遍 + EDL + Audition 标记:
-                python scripts/retake_keep_last.py \
-                    --json {resources.asr_json} \
-                    --original {resources.original_txt} \
-                    --outdir {outdir}
-            """
-        ).strip()
-    ]
-
-    if resources.audio_file:
-        commands.append(
-            dedent(
-                f"""
-                按 EDL 导出干净音频:
-                    python scripts/edl_to_ffmpeg.py \
-                        --audio {resources.audio_file} \
-                        --edl {outdir / (resources.asr_json.stem + '.keepLast.edl.json')} \
-                        --out {outdir / (resources.asr_json.stem + '.clean.wav')}
-                """
-            ).strip()
-        )
-
-    return "\n\n".join(commands)
-
-
-def _show_summary(resources: ChapterResources, outdir: Path) -> None:
-    print_header("建议命令")
-    print_info(_build_summary(resources, outdir))
-    print_success("复制命令后即可在终端中直接运行。祝创作顺利！")
-
-
-def _extra_utilities() -> None:
-    print_header("额外工具")
-    choice = prompt_choice(
-        "选择要查看的脚本说明",
-        (
-            "验证素材完整性 (scripts/validate_assets.py)",
-            "仅生成 Audition 标记 CSV (scripts/make_markers.py)",
-            "返回主菜单",
-        ),
-        default=0,
+def _prompt_materials_directory() -> Path:
+    print_header("素材目录")
+    default_dir: Optional[Path] = DEFAULT_MATERIALS_DIR if DEFAULT_MATERIALS_DIR.exists() else None
+    return prompt_existing_directory(
+        "包含 JSON/TXT/音频 的素材文件夹路径",
+        default=default_dir,
     )
 
-    if choice.startswith("验证素材"):
-        print_info(
-            dedent(
-                """
-                用法示例:
-                    python scripts/validate_assets.py --root data/chapters/001
-                该脚本会检查指定章节目录下是否存在所需的 JSON/TXT/音频文件。
-                """
-            ).strip()
+
+def _ensure_output_directory() -> Path:
+    print_header("输出目录")
+    DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    return prompt_existing_directory("输出文件夹 (会在其中生成字幕/EDL 等)", default=DEFAULT_OUT_DIR)
+
+
+def _index_files_by_stem(paths: Iterable[Path]) -> Dict[str, Path]:
+    index: Dict[str, Path] = {}
+    for path in sorted(paths):
+        if not path.is_file():
+            continue
+        index.setdefault(path.stem.lower(), path.resolve())
+    return index
+
+
+def _discover_chapters(materials_dir: Path) -> List[ChapterResources]:
+    files = list(materials_dir.iterdir())
+    json_map = _index_files_by_stem(p for p in files if p.suffix.lower() == ".json")
+    txt_map = _index_files_by_stem(p for p in files if p.suffix.lower() == ".txt")
+
+    audio_map: Dict[str, Tuple[int, Path]] = {}
+    for path in files:
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix not in AUDIO_PRIORITY:
+            continue
+        priority = AUDIO_PRIORITY[suffix]
+        key = path.stem.lower()
+        existing = audio_map.get(key)
+        if existing is None or priority < existing[0]:
+            audio_map[key] = (priority, path.resolve())
+
+    missing_txt = sorted(set(json_map) - set(txt_map))
+    for stem in missing_txt:
+        print_warning(f"找到 JSON 但缺少同名 TXT: {json_map[stem].name}")
+
+    missing_json = sorted(set(txt_map) - set(json_map))
+    for stem in missing_json:
+        print_warning(f"找到 TXT 但缺少同名 JSON: {txt_map[stem].name}")
+
+    chapters: List[ChapterResources] = []
+    for key in sorted(set(json_map) & set(txt_map)):
+        json_path = json_map[key]
+        txt_path = txt_map[key]
+        audio_entry = audio_map.get(key)
+        audio_path = audio_entry[1] if audio_entry else None
+        chapters.append(
+            ChapterResources(
+                stem=json_path.stem,
+                asr_json=json_path,
+                original_txt=txt_path,
+                audio_file=audio_path,
+            )
         )
-    elif choice.startswith("仅生成 Audition"):
-        print_info(
-            dedent(
-                """
-                用法示例:
-                    python scripts/make_markers.py --json data/asr-json/001.json --out out/001.markers.csv
-                该脚本会读取 ASR JSON 并导出 Adobe Audition 标记文件。
-                """
-            ).strip()
+
+    return chapters
+
+
+def _warn_mismatch(words: List[Word], sentences: List[Sentence]) -> None:
+    if not words or not sentences:
+        return
+    if len(sentences) > len(words) * 1.5:
+        print_warning("原稿句子数量明显多于 ASR 词数量，可能存在内容不匹配。")
+
+
+def _serialise_edl(edl: EDL) -> dict:
+    return {
+        "audio_stem": edl.audio_stem,
+        "sample_rate": edl.sample_rate,
+        "actions": [asdict(action) for action in edl.actions],
+        "stats": edl.stats,
+        "created_at": edl.created_at,
+    }
+
+
+def _format_srt_timestamp(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _write_srt(entries: List[Tuple[float, float, str]], out_path: Path) -> None:
+    lines: List[str] = []
+    for index, (start, end, text) in enumerate(entries, start=1):
+        lines.append(str(index))
+        lines.append(f"{_format_srt_timestamp(start)} --> {_format_srt_timestamp(end)}")
+        payload = text.splitlines() or [""]
+        lines.extend(payload)
+        lines.append("")
+    out_path.write_text("\n".join(lines).strip() + "\n" if lines else "", encoding="utf-8")
+
+
+def _write_plain_transcript(entries: List[Tuple[float, float, str]], out_path: Path) -> None:
+    text = "\n".join(content for _, _, content in entries)
+    out_path.write_text((text + "\n") if text else "", encoding="utf-8")
+
+
+def _render_audio(audio: Path, edl_path: Path, output: Path) -> bool:
+    script = ROOT_DIR / "scripts" / "edl_to_ffmpeg.py"
+    if not script.exists():
+        print_warning("未找到 edl_to_ffmpeg.py，跳过音频导出。")
+        return False
+
+    cmd = [
+        sys.executable,
+        str(script),
+        "--audio",
+        str(audio),
+        "--edl",
+        str(edl_path),
+        "--out",
+        str(output),
+    ]
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用 Python 解释器导出音频: {exc}")
+        return False
+
+    if result.returncode != 0:
+        print_error("音频导出失败，请确认已安装 ffmpeg 并可在命令行中使用。")
+        return False
+
+    print_success(f"已导出干净音频: {output.name}")
+    return True
+
+
+def _process_chapter(
+    chapter: ChapterResources,
+    outdir: Path,
+    *,
+    score_threshold: int,
+    render_audio: bool,
+) -> ChapterSummary | None:
+    try:
+        words = load_words(chapter.asr_json)
+    except Exception as exc:
+        print_error(f"读取 ASR JSON 失败: {exc}")
+        return None
+
+    try:
+        raw_text = chapter.original_txt.read_text(encoding="utf-8")
+    except Exception as exc:
+        print_error(f"读取原稿 TXT 失败: {exc}")
+        return None
+
+    prepared: PreparedSentences = prepare_sentences(raw_text)
+    sentences = prepared.alignment
+    display_texts = prepared.display
+
+    if not sentences:
+        print_warning("原稿中没有有效的句子，跳过该文件。")
+        return None
+
+    _warn_mismatch(words, sentences)
+
+    align = align_sentences(words, sentences, score_threshold=score_threshold)
+    edl = build_keep_last_edl(words, align)
+    edl.audio_stem = chapter.stem
+
+    subtitle_entries: List[Tuple[float, float, str]] = []
+    for idx, match in sorted(align.kept.items()):
+        if match is None:
+            continue
+        if idx >= len(display_texts):
+            continue
+        subtitle_entries.append((match.start, match.end, display_texts[idx]))
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    srt_path = outdir / f"{chapter.stem}.keepLast.srt"
+    txt_path = outdir / f"{chapter.stem}.keepLast.txt"
+    edl_path = outdir / f"{chapter.stem}.keepLast.edl.json"
+    markers_path = outdir / f"{chapter.stem}.keepLast.audition_markers.csv"
+
+    try:
+        with edl_path.open("w", encoding="utf-8") as fh:
+            json.dump(_serialise_edl(edl), fh, ensure_ascii=False, indent=2)
+        _write_srt(subtitle_entries, srt_path)
+        _write_plain_transcript(subtitle_entries, txt_path)
+        write_audition_markers(edl, markers_path)
+    except Exception as exc:
+        print_error(f"写入输出文件失败: {exc}")
+        return None
+
+    kept_count = sum(1 for m in align.kept.values() if m is not None)
+    duplicate_windows = sum(len(windows) for windows in align.dups.values())
+    unaligned_count = len(align.unaligned)
+    cut_seconds = float(edl.stats.get("total_cut_sec", 0.0)) if isinstance(edl.stats, dict) else 0.0
+
+    if align.unaligned:
+        samples: List[str] = []
+        for idx in align.unaligned[:3]:
+            if 0 <= idx < len(display_texts):
+                sample = display_texts[idx]
+                samples.append(sample if len(sample) <= 20 else sample[:20] + "…")
+        if samples:
+            print_warning("未对齐的句子示例: " + "; ".join(samples))
+
+    audio_output: Path | None = None
+    if render_audio:
+        if chapter.audio_file is None:
+            print_warning("未找到同名音频文件，跳过音频导出。")
+        else:
+            audio_output = outdir / f"{chapter.stem}.clean.wav"
+            if not _render_audio(chapter.audio_file, edl_path, audio_output):
+                audio_output = None
+
+    print_info(
+        "句子总数 {total}，保留 {kept}，重复窗口 {dup}，未对齐 {unaligned}，去除重复 {cut:.3f}s".format(
+            total=len(sentences),
+            kept=kept_count,
+            dup=duplicate_windows,
+            unaligned=unaligned_count,
+            cut=cut_seconds,
         )
-    else:
-        print_info("返回主菜单。")
+    )
+    print_success(f"已生成字幕: {srt_path.name}")
+    print_success(f"已生成精简文本: {txt_path.name}")
+    print_success(f"已生成 EDL: {edl_path.name}")
+    print_success(f"已生成 Audition 标记: {markers_path.name}")
+
+    return ChapterSummary(
+        stem=chapter.stem,
+        subtitle_path=srt_path,
+        transcript_path=txt_path,
+        edl_path=edl_path,
+        markers_path=markers_path,
+        audio_path=audio_output,
+        kept_sentences=kept_count,
+        duplicate_windows=duplicate_windows,
+        unaligned_sentences=unaligned_count,
+        cut_seconds=cut_seconds,
+    )
 
 
 def main() -> None:
     _print_banner()
-    resources = _collect_chapter_resources()
-    outdir = _collect_output_directory()
-    _show_summary(resources, outdir)
+    materials_dir = _prompt_materials_directory()
 
-    if prompt_yes_no("需要查看其他可用脚本吗?", default=False):
-        _extra_utilities()
+    print_header("素材匹配")
+    chapters = _discover_chapters(materials_dir)
+    if not chapters:
+        print_error("未找到任何同时包含 JSON 与 TXT 的素材文件。")
+        return
+
+    with_audio = sum(1 for chapter in chapters if chapter.audio_file is not None)
+    preview = ", ".join(ch.stem for ch in chapters[:5])
+    if len(chapters) > 5:
+        preview += " …"
+    print_info(
+        f"共匹配到 {len(chapters)} 套素材，其中 {with_audio} 套包含音频。" +
+        (f" 示例: {preview}" if preview else "")
+    )
+
+    outdir = _ensure_output_directory()
+
+    render_audio = with_audio > 0 and prompt_yes_no("检测到音频文件，是否按 EDL 自动导出干净音频?", default=True)
+
+    print_header("批量处理")
+    summaries: List[ChapterSummary] = []
+    total = len(chapters)
+    for index, chapter in enumerate(chapters, start=1):
+        print_header(f"[{index}/{total}] {chapter.stem}")
+        summary = _process_chapter(
+            chapter,
+            outdir,
+            score_threshold=DEFAULT_SCORE_THRESHOLD,
+            render_audio=render_audio,
+        )
+        if summary:
+            summaries.append(summary)
+
+    print_header("处理结果")
+    print_success(f"成功处理 {len(summaries)}/{total} 套素材。输出目录: {outdir}")
+    if summaries:
+        for summary in summaries:
+            info = [
+                f"保留{summary.kept_sentences}",
+                f"重复{summary.duplicate_windows}",
+                f"未对齐{summary.unaligned_sentences}",
+                f"cut={summary.cut_seconds:.3f}s",
+            ]
+            if summary.audio_path:
+                info.append(f"音频→{summary.audio_path.name}")
+            print_info(f"{summary.stem}: " + ", ".join(info))
 
 
 if __name__ == "__main__":
