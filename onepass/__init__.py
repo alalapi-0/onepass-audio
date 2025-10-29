@@ -1,32 +1,29 @@
-"""OnePass Audio package initializer.
-
-Provides convenient shortcuts to the core modules that implement the "keep
-last take" workflow.
-
-Example
--------
->>> from onepass import load_words, textnorm  # doctest: +SKIP
+"""
+项目: OnePass Audio
+用途: 初始化包命名空间，并预留后续 loader/retake/clean/segment/edl/writers/markers/aggr/pipeline 模块的聚合入口。
+依赖: 仅使用 Python 标准库。
+示例用法:
+    from onepass import __version__, planned_modules
+    print(__version__)
+    print(", ".join(planned_modules))
 """
 
-from .align import AlignResult, MatchWindow, align_sentences
-from .asr_loader import Word, load_words
-from .edl import EDL, EDLAction, build_keep_last_edl, merge_intervals
-from .markers import write_audition_markers
-from .textnorm import Sentence, normalize_sentence, split_sentences, tokenize_for_match
+from __future__ import annotations
 
-__all__ = [
-    "AlignResult",
-    "MatchWindow",
-    "align_sentences",
-    "Word",
-    "load_words",
-    "EDL",
-    "EDLAction",
-    "build_keep_last_edl",
-    "merge_intervals",
-    "write_audition_markers",
-    "Sentence",
-    "normalize_sentence",
-    "split_sentences",
-    "tokenize_for_match",
-]
+__all__ = ["__version__", "planned_modules"]
+
+__version__: str = "0.0.0"
+"""当前预发行版本号，占位用。"""
+
+planned_modules: tuple[str, ...] = (
+    "loader",
+    "retake",
+    "clean",
+    "segment",
+    "edl",
+    "writers",
+    "markers",
+    "aggr",
+    "pipeline",
+)
+"""预期将在后续迭代中补充的子模块名称。"""
