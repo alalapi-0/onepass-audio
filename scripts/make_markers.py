@@ -22,20 +22,8 @@ from onepass.align import align_sentences
 from onepass.asr_loader import Word, load_words
 from onepass.edl import EDL, build_keep_last_edl
 from onepass.markers import write_audition_markers
-from onepass.textnorm import Sentence, normalize_sentence, split_sentences, tokenize_for_match
-
-
-def _prepare_sentences(raw_text: str) -> List[Sentence]:
-    sentences: List[Sentence] = []
-    for raw_sentence in split_sentences(raw_text):
-        normalised = normalize_sentence(raw_sentence)
-        if not normalised:
-            continue
-        tokens = tokenize_for_match(normalised)
-        if not tokens:
-            continue
-        sentences.append(Sentence(text=normalised, tokens=tokens))
-    return sentences
+from onepass.pipeline import PreparedSentences, prepare_sentences
+from onepass.textnorm import Sentence
 
 
 def _warn_mismatch(words: List[Word], sentences: List[Sentence]) -> None:
@@ -79,7 +67,8 @@ def main(argv: List[str] | None = None) -> int:
         print(f"failed to read transcript: {exc}", file=sys.stderr)
         return 1
 
-    sentences = _prepare_sentences(raw_text)
+    prepared: PreparedSentences = prepare_sentences(raw_text)
+    sentences = prepared.alignment
     _warn_mismatch(words, sentences)
 
     align = align_sentences(words, sentences, score_threshold=args.score)
