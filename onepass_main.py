@@ -29,6 +29,8 @@ from onepass.ux import (
 ROOT_DIR = Path(__file__).resolve().parent
 DEFAULT_MATERIALS_DIR = ROOT_DIR / "materials"
 DEFAULT_OUT_DIR = ROOT_DIR / "out"
+DEFAULT_NORMALIZED_DIR = ROOT_DIR / "data" / "original_txt_norm"
+DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"
 DEFAULT_SCORE_THRESHOLD = 80
 AUDIO_PRIORITY = {
     ".wav": 0,
@@ -141,6 +143,61 @@ def _discover_chapters(materials_dir: Path) -> List[ChapterResources]:
     return chapters
 
 
+def _ensure_normalized_text_path(chapter: ChapterResources) -> Path:
+    """Ensure the normalised transcript exists and return the path to use."""
+
+    norm_path = DEFAULT_NORMALIZED_DIR / f"{chapter.stem}.norm.txt"
+    if norm_path.exists():
+        print_info(f"使用已规范文本: {norm_path}")
+        return norm_path
+
+    script_path = ROOT_DIR / "scripts" / "normalize_original.py"
+    if not script_path.exists():
+        print_warning("未找到 scripts/normalize_original.py，将继续使用原始 TXT。")
+        return chapter.original_txt
+
+    message = (
+        "未检测到规范化文本，是否现在调用 scripts/normalize_original.py?\n"
+        f"原稿: {chapter.original_txt}\n"
+        f"输出: {norm_path}\n"
+        "生成 CSV 报告: out/normalize_report.csv"
+    )
+    if not prompt_yes_no(message, default=True):
+        return chapter.original_txt
+
+    DEFAULT_NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = DEFAULT_NORMALIZE_REPORT
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--in",
+        str(chapter.original_txt),
+        "--out",
+        str(norm_path),
+        "--report",
+        str(report_path),
+        "--mode",
+        "align",
+    ]
+
+    print_info("正在规范化原稿，稍候…")
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用规范化脚本: {exc}")
+        return chapter.original_txt
+
+    if result.returncode == 0 and norm_path.exists():
+        print_success(f"已生成规范文本: {norm_path.name}")
+        return norm_path
+
+    print_warning("规范化脚本执行失败，将继续使用原始 TXT。")
+    return chapter.original_txt
+
+
 def _warn_mismatch(words: List[Word], sentences: List[Sentence]) -> None:
     if not words or not sentences:
         return
@@ -225,8 +282,9 @@ def _process_chapter(
         print_error(f"读取 ASR JSON 失败: {exc}")
         return None
 
+    text_path = _ensure_normalized_text_path(chapter)
     try:
-        raw_text = chapter.original_txt.read_text(encoding="utf-8")
+        raw_text = text_path.read_text(encoding="utf-8")
     except Exception as exc:
         print_error(f"读取原稿 TXT 失败: {exc}")
         return None

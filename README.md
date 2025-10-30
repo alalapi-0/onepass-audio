@@ -85,6 +85,34 @@ python scripts/normalize_texts.py --src data/original_txt --inplace --report out
 
 主程序（`python onepass_main.py`）的交互菜单新增 “预处理：原文规范化（NFKC + 兼容字清洗）” 项，可一键调用脚本对 `data/original_txt/` 进行处理；如选择 Dry-Run，会附加 `--dry-run` 并提示先检查报告。
 
+## 文本规范化（适配词级对齐）
+
+为进一步提升词级时间戳对齐的成功率，需要在通用清洗之后对原稿执行“对齐友好化”处理：
+
+- 兼容区部首与拆分写法（如 `⻛`、`⺠`、`序⾔` 等）统一回常用字符，避免被当作不同词；
+- 将中文全角标点转换为 ASCII 或去除书名号，确保分词器不会被特殊符号打断；
+- 合并软换行、去除中文内的额外空格，让句子与词时间戳能以同样的文本片段对齐。
+
+脚本 `scripts/normalize_original.py` 会把 `data/original_txt/*.txt` 批量转换为规范文本，并输出到 `data/original_txt_norm/` 同名 `.norm.txt`，同时生成 `out/normalize_report.csv` 汇总各类替换次数。运行示例如下：
+
+```bash
+# 单文件处理（生成 .norm.txt 与 .sentences.txt）
+python scripts/normalize_original.py \
+  --in data/original_txt/001序言01.txt \
+  --out data/original_txt_norm/001序言01.norm.txt \
+  --report out/normalize_report.csv \
+  --mode align
+
+# 批量处理文件夹内全部 TXT
+python scripts/normalize_original.py \
+  --in data/original_txt \
+  --out data/original_txt_norm \
+  --report out/normalize_report.csv \
+  --mode align
+```
+
+规范后的文本更贴近 ASR 词级输出，句级/词级对齐的匹配率会在相同阈值下显著提升。建议在运行主流程前先执行该步骤，后续所有对齐操作均可直接指向 `data/original_txt_norm/*.norm.txt`。
+
 ### 人工验收脚本
 
 ```bash
