@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keymesh"
+version = "0.1.0"
+description = "KeyMesh: mTLS-secured multi-share file sync over reachable networks (Round 1 scaffold)."
+authors = [{name = "YourName"}]
+requires-python = ">=3.11"
+dependencies = [
+  "PyYAML>=6.0.1",
+  "rich>=13.7.1",
+  "watchdog>=4.0.0",
+  "cryptography>=43.0.0",
+  "xxhash>=3.4.1"
+]
+
+[project.scripts]
+keymesh = "keymesh.__main__:main"
+
+[tool.keymesh]
+# future config placeholders (logging, testing, lint)
+
+[tool.ruff]
+# placeholder for linting configuration to be filled in future rounds
+line-length = 120
+
+[tool.pytest.ini_options]
+# placeholder for pytest configuration
+minversion = "7.0"
+addopts = "-ra"

@@ -1,0 +1,52 @@
+node:
+  id: "host-A"
+  listen_port: 51888
+  # 可选：指明绑定网卡或 0.0.0.0
+  bind_host: "0.0.0.0"
+
+security:
+  ca_cert: "keys/ca.crt"
+  cert: "keys/host-A.crt"
+  key: "keys/host-A.key"
+  # 对端证书指纹白名单（SHA-256）
+  fingerprint_whitelist: []
+
+peers:
+  - id: "host-B"
+    addr: "10.8.0.12:51888"       # 由你已有的中继/VPN 提供可达地址
+    cert_fingerprint: "sha256:ABCD..."
+    shares_access:
+      - share: "common"   # 公共域
+        mode: "rw"
+      - share: "to-B"     # 针对 B 的私有域
+        mode: "rw"
+  - id: "host-C"
+    addr: "10.8.0.13:51888"
+    cert_fingerprint: "sha256:EFGH..."
+    shares_access:
+      - share: "common"
+        mode: "ro"
+      - share: "to-C"
+        mode: "rw"
+
+shares:
+  - name: "common"
+    path: "./data/common"
+    delete_propagation: false
+    ignore_file: ".keymeshignore"
+  - name: "to-B"
+    path: "./data/peers/B"
+    delete_propagation: true
+  - name: "to-C"
+    path: "./data/peers/C"
+    delete_propagation: true
+
+transfer:
+  chunk_mb: 16
+  concurrent_files: 2
+  concurrent_chunks_per_file: 2
+  rate_limit_mbps: 0   # 0 表示不限速，后续轮次生效
+
+logging:
+  level: "info"
+  file: "logs/keymesh.log"
