@@ -73,58 +73,6 @@ def _print_banner() -> None:
     print_info("本程序将自动匹配素材并批量生成字幕、EDL 等文件。\n")
 
 
-def _invoke_text_normalisation(dry_run: bool) -> None:
-    """Call the standalone text normalisation script with default arguments."""
-
-    script_path = ROOT_DIR / "scripts" / "normalize_texts.py"
-    report_path = ROOT_DIR / "out" / "textnorm_report.md"
-    # Build the CLI invocation mirroring the documented command line usage.
-    cmd = [
-        sys.executable,
-        str(script_path),
-        "--src",
-        "data/original_txt",
-        "--inplace",
-        "--report",
-        str(report_path),
-        "--punct",
-        "ascii",
-        "--t2s",
-    ]
-    if dry_run:
-        # Append --dry-run to preview changes without writing files.
-        cmd.append("--dry-run")
-
-    print_info("正在调用文本规范化脚本…")
-    try:
-        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
-    except FileNotFoundError as exc:
-        print_error(f"无法执行文本规范化脚本: {exc}")
-        return
-
-    if result.returncode == 0:
-        if dry_run:
-            print_success(f"Dry-Run 完成，报告已生成: {report_path}")
-            print_info("请先检查报告再确认是否写回。")
-        else:
-            print_success(f"文本规范化完成，报告已生成: {report_path}")
-    elif result.returncode == 1:
-        print_warning(f"脚本报告未检测到可规范化的内容。报告: {report_path}")
-    else:
-        print_error("文本规范化脚本执行失败，请查看上方输出。")
-
-
-def _maybe_run_text_normalisation() -> None:
-    """Offer the user an interactive entry to normalise original transcripts."""
-
-    print_header("预处理：原文规范化（NFKC + 兼容字清洗）")
-    print_info("10) 预处理：原文规范化（NFKC + 兼容字清洗）")
-    if not prompt_yes_no("是否现在执行原文规范化?", default=False):
-        return
-    dry_run = prompt_yes_no("是否先 dry-run，仅生成报告?", default=True)
-    _invoke_text_normalisation(dry_run=dry_run)
-
-
 def _prompt_materials_directory() -> Path:
     print_header("素材目录")
     default_dir: Optional[Path] = DEFAULT_MATERIALS_DIR if DEFAULT_MATERIALS_DIR.exists() else None
@@ -374,7 +322,6 @@ def _process_chapter(
 
 def main() -> None:
     _print_banner()
-    _maybe_run_text_normalisation()
     materials_dir = _prompt_materials_directory()
 
     print_header("素材匹配")
