@@ -52,6 +52,53 @@ python scripts/retake_keep_last.py --json data/asr-json/001.json --original data
 python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
 ```
 
+## 文本规范化（原文预处理）
+
+为了提高句级与词级对齐的召回率，建议先对原稿执行统一的文本规范化：把 `序⾔/⼈类/⽹络/⼒量` 等兼容部件替换为常见写法（`序言/人类/网络/力量`），统一全半角标点，去掉 BOM、零宽字符与隐形控制符，必要时再进行繁体转简体。项目新增了独立脚本与交互入口用于批量处理 `data/original_txt/*.txt`。
+
+常用命令如下：
+
+```bash
+# 仅查看改动（dry-run）
+python scripts/normalize_texts.py --src data/original_txt --dry-run --report out/textnorm_report.md
+
+# 原地规范化（会生成 .bak）
+python scripts/normalize_texts.py --src data/original_txt --inplace --report out/textnorm_report.md --punct ascii --t2s
+```
+
+运行脚本会对每个文件执行 Unicode NFKC 归一化、去除零宽字符/BOM、兼容部件替换、标点风格统一（`ascii` | `cjk` | `keep`）、空白压缩，并可在安装 [OpenCC](https://github.com/BYVoid/OpenCC) 后追加 `--t2s` 实现繁转简。未安装 opencc 时脚本会打印提示并自动跳过。
+
+处理完成会生成 Markdown 汇总报告（默认 `out/textnorm_report.md`），包含：
+
+- 总替换数量与空白压缩统计；
+- Top 10 “怪字符”列表（含 Unicode 编码）；
+- 每个文件的变更情况与长度变化；
+- 逐文件的若干个 `Before/After` 片段，使用 `…`/`⏎` 标识截断与换行。
+
+如需扩展兼容字符映射，可在 `config/textnorm_custom_map.json` 中追加键值，例如：
+
+```json
+{ "⾃": "自", "⾏": "行" }
+```
+
+脚本默认写入 `.bak` 备份，可加 `--no-backup` 禁用。若不想覆盖原文件，可提供 `--dst` 输出目录；使用 `--dry-run` 时不会写入文件，只生成报告以便审核。
+
+主程序（`python onepass_main.py`）的交互菜单新增 “预处理：原文规范化（NFKC + 兼容字清洗）” 项，可一键调用脚本对 `data/original_txt/` 进行处理；如选择 Dry-Run，会附加 `--dry-run` 并提示先检查报告。
+
+### 人工验收脚本
+
+```bash
+# 1) 仅预览
+python scripts/normalize_texts.py --src data/original_txt --dry-run --report out/textnorm_report.md
+
+# 2) 原地生效（有 .bak 备份）
+python scripts/normalize_texts.py --src data/original_txt --inplace --report out/textnorm_report.md --punct ascii --t2s
+
+# 3) 在主菜单中执行同等动作
+python onepass_main.py
+# 选择 “预处理：原文规范化（NFKC + 兼容字清洗）”，观察逐步反馈与最终统计
+```
+
 ## 不提交二进制/媒体的约定
 
 `data/audio/`、`data/asr-json/`、`data/original_txt/`、`out/` 目录全部不入库，原因是涉及版权、容量与隐私数据，需在本地或受控环境中管理。
