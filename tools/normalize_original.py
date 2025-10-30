@@ -1,6 +1,7 @@
 """Interactive helper to normalise original transcript texts."""
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,6 @@ from onepass.ux import (
     print_info,
     print_success,
     print_warning,
-    prompt_yes_no,
 )
 
 
@@ -35,8 +35,12 @@ def _invoke_text_normalisation(dry_run: bool) -> None:
         print_error(f"未找到文本规范化脚本: {NORMALISE_SCRIPT}")
         return
 
-    if not SOURCE_DIR.exists() or not SOURCE_DIR.is_dir():
-        print_error(f"源目录不存在或不是文件夹: {SOURCE_DIR}")
+    if not SOURCE_DIR.exists():
+        print_warning(f"源目录不存在，已自动创建: {SOURCE_DIR}")
+        SOURCE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not SOURCE_DIR.is_dir():
+        print_error(f"源目录路径不是文件夹: {SOURCE_DIR}")
         return
 
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -76,15 +80,25 @@ def _invoke_text_normalisation(dry_run: bool) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="原文文本规范化工具（默认 dry-run，使用 --write 直接写回）"
+    )
+    parser.add_argument(
+        "--write",
+        action="store_true",
+        help="执行规范化并写回源文件，而非 dry-run。",
+    )
+    args = parser.parse_args()
+
     _print_banner()
     print_header("预处理：原文规范化（NFKC + 兼容字清洗）")
     print_info("10) 预处理：原文规范化（NFKC + 兼容字清洗）")
-    if not prompt_yes_no("是否现在执行原文规范化?", default=False):
-        print_info("已取消文本规范化。")
-        return
+    if args.write:
+        print_warning("将直接执行原文规范化，并写回源文件。")
+    else:
+        print_info("将直接执行原文规范化（默认 dry-run）。")
 
-    dry_run = prompt_yes_no("是否先 dry-run，仅生成报告?", default=True)
-    _invoke_text_normalisation(dry_run=dry_run)
+    _invoke_text_normalisation(dry_run=not args.write)
 
 
 if __name__ == "__main__":
