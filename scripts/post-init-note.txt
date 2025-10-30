@@ -1,0 +1,5 @@
+1) 使用 scripts/gen-certs.* 生成 CA 与节点证书
+2) 将 config.yaml 中 security 路径指向 keys/ 下的证书文件
+3) 根据你的 VPN/中继为 peers[].addr 填写可达地址
+4) 运行 keymesh check 验证配置
+5) 目前 run 为占位，Round 2 起生效

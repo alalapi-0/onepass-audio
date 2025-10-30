@@ -1,33 +1,34 @@
-# OnePass Audio ignore rules
-/venv/
-/.venv/
-/out/
-!/out/
-/out/*
-!/out/.gitkeep
-/data/audio/
-!/data/audio/
-/data/audio/*
-!/data/audio/.gitkeep
-/data/asr-json/
-!/data/asr-json/
-/data/asr-json/*
-!/data/asr-json/.gitkeep
-/data/original_txt/
-!/data/original_txt/
-/data/original_txt/*
-!/data/original_txt/.gitkeep
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.sqlite3
+
+# Virtual env
+.venv/
+venv/
+
+# Output and logs
+out/
+logs/
 *.log
-*.tmp
+
+# Keys and certs (never commit)
+keys/
+*.pem
+*.crt
+*.csr
+*.key
+
+# OS
 .DS_Store
 Thumbs.db
-*.wav
-*.mp3
-*.m4a
-*.flac
-*.bak
-out/textnorm_report*.md
+
+# Misc
+.temp/
+.cache/
+build/
+dist/
+.eggs/
+*.egg-info/
