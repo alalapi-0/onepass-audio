@@ -29,3 +29,5 @@ Thumbs.db
 *.mp3
 *.m4a
 *.flac
+*.bak
+out/textnorm_report*.md
