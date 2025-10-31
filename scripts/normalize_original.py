@@ -19,6 +19,9 @@ from pathlib import Path
 # 导入类型注解以提高可读性
 from typing import Dict, List, Tuple
 
+# 解析项目根目录，确保脚本在任意工作目录下运行
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 # 定义兼容部首的二次替换映射
 RADICAL_MAP: Dict[str, str] = {
     "⻓": "长",
@@ -344,23 +347,23 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:  # 解析命令行参数
         "--in",
         dest="input",
         type=Path,
-        default=Path("data/original_txt"),
-        help="输入文件或目录 (默认: data/original_txt)",
+        default=PROJECT_ROOT / "data" / "original_txt",
+        help="输入文件或目录 (默认: <项目根>/data/original_txt)",
     )
     # 添加输出参数
     parser.add_argument(
         "--out",
         dest="output",
         type=Path,
-        default=Path("data/original_txt_norm"),
-        help="输出文件或目录 (默认: data/original_txt_norm)",
+        default=PROJECT_ROOT / "data" / "original_txt_norm",
+        help="输出文件或目录 (默认: <项目根>/data/original_txt_norm)",
     )
     # 添加报告参数
     parser.add_argument(
         "--report",
         type=Path,
-        default=Path("out/normalize_report.csv"),
-        help="CSV 报告路径 (默认: out/normalize_report.csv)",
+        default=PROJECT_ROOT / "out" / "normalize_report.csv",
+        help="CSV 报告路径 (默认: <项目根>/out/normalize_report.csv)",
     )
     # 添加模式参数
     parser.add_argument("--mode", default="align", choices=["align"], help="处理模式")
