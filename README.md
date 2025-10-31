@@ -87,31 +87,40 @@ python scripts/normalize_texts.py --src data/original_txt --inplace --report out
 
 ## 文本规范化（适配词级对齐）
 
-为进一步提升词级时间戳对齐的成功率，需要在通用清洗之后对原稿执行“对齐友好化”处理：
+在完成基础清洗后，还需要针对 ASR 词级 `words.json` 进行“对齐友好化”增强，以减少“最后一遍”保留流程中的误差：
 
-- 兼容区部首与拆分写法（如 `⻛`、`⺠`、`序⾔` 等）统一回常用字符，避免被当作不同词；
-- 将中文全角标点转换为 ASCII 或去除书名号，确保分词器不会被特殊符号打断；
-- 合并软换行、去除中文内的额外空格，让句子与词时间戳能以同样的文本片段对齐。
+- 统一康熙部首/兼容字形，例如 `⼈/⼤/⽤/⾥/⾼/⻓/⻋/⻝/⻢` 等字符回写为常用字；
+- 统一省略号、破折号和中英文标点，将 `...`、`--`、半角括号等写法折算为中文标点系；
+- 剔除零宽空格、段内硬换行以及中文之间的额外空格，使句子与词时间戳可直接比对；
+- 可选剔除目录、版权页、献词等前后缀文本，避免无效段落干扰词级覆盖率。
 
-脚本 `scripts/normalize_original.py` 会把 `data/original_txt/*.txt` 批量转换为规范文本，并输出到 `data/original_txt_norm/` 同名 `.norm.txt`，同时生成 `out/normalize_report.csv` 汇总各类替换次数。运行示例如下：
+对应 CLI 由 `onepass.normalize_original` 模块提供，既可处理单个章节，也可批量跑整本书：
 
 ```bash
-# 单文件处理（生成 .norm.txt 与 .sentences.txt）
-python scripts/normalize_original.py \
-  --in data/original_txt/001序言01.txt \
-  --out data/original_txt_norm/001序言01.norm.txt \
-  --report out/normalize_report.csv \
-  --mode align
+# 单章试跑：生成规范化文本与对齐感知报告
+python -m onepass.normalize_original \
+  --orig data/original_txt/001序言01.txt \
+  --words data/asr-json/001序言01.words.json \
+  --out  data/original_txt_norm/001序言01.norm.txt \
+  --report out/001序言01.norm.diff.md \
+  --lang zh --strip-frontmatter true --punct-style zh --number-style half
 
-# 批量处理文件夹内全部 TXT
-python scripts/normalize_original.py \
-  --in data/original_txt \
-  --out data/original_txt_norm \
-  --report out/normalize_report.csv \
-  --mode align
+# 批量跑前 3 章（自动按文件名匹配 .words.json）
+python -m onepass.normalize_original \
+  --orig-dir data/original_txt \
+  --words-dir data/asr-json \
+  --out-dir  data/original_txt_norm \
+  --report-dir out \
+  --lang zh --strip-frontmatter true
 ```
 
-规范后的文本更贴近 ASR 词级输出，句级/词级对齐的匹配率会在相同阈值下显著提升。建议在运行主流程前先执行该步骤，后续所有对齐操作均可直接指向 `data/original_txt_norm/*.norm.txt`。
+输出内容包括：
+
+- `*.norm.txt`：适配 ASR 词级的正文文本，兼容字、标点、空白均已统一；
+- `*.norm.diff.md`：差异报告，列出未覆盖的兼容字符、标点/空白统计、Top-20 未匹配 n-gram、字符集差异与预估“对齐友好度”评分；
+- 报告中会提示未入表的兼容字符，可根据建议把映射补充到 `config/compat_map_zh.json`。
+
+规范化结果通常能显著提高 `words.json` 的覆盖率与标点一致度，句级/词级对齐器在相同阈值下会获得更高的成功率，从而让“保留最后一遍”的抽取更加稳定。
 
 ### 人工验收脚本
 
