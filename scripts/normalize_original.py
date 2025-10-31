@@ -340,11 +340,28 @@ def _parse_args(argv: List[str]) -> argparse.Namespace:  # 解析命令行参数
     # 创建参数解析器
     parser = argparse.ArgumentParser(description="规范化原始 TXT 以提升词级对齐效果")
     # 添加输入参数
-    parser.add_argument("--in", dest="input", required=True, help="输入文件或目录")
+    parser.add_argument(
+        "--in",
+        dest="input",
+        type=Path,
+        default=Path("data/original_txt"),
+        help="输入文件或目录 (默认: data/original_txt)",
+    )
     # 添加输出参数
-    parser.add_argument("--out", dest="output", required=True, help="输出文件或目录")
+    parser.add_argument(
+        "--out",
+        dest="output",
+        type=Path,
+        default=Path("data/original_txt_norm"),
+        help="输出文件或目录 (默认: data/original_txt_norm)",
+    )
     # 添加报告参数
-    parser.add_argument("--report", required=True, help="CSV 报告路径")
+    parser.add_argument(
+        "--report",
+        type=Path,
+        default=Path("out/normalize_report.csv"),
+        help="CSV 报告路径 (默认: out/normalize_report.csv)",
+    )
     # 添加模式参数
     parser.add_argument("--mode", default="align", choices=["align"], help="处理模式")
     # 解析并返回结果
