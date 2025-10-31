@@ -13,10 +13,6 @@
 !/data/asr-json/
 /data/asr-json/*
 !/data/asr-json/.gitkeep
-/data/original_txt/
-!/data/original_txt/
-/data/original_txt/*
-!/data/original_txt/.gitkeep
 __pycache__/
 *.pyc
 *.pyo
