@@ -1,4 +1,4 @@
-r"""Utilities for sentence preparation and configurable text normalisation."""
+r"""提供句子预处理与可配置文本规范化的工具集合。"""
 from __future__ import annotations
 
 import importlib
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
-# Re-exported symbols for backwards compatibility with the previous API.
+# 重新导出旧版 API 依赖的符号，保持向后兼容。
 __all__ = [
     "Sentence",
     "split_sentences",
@@ -26,24 +26,24 @@ __all__ = [
 
 @dataclass
 class Sentence:
-    """Container representing a normalised sentence and its token sequence."""
+    """表示规范化后的句子及其分词序列。"""
 
     text: str
     tokens: List[str]
 
 
-# Regular expressions reused by legacy helpers.
+# 旧版辅助函数复用的正则表达式。
 _SENTENCE_PATTERN = re.compile(r"[^。！？；?!;\r\n]+[。！？；?!;]*", re.MULTILINE)
 _ASCII_WORD_RE = re.compile(r"[A-Za-z0-9_]+")
 _PUNCTUATION_RE = re.compile(r"\s*([。！？；?!;,，、])")
 
 
 def split_sentences(raw_text: str) -> List[str]:
-    """Split *raw_text* into coarse sentences based on punctuation marks."""
+    """依据标点将原始文本切分为粗粒度句子。"""
 
     sentences: List[str] = []
     for match in _SENTENCE_PATTERN.finditer(raw_text):
-        # Normalise whitespace around the matched sentence.
+        # 对匹配到的句子两端做空白归一。
         sentence = match.group().strip()
         if sentence:
             sentences.append(sentence)
@@ -51,22 +51,22 @@ def split_sentences(raw_text: str) -> List[str]:
 
 
 def normalize_sentence(text: str) -> str:
-    """Collapse whitespace and punctuation for fuzzy matching."""
+    """压缩空白与标点，便于后续模糊匹配。"""
 
-    text = text.replace("\u3000", " ")  # Replace full-width spaces.
-    text = re.sub(r"\s+", " ", text)  # Compress whitespace runs.
-    text = _PUNCTUATION_RE.sub(r"\1", text)  # Remove spacing before punctuation.
+    text = text.replace("\u3000", " ")  # 将全角空格替换为半角
+    text = re.sub(r"\s+", " ", text)  # 压缩连续空白字符
+    text = _PUNCTUATION_RE.sub(r"\1", text)  # 去除标点前多余空格
     return text.strip()
 
 
 def tokenize_for_match(text: str) -> List[str]:
-    """Tokenise *text* into ASCII word chunks and single CJK characters."""
+    """将文本拆成 ASCII 词块与单个中日韩字符的序列。"""
 
     tokens: List[str] = []
     pending_ascii: List[str] = []
     for ch in text:
         if ch.isspace():
-            # Flush buffered ASCII tokens when encountering whitespace.
+            # 遇到空白字符时刷新缓存的 ASCII token。
             if pending_ascii:
                 tokens.append("".join(pending_ascii))
                 pending_ascii.clear()
@@ -85,7 +85,7 @@ def tokenize_for_match(text: str) -> List[str]:
 
 @dataclass(slots=True)
 class TextNormConfig:
-    """Configuration flags controlling ``normalize_text`` behaviour."""
+    """控制 ``normalize_text`` 行为的配置开关。"""
 
     nfkc: bool = True
     strip_bom: bool = True
@@ -98,7 +98,7 @@ class TextNormConfig:
 
 
 DEFAULT_COMPAT_MAP: Dict[str, str] = {
-    # Common radicals and compatibility characters frequently seen in OCR text.
+    # OCR 场景中常见的偏旁部首与兼容字符映射。
     "⼈": "人",
     "⼒": "力",
     "⾔": "言",
@@ -116,7 +116,7 @@ DEFAULT_COMPAT_MAP: Dict[str, str] = {
 }
 
 
-# The following sets define invisible or suspicious characters worth reporting.
+# 以下集合定义了需要提示的零宽字符或可疑字符。
 _ZERO_WIDTH_CHARS = {
     "\u200b",
     "\u200c",
@@ -127,7 +127,7 @@ _ZERO_WIDTH_CHARS = {
 _SUSPECT_CONTROL_CATEGORIES = {"Cf", "Cc"}
 
 
-# Punctuation translation tables for the configurable styles.
+# 针对不同标点风格的转换表。
 _PUNCT_ASCII_TABLE: Sequence[Tuple[str, str]] = (
     ("，", ","),
     ("。", "."),
@@ -178,12 +178,12 @@ _PUNCT_CJK_TABLE: Sequence[Tuple[str, str]] = (
 
 _OPENCC_SPEC = importlib.util.find_spec("opencc")
 _OPENCC_MODULE = importlib.import_module("opencc") if _OPENCC_SPEC else None
-# Track whether we have already warned the user about missing opencc support.
+# 记录是否已经提示过用户缺少 opencc 支持。
 _OPENCC_WARNING_EMITTED = False
 
 
 def load_custom_map(path: str | None) -> Dict[str, str]:
-    """Load additional compatibility mappings from *path* if it exists."""
+    """在文件存在时加载额外的兼容字符映射。"""
 
     if not path:
         return {}
@@ -192,16 +192,16 @@ def load_custom_map(path: str | None) -> Dict[str, str]:
         return {}
     try:
         data = json.loads(file_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:  # pragma: no cover - invalid user input
+    except json.JSONDecodeError as exc:  # pragma: no cover - 用户提供的 JSON 非法
         raise ValueError(f"无法解析自定义映射 JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError("自定义映射文件必须是键值对 JSON 对象。")
-    # Filter only string-to-string overrides to avoid crashes.
+    # 仅保留字符串到字符串的映射，避免类型不符导致异常。
     return {str(key): str(value) for key, value in data.items()}
 
 
 def _apply_punctuation(text: str, style: str) -> Tuple[str, int]:
-    """Return text with punctuation converted according to *style*."""
+    """按照指定风格转换标点并返回变换次数。"""
 
     if style == "keep":
         return text, 0
@@ -211,7 +211,7 @@ def _apply_punctuation(text: str, style: str) -> Tuple[str, int]:
     for source, target in table:
         if not source:
             continue
-        # Replace occurrences and update replacement statistics.
+        # 替换匹配到的源标点并更新计数。
         new_text = working.replace(source, target)
         if new_text != working:
             if len(source) == 1:
@@ -223,7 +223,7 @@ def _apply_punctuation(text: str, style: str) -> Tuple[str, int]:
 
 
 def _strip_zero_width(text: str) -> Tuple[str, int]:
-    """Remove zero-width and control characters from *text*."""
+    """移除文本中的零宽字符与控制字符。"""
 
     removed = 0
     chars: List[str] = []
@@ -239,7 +239,7 @@ def _strip_zero_width(text: str) -> Tuple[str, int]:
 
 
 def _collapse_whitespace(text: str) -> Tuple[str, int]:
-    """Collapse consecutive spaces/tabs while preserving paragraph breaks."""
+    """压缩连续空白符，同时保留段落换行。"""
 
     changed = 0
     normalised_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -254,7 +254,7 @@ def _collapse_whitespace(text: str) -> Tuple[str, int]:
 
 
 def _ensure_trailing_newline(text: str) -> str:
-    """Guarantee that *text* ends with a single newline character."""
+    """确保文本以单个换行符结尾。"""
 
     if not text.endswith("\n"):
         return text + "\n"
@@ -262,7 +262,7 @@ def _ensure_trailing_newline(text: str) -> str:
 
 
 def normalize_text(text: str, cfg: TextNormConfig) -> Tuple[str, Dict[str, int]]:
-    """Normalise *text* according to *cfg* and return statistics."""
+    """依据配置执行规范化并返回统计信息。"""
 
     stats: Dict[str, int] = {
         "len_before": len(text),
@@ -277,16 +277,16 @@ def normalize_text(text: str, cfg: TextNormConfig) -> Tuple[str, Dict[str, int]]
     working = text
 
     if cfg.nfkc:
-        # Apply Unicode NFKC folding before more specific replacements.
+        # 在执行具体替换前先做 Unicode NFKC 折叠。
         working = unicodedata.normalize("NFKC", working)
 
     if cfg.strip_bom and working.startswith("\ufeff"):
-        # Remove Unicode BOM characters that occasionally sneak into files.
+        # 去除偶尔混入文件头部的 Unicode BOM。
         working = working.lstrip("\ufeff")
         stats["bom_removed"] = 1
 
     if cfg.strip_zw:
-        # Drop zero-width or control characters that hinder alignment.
+        # 删除妨碍对齐的零宽或控制字符。
         working, removed = _strip_zero_width(working)
         stats["removed_zw"] = removed
 
@@ -297,7 +297,7 @@ def normalize_text(text: str, cfg: TextNormConfig) -> Tuple[str, Dict[str, int]]
         replaced = 0
         chars: List[str] = []
         for ch in working:
-            # Replace compatibility radicals with their common forms.
+            # 将兼容用部首替换成常用形态。
             target = compat_map.get(ch)
             if target is not None:
                 replaced += 1
@@ -311,7 +311,7 @@ def normalize_text(text: str, cfg: TextNormConfig) -> Tuple[str, Dict[str, int]]
     stats["punct_changes"] = punct_changes
 
     if cfg.collapse_spaces:
-        # Compress repeated spaces/tabs to reduce alignment noise.
+        # 压缩重复空格/制表符，降低对齐噪声。
         working, collapsed = _collapse_whitespace(working)
         stats["space_collapses"] = collapsed
 
@@ -335,7 +335,7 @@ def normalize_text(text: str, cfg: TextNormConfig) -> Tuple[str, Dict[str, int]]
 
 
 def find_nonstandard_chars(text: str) -> Dict[str, int]:
-    """Count suspicious characters in *text* for reporting purposes."""
+    """统计文本中可疑字符的数量，便于输出报告。"""
 
     suspect_chars = set(DEFAULT_COMPAT_MAP)
     suspect_chars.update(_ZERO_WIDTH_CHARS)
