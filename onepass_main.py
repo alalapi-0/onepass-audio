@@ -313,10 +313,14 @@ def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本
     print_info(f"源音频: {source_audio}")
     print_info(f"输出文件: {out_path}")
     print_info(f"保留片段 {len(keeps)} 段，总计 {keep_duration:.3f}s")
-    if effective_samplerate:
-        print_info(f"目标采样率: {effective_samplerate} Hz")
-    if effective_channels:
-        print_info(f"目标声道数: {effective_channels}")
+    if samplerate is not None:
+        print_info(f"目标采样率: {effective_samplerate} Hz（用户输入）")
+    elif effective_samplerate:
+        print_info(f"目标采样率: {effective_samplerate} Hz（来自 EDL 建议）")
+    if channels is not None:
+        print_info(f"目标声道数: {effective_channels}（用户输入）")
+    elif effective_channels:
+        print_info(f"目标声道数: {effective_channels}（来自 EDL 建议）")
 
     script_path = ROOT_DIR / "scripts" / "edl_render.py"
     if not script_path.exists():

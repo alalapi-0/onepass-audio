@@ -298,8 +298,8 @@ def build_filter_complex(
     if samplerate:
         post_filters.append(f"aresample={samplerate}")
     if channels:
-        layout = {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")
-        post_filters.append(f"aformat=channel_layouts={layout}")
+        layout = {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")  # 根据声道数映射布局
+        post_filters.append(f"aformat=sample_fmts=s16:channel_layouts={layout}")
 
     final_label = "[ac]"  # 约定最终输出标签
     concat_filter = f"{concat_inputs}concat=n={len(keeps)}:v=0:a=1"
@@ -324,8 +324,9 @@ def render_audio(
 
     edl = load_edl(edl_path)  # 读取并校验 EDL
 
-    effective_samplerate = samplerate or edl.samplerate  # 优先使用用户参数
-    effective_channels = channels or edl.channels
+    # 计算最终滤镜使用的采样率与声道设置，优先采用用户显式指定的值
+    target_samplerate = samplerate if samplerate is not None else edl.samplerate  # 得到滤镜中使用的采样率
+    target_channels = channels if channels is not None else edl.channels  # 得到滤镜中使用的声道数
 
     source_audio = resolve_source_audio(edl, edl_path, audio_root)  # 定位原始音频
     duration = probe_duration(source_audio)  # 获取音频总时长
@@ -339,7 +340,7 @@ def render_audio(
     out_dir.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
     output_path = out_dir / f"{source_audio.stem}.clean.wav"  # 约定输出文件名
 
-    filter_args, label = build_filter_complex(keeps, effective_samplerate, effective_channels)
+    filter_args, label = build_filter_complex(keeps, target_samplerate, target_channels)
 
     cmd: list[str] = [
         "ffmpeg",
@@ -351,10 +352,10 @@ def render_audio(
         "-map",
         label,
     ]
-    if effective_samplerate:
-        cmd.extend(["-ar", str(effective_samplerate)])
-    if effective_channels:
-        cmd.extend(["-ac", str(effective_channels)])
+    if samplerate is not None:  # 仅在用户显式指定时追加采样率参数
+        cmd.extend(["-ar", str(samplerate)])
+    if channels is not None:  # 仅在用户显式指定时追加声道参数
+        cmd.extend(["-ac", str(channels)])
     cmd.append(str(output_path))
 
     if dry_run:  # 仅打印命令供用户预览
