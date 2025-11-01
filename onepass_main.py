@@ -2,6 +2,7 @@
 from __future__ import annotations  # 启用未来注解特性，避免前置字符串引用报错
 
 import json  # 处理 JSON 配置与结果文件
+import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
 from dataclasses import asdict, dataclass  # 引入数据类工具与转换字典的方法
@@ -12,6 +13,13 @@ from onepass import __version__  # 引入包版本信息用于展示
 from onepass.align import align_sentences  # 引入句子对齐核心函数
 from onepass.asr_loader import Word, load_words  # 引入词级别数据结构与加载函数
 from onepass.edl import EDL, build_keep_last_edl  # 引入 EDL 数据结构与构建函数
+from onepass.edl_renderer import (  # 引入音频渲染相关工具
+    load_edl as load_keep_edl,
+    normalize_segments as normalize_keep_segments,
+    probe_duration as probe_audio_duration,
+    render_audio as render_clean_audio,
+    resolve_source_audio as resolve_audio_path,
+)
 from onepass.markers import write_audition_markers  # 引入写入 Audition 标记的工具
 from onepass.pipeline import PreparedSentences, prepare_sentences  # 引入句子预处理逻辑
 from onepass.textnorm import Sentence  # 引入规范化后的句子结构
@@ -21,7 +29,9 @@ from onepass.ux import (  # 引入命令行交互的工具函数
     print_info,  # 打印普通提示的工具
     print_success,  # 打印成功提示的工具
     print_warning,  # 打印警告提示的工具
+    prompt_existing_file,  # 询问并校验文件存在性的函数
     prompt_existing_directory,  # 询问并校验目录存在性的函数
+    prompt_text,  # 自由输入文本
     prompt_yes_no,  # 询问用户是否继续的布尔函数
 )
 
@@ -87,7 +97,132 @@ def _prompt_materials_directory() -> Path:  # 询问并校验素材目录
 def _ensure_output_directory() -> Path:  # 询问输出目录并保证存在
     print_header("输出目录")  # 显示输出路径的标题
     DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)  # 确保默认输出目录存在
-    return prompt_existing_directory("输出文件夹 (会在其中生成字幕/EDL 等)", default=DEFAULT_OUT_DIR)  # 询问用户确认或修改输出目录
+    return prompt_existing_directory(
+        "输出文件夹 (会在其中生成字幕/EDL 等)",
+        default=DEFAULT_OUT_DIR,
+    )  # 询问用户确认或修改输出目录
+
+
+def _clean_input_path(raw: str) -> str:  # 清理用户输入的路径字符串
+    cleaned = raw.strip().strip('"').strip("'")  # 去掉首尾空白与引号
+    return cleaned or raw.strip()  # 若清理后为空则返回去除空白的原值
+
+
+def _prompt_optional_int(prompt: str) -> int | None:  # 允许留空的正整数输入
+    while True:  # 持续提示直到获得合法值
+        raw = _clean_input_path(prompt_text(prompt, allow_empty=True))  # 读取用户输入
+        if not raw:  # 留空表示沿用默认
+            return None
+        try:
+            value = int(raw)  # 尝试解析为整数
+        except ValueError:  # 解析失败
+            print_warning("请输入正整数或直接回车留空。")
+            continue
+        if value <= 0:  # 非正数需要重新输入
+            print_warning("数值必须大于 0。")
+            continue
+        return value
+
+
+def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本
+    print_header("按 EDL 渲染干净音频")  # 输出步骤标题
+
+    edl_path = prompt_existing_file("拖拽或输入 EDL JSON 路径")  # 获取 EDL 文件
+    default_audio_root = (
+        DEFAULT_MATERIALS_DIR if DEFAULT_MATERIALS_DIR.exists() else edl_path.parent
+    )  # 默认音频目录
+    audio_root = prompt_existing_directory(
+        "源音频所在目录 (用于解析 EDL 中的相对路径)",
+        default=default_audio_root,
+    )  # 询问音频根目录
+
+    out_default = DEFAULT_OUT_DIR if DEFAULT_OUT_DIR.exists() else edl_path.parent
+    out_raw = _clean_input_path(
+        prompt_text(
+            "输出目录 (不存在会自动创建)",
+            default=str(out_default),
+            allow_empty=False,
+        )
+    )
+    out_dir = Path(out_raw).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
+
+    samplerate = _prompt_optional_int("输出采样率 (Hz，可留空沿用原始设置)")
+    channels = _prompt_optional_int("输出声道数 (可留空沿用原始设置)")
+
+    try:
+        edl = load_keep_edl(edl_path)  # 加载 EDL 内容
+        source_audio = resolve_audio_path(edl, edl_path, audio_root)  # 解析源音频
+        duration = probe_audio_duration(source_audio)  # 获取音频总时长
+        keeps = normalize_keep_segments(edl.segments, duration)  # 计算保留片段
+    except Exception as exc:
+        print_error(f"解析 EDL 失败: {exc}")
+        return
+
+    keep_duration = sum(segment.end - segment.start for segment in keeps)  # 汇总保留时长
+    if keep_duration <= 0:
+        print_error("有效保留时长为 0，无法执行渲染。")
+        return
+
+    effective_samplerate = samplerate or edl.samplerate
+    effective_channels = channels or edl.channels
+    out_path = out_dir / f"{source_audio.stem}.clean.wav"
+
+    print_info(f"源音频: {source_audio}")
+    print_info(f"输出文件: {out_path}")
+    print_info(f"保留片段 {len(keeps)} 段，总计 {keep_duration:.3f}s")
+    if effective_samplerate:
+        print_info(f"目标采样率: {effective_samplerate} Hz")
+    if effective_channels:
+        print_info(f"目标声道数: {effective_channels}")
+
+    script_path = ROOT_DIR / "scripts" / "edl_render.py"
+    if not script_path.exists():
+        print_error("未找到 scripts/edl_render.py，请确认仓库已更新。")
+        return
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--edl",
+        str(edl_path),
+        "--audio-root",
+        str(audio_root),
+        "--out",
+        str(out_dir),
+    ]
+    if samplerate is not None:
+        cmd.extend(["--samplerate", str(samplerate)])
+    if channels is not None:
+        cmd.extend(["--channels", str(channels)])
+
+    dry_run = prompt_yes_no("是否仅预览渲染命令 (Dry-Run)?", default=False)
+    if dry_run:
+        cmd.append("--dry-run")
+
+    print_info("即将执行命令:")
+    print_info(shlex.join(cmd))
+
+    if not prompt_yes_no("确认执行上述命令?", default=True):
+        print_warning("已取消音频渲染。")
+        return
+
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用 Python 解释器执行脚本: {exc}")
+        return
+
+    if result.returncode != 0:
+        print_error("渲染脚本执行失败，请根据上方输出排查问题。")
+        return
+
+    if dry_run:
+        print_success("Dry-Run 已完成，可根据上方命令实际执行。")
+        return
+
+    print_success(f"已完成干净音频渲染: {out_path}")
+    print_info(f"保留片段 {len(keeps)} 段，总计 {keep_duration:.3f}s")
 
 
 def _index_files_by_stem(paths: Iterable[Path]) -> Dict[str, Path]:  # 按文件名前缀建立索引
@@ -206,13 +341,18 @@ def _warn_mismatch(words: List[Word], sentences: List[Sentence]) -> None:  # 检
 
 
 def _serialise_edl(edl: EDL) -> dict:  # 将 EDL 对象转换成字典
-    return {  # 构造可写入 JSON 的字典
+    payload = {  # 构造可写入 JSON 的字典
         "audio_stem": edl.audio_stem,  # 音频基名
         "sample_rate": edl.sample_rate,  # 音频采样率
+        "samplerate": edl.sample_rate,  # 兼容新式字段名
         "actions": [asdict(action) for action in edl.actions],  # 将所有剪辑动作转为字典
         "stats": edl.stats,  # 附带统计信息
         "created_at": edl.created_at,  # 记录生成时间
     }
+    source_audio = getattr(edl, "source_audio", None)
+    if source_audio:
+        payload["source_audio"] = source_audio  # 写入源音频路径
+    return payload
 
 
 def _format_srt_timestamp(seconds: float) -> str:  # 将秒转换为 SRT 时间戳
@@ -239,34 +379,22 @@ def _write_plain_transcript(entries: List[Tuple[float, float, str]], out_path: P
     out_path.write_text((text + "\n") if text else "", encoding="utf-8")  # 写入纯文本稿件
 
 
-def _render_audio(audio: Path, edl_path: Path, output: Path) -> bool:  # 按 EDL 调用脚本导出音频
-    script = ROOT_DIR / "scripts" / "edl_to_ffmpeg.py"  # 定位音频导出脚本
-    if not script.exists():  # 若脚本缺失
-        print_warning("未找到 edl_to_ffmpeg.py，跳过音频导出。")  # 给出提示
-        return False  # 返回失败
+def _render_audio(audio: Path, edl_path: Path, out_dir: Path) -> Path | None:  # 调用新模块渲染音频
+    try:
+        output = render_clean_audio(  # 直接调用库函数
+            edl_path,
+            audio.parent,
+            out_dir,
+            None,
+            None,
+            dry_run=False,
+        )
+    except Exception as exc:
+        print_error(f"音频导出失败: {exc}")  # 提示失败原因
+        return None
 
-    cmd = [  # 构建执行音频导出脚本的命令行
-        sys.executable,  # 使用当前 Python 解释器
-        str(script),  # 脚本路径
-        "--audio",  # 音频路径参数
-        str(audio),  # 原始音频文件
-        "--edl",  # EDL 路径参数
-        str(edl_path),  # EDL 文件路径
-        "--out",  # 输出文件参数
-        str(output),  # 目标音频输出路径
-    ]
-    try:  # 调用外部脚本尝试导出
-        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))  # 在项目根执行导出脚本
-    except FileNotFoundError as exc:  # 捕获解释器或脚本不可用的情况
-        print_error(f"无法调用 Python 解释器导出音频: {exc}")  # 提示错误
-        return False  # 导出失败
-
-    if result.returncode != 0:  # 如果脚本返回非零
-        print_error("音频导出失败，请确认已安装 ffmpeg 并可在命令行中使用。")  # 告知可能原因
-        return False  # 视为导出失败
-
-    print_success(f"已导出干净音频: {output.name}")  # 成功提示
-    return True  # 返回成功状态
+    print_success(f"已导出干净音频: {output.name}")  # 输出成功提示
+    return output
 
 
 def _process_chapter(  # 处理单章素材并汇总结果
@@ -317,6 +445,13 @@ def _process_chapter(  # 处理单章素材并汇总结果
     edl_path = outdir / f"{chapter.stem}.keepLast.edl.json"  # EDL 输出路径
     markers_path = outdir / f"{chapter.stem}.keepLast.audition_markers.csv"  # Audition 标记输出路径
 
+    if chapter.audio_file is not None:  # 若存在对应音频
+        try:
+            relative = chapter.audio_file.relative_to(ROOT_DIR)
+            setattr(edl, "source_audio", relative.as_posix())  # 存储相对路径
+        except ValueError:
+            setattr(edl, "source_audio", chapter.audio_file.as_posix())  # 回退为绝对路径
+
     try:
         with edl_path.open("w", encoding="utf-8") as fh:  # 打开 EDL 文件
             json.dump(_serialise_edl(edl), fh, ensure_ascii=False, indent=2)  # 写入 EDL 数据
@@ -346,9 +481,7 @@ def _process_chapter(  # 处理单章素材并汇总结果
         if chapter.audio_file is None:  # 没有匹配音频
             print_warning("未找到同名音频文件，跳过音频导出。")  # 提示缺失
         else:  # 找到音频时执行导出
-            audio_output = outdir / f"{chapter.stem}.clean.wav"  # 目标音频路径
-            if not _render_audio(chapter.audio_file, edl_path, audio_output):  # 调用导出流程
-                audio_output = None  # 导出失败时重置
+            audio_output = _render_audio(chapter.audio_file, edl_path, outdir)  # 调用导出流程
 
     print_info(  # 打印统计摘要
         "句子总数 {total}，保留 {kept}，重复窗口 {dup}，未对齐 {unaligned}，去除重复 {cut:.3f}s".format(
@@ -380,6 +513,21 @@ def _process_chapter(  # 处理单章素材并汇总结果
 
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
+
+    print_header("主菜单")  # 显示主菜单标题
+    print_info("[1] 批量处理素材，生成字幕/EDL/标记")
+    print_info("[R] 按 EDL 渲染干净音频")
+    print_info("[Q] 退出程序")
+
+    choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
+    choice_lower = choice.lower()
+    if choice_lower == "r":  # 仅执行音频渲染
+        _run_edl_render_menu()
+        return
+    if choice_lower == "q":  # 用户选择退出
+        print_info("已退出。")
+        return
+
     materials_dir = _prompt_materials_directory()  # 询问素材目录
 
     print_header("素材匹配")  # 提示开始匹配素材

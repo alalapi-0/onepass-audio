@@ -13,6 +13,7 @@
 !/data/asr-json/
 /data/asr-json/*
 !/data/asr-json/.gitkeep
+/materials/**/*.wav
 __pycache__/
 *.pyc
 *.pyo
