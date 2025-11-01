@@ -4,11 +4,21 @@
 
 ## 构建历程（Prompt 演进纪要）
 
-1. **第 1 轮：需求梳理与目录搭建** —— 通过最初的 Prompt 明确了“去口癖、保留最后一遍、生成 EDL”三大功能，并搭建了 `onepass/` 包与 `scripts/` 目录骨架。此阶段暴露出的难题是素材格式尚未统一，导致示例无法跑通。
-2. **第 2 轮：文本规范化与数据加载** —— 增补了 `onepass.textnorm`、`onepass.asr_loader` 等模块，围绕“词级对齐”细化了文本预处理流程。此时遇到的问题是兼容字符表不完整，导致规范化后仍存在漏网字符，需要在 `config/` 中维护自定义映射。
-3. **第 3 轮：交互主程序与批处理流程** —— 加入 `onepass_main.py` 交互入口、章节资源匹配与批量处理逻辑。过程中发现素材目录命名不一致、音频优先级选择困难，最终通过哈希表比对前缀和手动设定格式优先级解决。
-4. **第 4 轮：文档完善与可用性增强** —— 在最新 Prompt 中补充了运行说明、详细注释、环境准备指南，并修复了英语注释与中文内容风格不一致的问题。此阶段的主要挑战是“逐行中文注释”工作量较大，需要逐块核对关键模块。
+1. **第 1 轮：需求梳理与目录搭建** —— 通过最初的 Prompt 明确了“去口癖、保留最后一遍、生成 EDL”三大功能，并搭建了 `onepass/` 包与 `scripts/` 目录骨架。此阶段暴露出的难题是素材格式尚未统一，导致示例无法跑通，需要额外设计命名约定与目录结构。
+   - 关键决策：统一以 `<stem>.words.json` ↔ `<stem>.txt` 为配对基准，并预留 `materials/` 目录存放样例。
+   - 典型问题：部分 ASR 输出缺少 `end` 字段或时间戳乱序，必须在 Loader 层进行排序与异常提醒。
+2. **第 2 轮：文本规范化与数据加载** —— 增补了 `onepass.textnorm`、`onepass.asr_loader` 等模块，围绕“词级对齐”细化了文本预处理流程。此时遇到的问题是兼容字符表不完整、OpenCC 未必可用，导致规范化后仍存在漏网字符，需要在 `config/` 中维护自定义映射并增加“缺少 opencc” 的一次性告警。
+   - 关键决策：将规范化拆分为 NFKC → 去零宽 → 自定义兼容表 → 可选繁简转换 → 标点风格 → 空白压缩，方便插拔。
+   - 典型问题：发现部分素材存在 BOM 与零宽字符，若不先清洗会影响 RapidFuzz 对齐得分。
+3. **第 3 轮：交互主程序与批处理流程** —— 加入 `onepass_main.py` 交互入口、章节资源匹配与批量处理逻辑。过程中发现素材目录命名不一致、音频优先级选择困难，最终通过哈希表比对前缀、显式的音频格式优先级（WAV → FLAC → M4A → ...）以及“缺什么提示什么”的交互文案解决。
+   - 关键决策：批处理时先扫描 JSON，再按优先顺序回落到 `.norm.txt` / `.txt`，并输出 `batch_report.json` 方便复盘。
+   - 典型问题：Windows 上默认路径包含中文与空格，需在交互提示中增加引号清理与路径验证逻辑。
+4. **第 4 轮：文档完善与可用性增强** —— 在最新 Prompt 中补充了运行说明、详细注释、环境准备指南，并修复了英语注释与中文内容风格不一致的问题。此阶段的主要挑战是“逐行中文注释”工作量较大，需要逐块核对关键模块，尤其是对齐与文本规范化两个核心文件。
+   - 关键决策：统一采用中文注释解释每一步算法意图，让初次接触的播主也能快速理解流程。
+   - 典型问题：在批量补注释时需确保不破坏 doctest/类型提示，因而采用“就地翻译 + 轻量补充”策略。
 5. **第 5 轮：EDL 音频渲染落地** —— 新增 `onepass.edl_renderer` 库模块、`scripts/edl_render.py` 命令行脚本与主菜单入口，实现按剪辑清单一键导出干净音频，同时补充文档与 5 分钟跑通示例。
+   - 关键决策：借助 `ffprobe` 探测时长、`ffmpeg concat` 拼接保留片段，并允许 `--dry-run` 输出命令供人工验证。
+   - 典型问题：遇到旧版 EDL 中 `actions`/`segments` 字段混用，需要在 Loader 层兼容并输出清晰错误信息。
 
 ## 程序用途与最终产出
 
@@ -27,6 +37,23 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 - 依赖：执行 `pip install -r requirements.txt` 安装；若需繁转简功能，额外安装 [OpenCC](https://github.com/BYVoid/OpenCC)。
 - 多媒体工具：`ffmpeg` 需在 PATH 中，以便按 EDL 渲染音频。
 - 字体/编码：所有文本文件使用 UTF-8 编码，避免 BOM 与零宽字符干扰。
+- 可选硬件：CPU 即可完成全部流程；若有 GPU，可在导出 ASR JSON 时使用更高性能的识别模型，但本项目不直接调用 GPU。
+
+### Python 环境快速搭建
+
+```bash
+python -m venv .venv           # 创建虚拟环境
+source .venv/bin/activate      # macOS/Linux
+# 或 .venv\Scripts\Activate   # Windows PowerShell
+pip install -U pip setuptools  # 升级基础工具
+pip install -r requirements.txt
+```
+
+如需启用繁转简：
+
+```bash
+pip install opencc
+```
 
 ## 必备素材与目录约定
 
@@ -43,6 +70,16 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 2. ASR JSON 使用 faster-whisper/Funasr 等可提供词级时间戳的格式（字段见 `onepass.asr_loader`）。
 3. 原稿文本已通过 `scripts/normalize_texts.py` 或 `scripts/normalize_original.py` 做过基本清洗，避免兼容字符与零宽字符干扰对齐。
 
+### 素材文件格式速查
+
+| 文件类型 | 必填字段 | 说明 |
+| --- | --- | --- |
+| `*.words.json` | `segments[].words[].{word/text,start,end}` | 每个词需包含文本与起止时间，单位推荐秒（浮点）。 |
+| 原稿 `*.txt` | 纯文本 | 建议使用 UTF-8 与 Unix 换行，配合规范化脚本可生成 `<stem>.norm.txt`。 |
+| 可选音频 | N/A | 支持 WAV/FLAC/M4A/AAC/MP3/OGG/WMA，程序会按优先级自动选取。 |
+
+> **提示**：如第三方工具导出 JSON 的字段命名不同，可先编写转换脚本适配到上述结构，或扩展 `onepass.asr_loader`。
+
 ## 运行流程速览
 
 1. **创建虚拟环境并安装依赖**（见下文“安装步骤”）。
@@ -52,6 +89,21 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 5. **查看输出**：处理完成后在 `out/` 目录查看字幕、EDL、报告与可选音频，并按照日志提示核对未对齐样例。
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
+
+### 从零开始的 5 分钟示例
+
+1. 在 `materials/example/` 准备 `demo.words.json`、`demo.txt` 与 `demo.wav`。
+2. （可选）运行 `python scripts/normalize_original.py --in materials/example --out out/norm` 生成 `demo.norm.txt`。
+3. 执行 `python onepass_main.py`，依次确认素材目录、输出目录、是否渲染音频等选项。
+4. 等待程序自动对齐并输出字幕/EDL/Markers/音频，终端会提示未对齐或低得分句子。
+5. 在 `out/` 目录查收 `demo.keepLast.srt`、`demo.keepLast.edl.json`、`demo.clean.wav` 等成果文件。
+
+### 常见问题（FAQ）
+
+- **提示缺少 opencc**：若需要繁转简，请 `pip install opencc`；如果无需该功能可忽略提示。
+- **ffmpeg/ffprobe 未找到**：确认已安装 [FFmpeg](https://ffmpeg.org/)，并将其加入 `PATH`。
+- **字幕为空或缺句**：检查 JSON 是否存在 `words` 字段及时间戳是否递增，可调整 `--score-threshold` 重新执行。
+- **批处理配对失败**：确保文件前缀完全一致（区分大小写），或在 CLI 中修改 `--glob-words`、`--glob-text` 模式。
 
 ## 统一命令行与整书批处理
 
