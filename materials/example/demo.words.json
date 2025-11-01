@@ -1,0 +1,32 @@
+{
+  "segments": [
+    {
+      "words": [
+        {"start": 0.0, "end": 0.6, "word": "第一"},
+        {"start": 0.6, "end": 1.2, "word": "行"},
+        {"start": 1.2, "end": 1.8, "word": "文本"}
+      ]
+    },
+    {
+      "words": [
+        {"start": 1.8, "end": 2.4, "word": "第二"},
+        {"start": 2.4, "end": 3.0, "word": "行"},
+        {"start": 3.0, "end": 3.6, "word": "文本"}
+      ]
+    },
+    {
+      "words": [
+        {"start": 3.6, "end": 4.2, "word": "第二"},
+        {"start": 4.2, "end": 4.8, "word": "行"},
+        {"start": 4.8, "end": 5.4, "word": "文本"}
+      ]
+    },
+    {
+      "words": [
+        {"start": 5.4, "end": 6.0, "word": "第三"},
+        {"start": 6.0, "end": 6.6, "word": "行"},
+        {"start": 6.6, "end": 7.2, "word": "文本"}
+      ]
+    }
+  ]
+}

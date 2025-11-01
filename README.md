@@ -53,10 +53,75 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
 
+## 保留最后一遍流程
+
+### 输入与输出概览
+
+- **输入**：词级 ASR JSON（支持 faster-whisper/Funasr 等含 `segments[].words[]` 或顶层 `words[]` 字段）、原文 TXT（一行一“句”）。
+- **输出**：
+  - `<stem>.keepLast.srt` —— 仅保留每行最后一次出现的字幕，时间戳顺序整理完毕；
+  - `<stem>.keepLast.txt` —— 对应文本稿；
+  - `<stem>.keepLast.edl.json` —— action=`"keep"` 的 EDL，可直接喂给 `scripts/edl_render.py`；
+  - `<stem>.audition_markers.csv` —— Adobe Audition 标记。
+
+### 词级 JSON 支持的字段
+
+常见结构示例（可直接与本仓库提供的 `materials/example/demo.words.json` 对照）：
+
+```json
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 2.2,
+      "words": [
+        {"start": 0.0, "end": 0.6, "word": "第一"},
+        {"start": 0.6, "end": 1.2, "word": "行"},
+        {"start": 1.2, "end": 1.8, "word": "文本"}
+      ]
+    }
+  ]
+}
+```
+
+字段名 `word`/`text` 皆可，内部会自动 `strip()` 前后空格并跳过缺失时间戳的词。若时间戳不是递增，会自动稳定排序并在元数据中记录修复信息。
+
+### 原文 TXT 的建议格式
+
+- 建议“一行一段”，方便识别重录；
+- 保持与录音内容的实际顺序一致，避免跨行换位；
+- 可保留标点，适配层会在内部统一规范化。
+
+### 回退匹配与局限
+
+当严格子串匹配失败时，会回退到最长公共子串（LCS）策略；若命中长度 ≥ 原行的 80%，则视为近似成功。对于极端情况（大量口误、缺词或文本顺序与录音严重不符），仍可能需要人工干预或重新导出 ASR JSON。
+
+### 最小示例
+
+仓库已收录 `materials/example/demo.txt` 与 `materials/example/demo.words.json`，演示“第二行重复录制，仅保留最后一遍”的效果：
+
+```bash
+python scripts/retake_keep_last.py \
+  --words-json materials/example/demo.words.json \
+  --text materials/example/demo.txt \
+  --out out
+```
+
+成功后可在 `out/` 中查看 `demo.keepLast.srt`、`demo.keepLast.txt`、`demo.keepLast.edl.json` 与 `demo.audition_markers.csv`。若需立即渲染音频，可继续执行：
+
+```bash
+python scripts/edl_render.py \
+  --edl out/demo.keepLast.edl.json \
+  --audio-root materials \
+  --out out
+```
+
+或在主菜单中选择 `[K]` 进入单文件流程，再将生成的 EDL 交给 `[R]` 选项完成音频裁剪。
+
 ## 功能清单（当前与计划）
 
 - 去口癖（可配置词表），流畅断句（SRT/VTT/TXT）
-- “同句保留最后一遍、删除前面重录”
+- [x] ASR 适配层 + 保留最后一遍策略
 - 生成 EDL（剪辑清单）与 Adobe Audition 标记 CSV
 - （已实现）按 EDL 一键导出干净音频
 - 批处理整本书与汇总报告（后续补上）
@@ -283,6 +348,7 @@ python onepass_main.py
 
 ## 更新日志
 
+- 2025-11-02：新增统一 ASR 适配层、`scripts/retake_keep_last.py`、主菜单 `[K]` 单文件流程与示例素材，提供“保留最后一遍”一站式导出。
 - 2025-11-01：新增 `onepass.edl_renderer` 模块与 `scripts/edl_render.py`，主菜单支持按 EDL 渲染干净音频，并补充文档示例与最小跑通流程。
 
 ## 路线图

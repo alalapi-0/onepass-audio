@@ -23,6 +23,13 @@ from onepass.edl_renderer import (  # 引入音频渲染相关工具
 from onepass.markers import write_audition_markers  # 引入写入 Audition 标记的工具
 from onepass.pipeline import PreparedSentences, prepare_sentences  # 引入句子预处理逻辑
 from onepass.textnorm import Sentence  # 引入规范化后的句子结构
+from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需函数
+    compute_retake_keep_last,
+    export_audition_markers,
+    export_edl_json,
+    export_srt,
+    export_txt,
+)
 from onepass.ux import (  # 引入命令行交互的工具函数
     print_error,  # 打印错误信息的工具
     print_header,  # 打印分组标题的工具
@@ -516,11 +523,15 @@ def main() -> None:  # CLI 主入口
 
     print_header("主菜单")  # 显示主菜单标题
     print_info("[1] 批量处理素材，生成字幕/EDL/标记")
+    print_info("[K] 单文件：词级 JSON + 原文 → SRT/TXT/EDL/Markers")
     print_info("[R] 按 EDL 渲染干净音频")
     print_info("[Q] 退出程序")
 
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
     choice_lower = choice.lower()
+    if choice_lower == "k":  # 进入单文件保留最后一遍流程
+        _run_retake_keep_last_menu()
+        return
     if choice_lower == "r":  # 仅执行音频渲染
         _run_edl_render_menu()
         return
@@ -583,3 +594,78 @@ if __name__ == "__main__":  # 作为脚本运行时执行主流程
         main()  # 运行主函数
     except KeyboardInterrupt:  # 捕获 Ctrl+C 中断
         print_error("操作已取消。")  # 提示用户操作已终止
+def _derive_single_stem(words_path: Path, text_path: Path) -> str:  # 计算单文件流程的输出前缀
+    stem = words_path.stem  # 默认采用词级 JSON 的文件名前缀
+    if stem.endswith(".words"):  # 移除常见的 .words 后缀
+        stem = stem[:-6]
+    if not stem:  # 如果 JSON 名称为空则退回原文 TXT 的前缀
+        stem = text_path.stem
+    return stem or "output"  # 兜底使用 output
+
+
+def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”处理流程
+    print_header("词级 JSON + 原文 → SRT/TXT/EDL/Markers（保留最后一遍）")  # 显示步骤标题
+
+    json_path = prompt_existing_file("拖拽或输入词级 ASR JSON 路径")  # 获取词级 JSON
+    txt_path = prompt_existing_file("拖拽或输入原文 TXT 路径")  # 获取原文 TXT
+
+    out_default = DEFAULT_OUT_DIR if DEFAULT_OUT_DIR.exists() else ROOT_DIR / "out"  # 输出目录默认值
+    out_raw = _clean_input_path(  # 询问输出目录
+        prompt_text(
+            "输出目录 (不存在会自动创建)",
+            default=str(out_default),
+            allow_empty=False,
+        )
+    )
+    out_dir = Path(out_raw).expanduser().resolve()  # 解析成绝对路径
+    out_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
+
+    try:
+        doc = load_words(json_path)  # 加载词级 JSON
+    except Exception as exc:  # pragma: no cover - 交互流程
+        print_error(f"加载词级 JSON 失败: {exc}")
+        return
+
+    try:
+        result = compute_retake_keep_last(list(doc), txt_path)  # 计算保留最后一遍
+    except Exception as exc:  # pragma: no cover - 交互流程
+        print_error(f"计算保留最后一遍失败: {exc}")
+        return
+
+    stem = _derive_single_stem(json_path, txt_path)  # 推导输出文件前缀
+
+    srt_path = out_dir / f"{stem}.keepLast.srt"  # 字幕路径
+    txt_out_path = out_dir / f"{stem}.keepLast.txt"  # 文本路径
+    markers_path = out_dir / f"{stem}.audition_markers.csv"  # 标记路径
+    edl_path = out_dir / f"{stem}.keepLast.edl.json"  # EDL 路径
+
+    export_srt(result.keeps, srt_path)  # 导出字幕
+    export_txt(result.keeps, txt_out_path)  # 导出文本
+    export_audition_markers(result.keeps, markers_path)  # 导出 Audition 标记
+    export_edl_json(result.edl_keep_segments, None, edl_path)  # 导出 EDL，源音频留空待后续指定
+
+    stats = result.stats  # 读取统计信息
+    print_info(
+        "总词数 {total_words}，匹配行数 {matched_lines}，严格匹配 {strict_matches}，"
+        "LCS 回退 {fallback_matches}，未匹配 {unmatched_lines}".format(**stats)
+    )  # 打印统计摘要
+
+    print_success(f"已生成字幕: {srt_path}")  # 回显各产物路径
+    print_success(f"已生成文本: {txt_out_path}")
+    print_success(f"已生成 Audition 标记: {markers_path}")
+    print_success(f"已生成 EDL: {edl_path}")
+
+    script_path = ROOT_DIR / "scripts" / "retake_keep_last.py"  # 构建 CLI 命令用于复用
+    if script_path.exists():
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--words-json",
+            str(json_path),
+            "--text",
+            str(txt_path),
+            "--out",
+            str(out_dir),
+        ]
+        print_info(f"等价 CLI: {shlex.join(cmd)}")  # 打印便于批处理的命令
+
