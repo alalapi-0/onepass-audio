@@ -1,32 +1,49 @@
 {
   "segments": [
     {
+      "start": 0.00,
+      "end": 2.40,
       "words": [
-        {"start": 0.0, "end": 0.6, "word": "第一"},
-        {"start": 0.6, "end": 1.2, "word": "行"},
-        {"start": 1.2, "end": 1.8, "word": "文本"}
+        {"start": 0.00, "end": 0.40, "word": "第"},
+        {"start": 0.40, "end": 0.80, "word": "一"},
+        {"start": 0.80, "end": 1.20, "word": "行"},
+        {"start": 1.20, "end": 1.60, "word": "文"},
+        {"start": 1.60, "end": 2.00, "word": "本"}
       ]
     },
     {
+      "start": 2.50,
+      "end": 4.90,
       "words": [
-        {"start": 1.8, "end": 2.4, "word": "第二"},
-        {"start": 2.4, "end": 3.0, "word": "行"},
-        {"start": 3.0, "end": 3.6, "word": "文本"}
+        {"start": 2.50, "end": 2.90, "word": "第"},
+        {"start": 2.90, "end": 3.30, "word": "二"},
+        {"start": 3.30, "end": 3.70, "word": "行"},
+        {"start": 3.70, "end": 4.10, "word": "文"},
+        {"start": 4.10, "end": 4.50, "word": "本"}
       ]
     },
     {
+      "start": 5.00,
+      "end": 7.40,
       "words": [
-        {"start": 3.6, "end": 4.2, "word": "第二"},
-        {"start": 4.2, "end": 4.8, "word": "行"},
-        {"start": 4.8, "end": 5.4, "word": "文本"}
+        {"start": 5.00, "end": 5.40, "word": "第"},
+        {"start": 5.40, "end": 5.80, "word": "三"},
+        {"start": 5.80, "end": 6.20, "word": "行"},
+        {"start": 6.20, "end": 6.60, "word": "文"},
+        {"start": 6.60, "end": 7.00, "word": "本"}
       ]
     },
     {
+      "start": 7.50,
+      "end": 9.90,
       "words": [
-        {"start": 5.4, "end": 6.0, "word": "第三"},
-        {"start": 6.0, "end": 6.6, "word": "行"},
-        {"start": 6.6, "end": 7.2, "word": "文本"}
+        {"start": 7.50, "end": 7.90, "word": "第"},
+        {"start": 7.90, "end": 8.30, "word": "二"},
+        {"start": 8.30, "end": 8.70, "word": "行"},
+        {"start": 8.70, "end": 9.10, "word": "文"},
+        {"start": 9.10, "end": 9.50, "word": "本"}
       ]
     }
-  ]
+  ],
+  "meta": {"note": "第二行文本重复，最后一遍在 7.50s~9.90s"}
 }

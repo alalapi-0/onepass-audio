@@ -1,5 +1,47 @@
 # OnePass Audio — 录完即净，一遍过
 
+## 5 分钟跑通
+
+### 快速前置
+
+- 安装 Python 3.10 及以上版本，建议使用虚拟环境隔离依赖。
+- 确保 `ffmpeg` 与 `ffprobe` 在 PATH 中（用于生成演示音频与最终渲染）。
+- （可选）安装 `opencc`，以启用繁简转换提示。
+
+### 一键跑通
+
+- **Windows**：
+  - `python scripts/smoke_test.py`
+  - 或 `powershell -ExecutionPolicy Bypass -File .\scripts\demo_run.ps1`
+- **Linux / macOS**：
+  - `python scripts/smoke_test.py`
+  - 或 `bash scripts/demo_run.sh`
+    - 首次运行前请执行 `chmod +x scripts/demo_run.sh`
+
+### 将看到的产物
+
+- 文本类：`out/demo.keepLast.srt`、`out/demo.keepLast.txt`、`out/demo.audition_markers.csv`、`out/demo.keepLast.edl.json`
+- 若系统已安装 `ffmpeg`：`out/demo.clean.wav`
+
+### 若出现问题
+
+- 运行环境自检：`python scripts/env_check.py --out out --verbose`
+- 提交 issue 时附带 `out/env_report.json` 与 `out/logs/...` 中的日志片段，有助于快速定位问题。
+
+### 示例数据说明
+
+- 仓库仅收录 `materials/example/demo.txt` 与 `materials/example/demo.words.json` 两个文本示例。
+- 演示音频 `materials/example/demo.wav` 由脚本在本地即时生成，不会随仓库提交。
+
+### 轮次能力串联演示（第 1～5 轮）
+
+1. **第 1 轮：目录骨架与交互主程序** —— 运行 `python onepass_main.py` 体验主菜单与交互流程。
+2. **第 2 轮：保留最后一遍策略** —— 运行 `python scripts/retake_keep_last.py --words-json materials/example/demo.words.json --text materials/example/demo.txt --out out`，生成字幕、文本、EDL 与 Audition 标记。
+3. **第 3 轮：统一 CLI 与批处理** —— 使用 `python scripts/onepass_cli.py all-in-one --materials materials --out out`，串联规范化、保留最后一遍与（可选）渲染。
+4. **第 4 轮：环境自检与日志** —— `python scripts/env_check.py --out out --verbose`，核对依赖、PATH 与读写权限，同时掌握日志目录位置。
+5. **第 5 轮：EDL 音频渲染** —— `python scripts/edl_render.py --edl out/demo.keepLast.edl.json --audio-root materials/example --out out --samplerate 48000 --channels 1`；若想自动补齐 `source_audio`，可先运行 `python scripts/edl_set_source.py --edl out/demo.keepLast.edl.json --source materials/example/demo.wav`。
+6. **综合示例** —— `python scripts/smoke_test.py` 会自动完成上述关键步骤的最小闭环演示。
+
 本项目是一键生成去口癖、保留“同句最后一遍”的干净字幕，并可选按剪辑清单导出干净音频的工具集（MVP）。
 
 ## 构建历程（Prompt 演进纪要）
@@ -16,7 +58,7 @@
 4. **第 4 轮：文档完善与可用性增强** —— 在最新 Prompt 中补充了运行说明、详细注释、环境准备指南，并修复了英语注释与中文内容风格不一致的问题。此阶段的主要挑战是“逐行中文注释”工作量较大，需要逐块核对关键模块，尤其是对齐与文本规范化两个核心文件。
    - 关键决策：统一采用中文注释解释每一步算法意图，让初次接触的播主也能快速理解流程。
    - 典型问题：在批量补注释时需确保不破坏 doctest/类型提示，因而采用“就地翻译 + 轻量补充”策略。
-5. **第 5 轮：EDL 音频渲染落地** —— 新增 `onepass.edl_renderer` 库模块、`scripts/edl_render.py` 命令行脚本与主菜单入口，实现按剪辑清单一键导出干净音频，同时补充文档与 5 分钟跑通示例。
+5. **第 5 轮：EDL 音频渲染落地** —— 新增 `onepass.edl_renderer` 库模块、`scripts/edl_render.py` 命令行脚本、`scripts/edl_set_source.py` 辅助工具与 `scripts/smoke_test.py` 最小示例，实现按剪辑清单一键导出干净音频，并完善“5 分钟跑通”文档。
    - 关键决策：借助 `ffprobe` 探测时长、`ffmpeg concat` 拼接保留片段，并允许 `--dry-run` 输出命令供人工验证。
    - 典型问题：遇到旧版 EDL 中 `actions`/`segments` 字段混用，需要在 Loader 层兼容并输出清晰错误信息。
 
@@ -90,13 +132,13 @@ pip install opencc
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
 
-### 从零开始的 5 分钟示例
+### 从零开始的进阶演示
 
-1. 在 `materials/example/` 准备 `demo.words.json`、`demo.txt` 与 `demo.wav`。
-2. （可选）运行 `python scripts/normalize_original.py --in materials/example --out out/norm` 生成 `demo.norm.txt`。
-3. 执行 `python onepass_main.py`，依次确认素材目录、输出目录、是否渲染音频等选项。
-4. 等待程序自动对齐并输出字幕/EDL/Markers/音频，终端会提示未对齐或低得分句子。
-5. 在 `out/` 目录查收 `demo.keepLast.srt`、`demo.keepLast.edl.json`、`demo.clean.wav` 等成果文件。
+1. 运行 `python scripts/smoke_test.py`（或 `bash scripts/demo_run.sh` / `powershell -File scripts/demo_run.ps1`）验证最小示例可以无配置跑通。
+2. 打开 `out/demo.keepLast.edl.json` 与 `out/demo.audition_markers.csv`，观察“保留最后一遍”策略如何仅留下第二次朗读的片段。
+3. 若需进一步体验交互流程，可执行 `python onepass_main.py`，按菜单提示选择素材目录、输出目录与是否渲染音频。
+4. 结合 `python scripts/onepass_cli.py all-in-one --materials materials/example --out out/cli_demo` 感受批处理汇总与报告输出。
+5. 对于自有素材，可先运行 `python scripts/normalize_original.py --in <your_dir> --out out/norm` 完成规范化，再重复以上步骤。
 
 ### 常见问题（FAQ）
 
@@ -275,6 +317,7 @@ python scripts/edl_render.py \
 - [x] 原文规范化（可配置）
 - [x] 统一命令行与批处理报告（含整书汇总）
 - [x] 环境自检与统一日志
+- [x] 示例与 5 分钟跑通脚本（`scripts/smoke_test.py` + `scripts/demo_run.*`）
 
 ## 目录结构
 
@@ -544,6 +587,7 @@ python onepass_main.py
 
 ## 更新日志
 
+- 2025-11-06：补齐 `materials/example/` 文本示例，新增 `scripts/smoke_test.py`、`scripts/edl_set_source.py` 及跨平台包装脚本，完善 README《5 分钟跑通》。
 - 2025-11-05：新增 `scripts/env_check.py` 环境自检脚本、统一日志工具，并在主菜单/CLI 接入日志，补充排障文档。
 - 2025-11-04：新增 `scripts/onepass_cli.py` 统一命令行、`onepass/batch_utils.py` 批处理工具以及主菜单 `[A]` 一键流水线入口，覆盖整书批处理与报告输出。
 - 2025-11-03：新增 `config/default_char_map.json`、`scripts/normalize_original.py` 与主菜单 `[P]` 原文规范化入口，提供可配置管线与归一报表。
