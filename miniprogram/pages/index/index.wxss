@@ -1,0 +1,43 @@
+/* /miniprogram/pages/index/index.wxss */
+/* 说明：简单居中布局与文本样式 */
+
+page { background: #faf8ef; }
+
+.wrap {
+  min-height: 100vh;               /* 填满屏幕高度 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 24rpx;
+  padding: 24rpx;
+  box-sizing: border-box;
+}
+
+.row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 16rpx;
+}
+
+.title {
+  font-size: 36rpx;
+  font-weight: 700;
+  color: #776e65;
+}
+
+.meta, .score {
+  color: #776e65;
+  font-size: 28rpx;
+}
+
+.btn {
+  padding: 10rpx 24rpx;
+  border: 1rpx solid #bbb;
+  border-radius: 12rpx;
+  background: #fff;
+  color: #333;
+}
