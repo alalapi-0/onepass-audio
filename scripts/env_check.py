@@ -1,0 +1,373 @@
+"""环境自检脚本。
+
+用法示例::
+
+    python scripts/env_check.py --out out --verbose
+
+该脚本会检测 Python 版本、虚拟环境状态、关键外部工具以及常用目录的读写权限，
+并输出人类可读摘要与 JSON 报告，帮助排查常见部署问题。
+"""
+
+from __future__ import annotations
+
+import argparse  # 解析命令行参数
+import json  # 写入 JSON 报告
+import os  # 访问环境变量与权限
+import platform  # 获取平台信息
+import shutil  # 探测命令可执行文件
+import subprocess  # 调用外部命令获取版本信息
+import sys  # 获取解释器信息
+from dataclasses import dataclass  # 结构化存储检查结果
+from datetime import datetime  # 生成报告时间戳
+from pathlib import Path  # 统一路径处理
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class CheckItem:
+    """单项检查的摘要结果。"""
+
+    name: str  # 检查项名称
+    status: str  # 状态：ok/warn/fail
+    detail: str  # 简要说明
+    advice: str  # 修复建议
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """解析命令行参数。"""
+
+    # 创建解析器并描述脚本用途
+    parser = argparse.ArgumentParser(description="OnePass Audio 环境自检工具")
+    # 指定报告输出目录，默认 out
+    parser.add_argument("--out", default="out", help="报告输出目录 (默认 out)")
+    # 允许自定义 JSON 文件名
+    parser.add_argument("--json", help="自定义 JSON 报告文件名 (默认 env_report.json)")
+    # 控制是否打印额外调试信息
+    parser.add_argument("--verbose", action="store_true", help="打印详细检查过程")
+    # 返回解析结果
+    return parser.parse_args(argv)
+
+
+def _run_command(command: List[str], verbose: bool) -> tuple[int, str]:
+    """运行外部命令并返回退出码与输出。"""
+
+    # 当 verbose 开启时，先打印命令以便复现
+    if verbose:
+        print(f"执行命令: {' '.join(command)}")
+    try:
+        # 捕获标准输出与错误输出，统一返回文本
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        # 命令启动失败时返回错误信息
+        return 1, str(exc)
+    # 将 stdout 与 stderr 合并，兼容 ffmpeg 只写 stderr 的行为
+    output = (completed.stdout or "") + (completed.stderr or "")
+    # 在 verbose 模式下打印退出码
+    if verbose:
+        print(f"返回码: {completed.returncode}")
+    return completed.returncode, output.strip()
+
+
+def _check_python() -> tuple[Dict[str, Any], CheckItem]:
+    """检查 Python 版本与虚拟环境状态。"""
+
+    # 读取当前解释器版本信息
+    version_info = sys.version_info
+    version_str = platform.python_version()
+    # 判断是否满足 3.10+ 要求
+    meets_requirement = version_info >= (3, 10)
+    # 判断当前是否处于虚拟环境中
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    # 根据版本结果确定状态
+    status = "ok" if meets_requirement else "fail"
+    # 构造提示详情
+    detail = f"Python {version_str} ({'venv' if in_venv else 'system'})"
+    # 若版本不足则给出升级建议
+    advice = "" if meets_requirement else "请使用 Python 3.10 或更高版本。"
+    # 构建 JSON 片段
+    payload = {
+        "version": version_str,
+        "ok": meets_requirement,
+        "in_venv": in_venv,
+    }
+    # 返回 JSON 数据与摘要项
+    return payload, CheckItem("Python 版本", status, detail, advice)
+
+
+def _check_tool(tool: str, verbose: bool, required: bool) -> tuple[Dict[str, Any], CheckItem, Optional[str]]:
+    """检测外部工具的可用性。"""
+
+    # 首先通过 PATH 查找可执行文件
+    path = shutil.which(tool)
+    if not path:
+        # 未找到时根据是否关键工具设置状态
+        status = "fail" if required else "warn"
+        detail = "未在 PATH 中找到"
+        advice = f"请安装 {tool} 并确认其在 PATH 中可用。" if required else f"未安装 {tool}，相关功能将被跳过。"
+        note = None if required else f"{tool} 未安装，相关功能将被跳过"
+        return {"found": False}, CheckItem(tool, status, detail, advice), note
+
+    # 记录找到的可执行文件路径
+    version_info = {"found": True, "path": path}
+    # 调用 -version 获取版本字符串
+    code, output = _run_command([path, "-version"], verbose)
+    if code == 0 and output:
+        version_info["version"] = output.splitlines()[0]
+        detail = version_info["version"]
+        status = "ok"
+        advice = ""
+        note = None
+    else:
+        # 版本命令失败也视为警告
+        detail = "版本查询失败"
+        status = "warn" if not required else "fail"
+        advice = f"运行 {tool} -version 失败: {output}".strip()
+        note = advice if status != "ok" else None
+    return version_info, CheckItem(tool, status, detail, advice), note
+
+
+def _test_writable(path: Path) -> bool:
+    """通过创建临时文件判断目录是否可写。"""
+
+    try:
+        # 创建临时文件并立即删除，验证写入权限
+        test_file = path / ".env_check_write_test"
+        test_file.write_text("test", encoding="utf-8")
+        test_file.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _check_paths(out_dir: Path) -> tuple[Dict[str, Any], List[CheckItem], List[str]]:
+    """检查输出与素材目录状态。"""
+
+    # 初始化结果字典
+    paths_info: Dict[str, Any] = {}
+    rows: List[CheckItem] = []
+    notes: List[str] = []
+
+    # 检查 out 目录
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        detail = f"创建失败: {exc}"
+        rows.append(CheckItem("输出目录", "fail", detail, "请检查路径是否存在权限限制或被占用。"))
+        paths_info["out"] = {"path": str(out_dir), "writable": False, "error": detail}
+        return paths_info, rows, notes
+
+    writable = _test_writable(out_dir)
+    paths_info["out"] = {"path": str(out_dir), "writable": writable}
+    if writable:
+        rows.append(CheckItem("输出目录", "ok", f"{out_dir}", ""))
+    else:
+        rows.append(CheckItem("输出目录", "fail", f"{out_dir}", "请为该目录授予写权限或选择其他位置。"))
+
+    # materials 目录可选检查
+    materials_dir = Path("materials").resolve()
+    if materials_dir.exists():
+        readable = os.access(materials_dir, os.R_OK)
+        writable_materials = os.access(materials_dir, os.W_OK)
+        paths_info["materials"] = {
+            "path": str(materials_dir),
+            "readable": bool(readable),
+            "writable": bool(writable_materials),
+        }
+        status = "ok" if readable else "warn"
+        advice = "" if readable else "请检查目录访问权限。"
+        detail = "可读写" if readable and writable_materials else (
+            "仅可读" if readable else "不可读"
+        )
+        rows.append(CheckItem("素材目录", status, detail, advice))
+        if not writable_materials:
+            notes.append("materials 目录不可写，部分脚本可能无法缓存中间文件。")
+    else:
+        paths_info["materials"] = {"path": str(materials_dir), "exists": False}
+        rows.append(CheckItem("素材目录", "warn", "未找到 materials/ 目录", "根据需要创建或指定素材路径。"))
+
+    return paths_info, rows, notes
+
+
+def _check_windows_path_hints(out_dir: Path, raw_out: str) -> List[CheckItem]:
+    """在 Windows 平台输出额外路径提示。"""
+
+    rows: List[CheckItem] = []
+    # 检测命令行参数中是否包含制表符等控制字符，提示可能的转义问题
+    if any(ord(ch) < 32 for ch in raw_out if ch not in {"\t", "\n"}):
+        rows.append(
+            CheckItem(
+                "Windows 路径",
+                "warn",
+                "检测到控制字符，可能因未正确转义反斜杠。",
+                "请在命令行中使用双反斜杠或加引号。",
+            )
+        )
+
+    # 检查路径各部分是否以空格或点结尾
+    trailing_issue = any(part.endswith(" ") or part.endswith(".") for part in out_dir.parts)
+    if trailing_issue:
+        rows.append(
+            CheckItem(
+                "Windows 路径",
+                "warn",
+                "路径包含以空格或点结尾的片段。",
+                "建议调整目录名称，避免 Windows 自动截断。",
+            )
+        )
+
+    # 检查长路径策略
+    try:
+        import winreg  # type: ignore
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\FileSystem",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "LongPathsEnabled")
+            if value != 1:
+                rows.append(
+                    CheckItem(
+                        "长路径支持",
+                        "warn",
+                        "未启用 LongPathsEnabled。",
+                        "可参考微软文档启用长路径策略，避免处理超长路径时失败。",
+                    )
+                )
+    except Exception:
+        rows.append(
+            CheckItem(
+                "长路径支持",
+                "warn",
+                "无法检测 LongPathsEnabled 状态。",
+                "请在本地组策略或注册表中确认已启用长路径。",
+            )
+        )
+    return rows
+
+
+def _print_summary_table(items: List[CheckItem]) -> None:
+    """以表格形式打印检查摘要。"""
+
+    if not items:
+        return
+
+    # 计算各列宽度以对齐输出
+    name_width = max(len(item.name) for item in items) + 2
+    status_width = max(len(item.status) for item in items) + 2
+
+    header = f"{'项目'.ljust(name_width)}{'状态'.ljust(status_width)}详情 / 建议"
+    separator = "-" * len(header)
+    print(separator)
+    print(header)
+    print(separator)
+    for item in items:
+        detail = item.detail
+        if item.advice:
+            detail = f"{detail} ｜ 建议: {item.advice}"
+        print(f"{item.name.ljust(name_width)}{item.status.ljust(status_width)}{detail}")
+    print(separator)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """脚本入口，负责 orchestrate 所有检查并输出结果。"""
+
+    # 解析命令行参数
+    args = _parse_args(argv)
+    out_dir = Path(args.out).expanduser().resolve()
+
+    # 初始化整体结果字典
+    report: Dict[str, Any] = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    # 平台信息
+    platform_info = {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+    }
+    report["platform"] = platform_info
+
+    # 收集摘要条目与备注
+    summary_items: List[CheckItem] = []
+    notes: List[str] = []
+
+    # Python 检查
+    python_info, python_item = _check_python()
+    report["python"] = python_info
+    summary_items.append(python_item)
+
+    # 工具检查
+    tools_payload: Dict[str, Any] = {}
+    for tool, required in (("ffmpeg", True), ("ffprobe", True), ("opencc", False)):
+        info, item, note = _check_tool(tool, args.verbose, required)
+        tools_payload[tool] = info
+        summary_items.append(item)
+        if note:
+            notes.append(note)
+    report["tools"] = tools_payload
+
+    # 路径检查
+    paths_info, path_items, path_notes = _check_paths(out_dir)
+    report["paths"] = paths_info
+    summary_items.extend(path_items)
+    notes.extend(path_notes)
+
+    # Windows 特殊提示
+    if platform_info["system"].lower() == "windows":
+        win_items = _check_windows_path_hints(out_dir, args.out)
+        summary_items.extend(win_items)
+
+    # 计算整体状态
+    has_fail = any(item.status == "fail" for item in summary_items)
+    has_warn = any(item.status == "warn" for item in summary_items)
+    report["summary"] = {
+        "ok": not has_fail,
+        "has_warning": has_warn,
+        "notes": notes,
+    }
+    report["checks"] = [
+        {
+            "name": item.name,
+            "status": item.status,
+            "detail": item.detail,
+            "advice": item.advice,
+        }
+        for item in summary_items
+    ]
+
+    if notes:
+        print("提示:")
+        for note in notes:
+            print(f" - {note}")
+
+    # 打印摘要表格
+    _print_summary_table(summary_items)
+
+    # 写入 JSON 报告
+    json_name = args.json or "env_report.json"
+    json_path = out_dir / json_name
+    try:
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:
+        print(f"写入 JSON 报告失败: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"JSON 报告已写入: {json_path}")
+
+    # 根据结果返回退出码
+    if has_fail:
+        return 1
+    if has_warn:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI 脚本入口
+    raise SystemExit(main())
+

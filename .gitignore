@@ -28,3 +28,4 @@ Thumbs.db
 *.flac
 *.bak
 out/textnorm_report*.md
+/out/logs/
