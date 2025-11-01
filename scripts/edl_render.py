@@ -82,8 +82,19 @@ def main() -> None:
     print(f"输出文件: {out_path}")
     print(f"片段数量: {len(keeps)}，累计保留时长: {keep_duration:.3f}s")
 
-    samplerate = args.samplerate or edl.samplerate  # 计算实际采样率
-    channels = args.channels or edl.channels  # 计算实际声道数
+    override_samplerate = args.samplerate  # 记录用户是否显式设置采样率
+    override_channels = args.channels  # 记录用户是否显式设置声道数
+    samplerate = override_samplerate or edl.samplerate  # 计算实际使用的采样率
+    channels = override_channels or edl.channels  # 计算实际使用的声道数
+
+    if override_samplerate is not None:
+        print(f"目标采样率: {samplerate} Hz（命令行指定）")
+    elif samplerate is not None:
+        print(f"目标采样率: {samplerate} Hz（来自 EDL 建议）")
+    if override_channels is not None:
+        print(f"目标声道数: {channels}（命令行指定）")
+    elif channels is not None:
+        print(f"目标声道数: {channels}（来自 EDL 建议）")
 
     if args.dry_run:
         try:
@@ -91,8 +102,8 @@ def main() -> None:
                 edl_path,
                 audio_root,
                 out_dir,
-                samplerate,
-                channels,
+                override_samplerate,
+                override_channels,
                 dry_run=True,
             )
             logger.info("Dry-run 已输出渲染命令")
@@ -107,8 +118,8 @@ def main() -> None:
             edl_path,
             audio_root,
             out_dir,
-            samplerate,
-            channels,
+            override_samplerate,
+            override_channels,
             dry_run=False,
         )
     except Exception as exc:
