@@ -12,6 +12,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed  # 批处理并�
 from pathlib import Path  # 跨平台路径处理
 from typing import Optional, Sequence, Tuple
 
+# 计算项目根目录，确保脚本可直接运行
+ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
+if str(ROOT_DIR) not in sys.path:  # 若根目录未在 sys.path 中则插入
+    sys.path.insert(0, str(ROOT_DIR))
+
 from onepass.asr_loader import load_words  # 载入词级 JSON
 from onepass.batch_utils import (  # 批处理通用工具
     find_text_for_stem,
@@ -43,7 +48,6 @@ from onepass.text_norm import (  # 规范化工具
 from onepass.logging_utils import default_log_dir, setup_logger
 
 
-ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
