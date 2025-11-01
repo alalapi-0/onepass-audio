@@ -30,7 +30,7 @@ class CheckItem:
     name: str  # 检查项名称
     status: str  # 状态：ok/warn/fail
     detail: str  # 简要说明
-    advice: str  # 修复建议
+    advice: str  # 修复建议，可为空字符串
 
 
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -73,7 +73,7 @@ def _run_command(command: List[str], verbose: bool) -> tuple[int, str]:
     return completed.returncode, output.strip()
 
 
-def _check_python() -> tuple[Dict[str, Any], CheckItem]:
+def _check_python() -> tuple[Dict[str, Any], List[CheckItem], List[str]]:
     """检查 Python 版本与虚拟环境状态。"""
 
     # 读取当前解释器版本信息
@@ -83,20 +83,32 @@ def _check_python() -> tuple[Dict[str, Any], CheckItem]:
     meets_requirement = version_info >= (3, 10)
     # 判断当前是否处于虚拟环境中
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-    # 根据版本结果确定状态
-    status = "ok" if meets_requirement else "fail"
-    # 构造提示详情
-    detail = f"Python {version_str} ({'venv' if in_venv else 'system'})"
-    # 若版本不足则给出升级建议
-    advice = "" if meets_requirement else "请使用 Python 3.10 或更高版本。"
+    # 构造版本检查摘要
+    version_item = CheckItem(
+        "Python 版本",
+        "ok" if meets_requirement else "fail",
+        f"当前版本 {version_str}",
+        "" if meets_requirement else "请使用 Python 3.10 或更高版本。",
+    )
+    # 构造虚拟环境提示
+    venv_item = CheckItem(
+        "虚拟环境",
+        "ok" if in_venv else "warn",
+        "已启用 venv" if in_venv else "当前使用系统解释器",
+        "" if in_venv else "建议使用 python -m venv 隔离依赖。",
+    )
+    # 缺少虚拟环境时追加提醒
+    notes: List[str] = []
+    if not in_venv:
+        notes.append("未检测到虚拟环境，后续安装依赖可能影响系统 Python。")
     # 构建 JSON 片段
     payload = {
         "version": version_str,
         "ok": meets_requirement,
         "in_venv": in_venv,
     }
-    # 返回 JSON 数据与摘要项
-    return payload, CheckItem("Python 版本", status, detail, advice)
+    # 返回 JSON 数据、摘要项列表与备注
+    return payload, [version_item, venv_item], notes
 
 
 def _check_tool(tool: str, verbose: bool, required: bool) -> tuple[Dict[str, Any], CheckItem, Optional[str]]:
@@ -108,8 +120,12 @@ def _check_tool(tool: str, verbose: bool, required: bool) -> tuple[Dict[str, Any
         # 未找到时根据是否关键工具设置状态
         status = "fail" if required else "warn"
         detail = "未在 PATH 中找到"
-        advice = f"请安装 {tool} 并确认其在 PATH 中可用。" if required else f"未安装 {tool}，相关功能将被跳过。"
-        note = None if required else f"{tool} 未安装，相关功能将被跳过"
+        advice = (
+            f"请安装 {tool} 并确认其在 PATH 中可用。"
+            if required
+            else f"未安装 {tool}，相关功能将被跳过。"
+        )
+        note = None if required else f"{tool} 未安装，繁简转换等依赖将被跳过。"
         return {"found": False}, CheckItem(tool, status, detail, advice), note
 
     # 记录找到的可执行文件路径
@@ -157,16 +173,40 @@ def _check_paths(out_dir: Path) -> tuple[Dict[str, Any], List[CheckItem], List[s
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         detail = f"创建失败: {exc}"
-        rows.append(CheckItem("输出目录", "fail", detail, "请检查路径是否存在权限限制或被占用。"))
-        paths_info["out"] = {"path": str(out_dir), "writable": False, "error": detail}
+        rows.append(
+            CheckItem(
+                "输出目录",
+                "fail",
+                detail,
+                "请检查路径是否存在权限限制或被占用。",
+            )
+        )
+        paths_info["out"] = {
+            "path": str(out_dir),
+            "exists": False,
+            "writable": False,
+            "error": detail,
+        }
         return paths_info, rows, notes
 
     writable = _test_writable(out_dir)
-    paths_info["out"] = {"path": str(out_dir), "writable": writable}
+    paths_info["out"] = {
+        "path": str(out_dir),
+        "exists": True,
+        "readable": os.access(out_dir, os.R_OK),
+        "writable": writable,
+    }
     if writable:
         rows.append(CheckItem("输出目录", "ok", f"{out_dir}", ""))
     else:
-        rows.append(CheckItem("输出目录", "fail", f"{out_dir}", "请为该目录授予写权限或选择其他位置。"))
+        rows.append(
+            CheckItem(
+                "输出目录",
+                "fail",
+                f"{out_dir}",
+                "请为该目录授予写权限或选择其他位置。",
+            )
+        )
 
     # materials 目录可选检查
     materials_dir = Path("materials").resolve()
@@ -175,6 +215,7 @@ def _check_paths(out_dir: Path) -> tuple[Dict[str, Any], List[CheckItem], List[s
         writable_materials = os.access(materials_dir, os.W_OK)
         paths_info["materials"] = {
             "path": str(materials_dir),
+            "exists": True,
             "readable": bool(readable),
             "writable": bool(writable_materials),
         }
@@ -188,17 +229,26 @@ def _check_paths(out_dir: Path) -> tuple[Dict[str, Any], List[CheckItem], List[s
             notes.append("materials 目录不可写，部分脚本可能无法缓存中间文件。")
     else:
         paths_info["materials"] = {"path": str(materials_dir), "exists": False}
-        rows.append(CheckItem("素材目录", "warn", "未找到 materials/ 目录", "根据需要创建或指定素材路径。"))
+        rows.append(
+            CheckItem(
+                "素材目录",
+                "warn",
+                "未找到 materials/ 目录",
+                "根据需要创建或指定素材路径。",
+            )
+        )
 
     return paths_info, rows, notes
 
 
-def _check_windows_path_hints(out_dir: Path, raw_out: str) -> List[CheckItem]:
+def _check_windows_path_hints(out_dir: Path, raw_out: str, verbose: bool) -> tuple[List[CheckItem], List[str]]:
     """在 Windows 平台输出额外路径提示。"""
 
     rows: List[CheckItem] = []
+    notes: List[str] = []
+
     # 检测命令行参数中是否包含制表符等控制字符，提示可能的转义问题
-    if any(ord(ch) < 32 for ch in raw_out if ch not in {"\t", "\n"}):
+    if any(ch in raw_out for ch in ("\t", "\n", "\r")):
         rows.append(
             CheckItem(
                 "Windows 路径",
@@ -220,7 +270,7 @@ def _check_windows_path_hints(out_dir: Path, raw_out: str) -> List[CheckItem]:
             )
         )
 
-    # 检查长路径策略
+    # 通过注册表查询 LongPathsEnabled 状态
     try:
         import winreg  # type: ignore
 
@@ -238,7 +288,12 @@ def _check_windows_path_hints(out_dir: Path, raw_out: str) -> List[CheckItem]:
                         "可参考微软文档启用长路径策略，避免处理超长路径时失败。",
                     )
                 )
-    except Exception:
+                notes.append("Windows 未启用长路径策略，处理超长路径时可能失败。")
+            else:
+                rows.append(CheckItem("长路径支持", "ok", "已启用 LongPathsEnabled", ""))
+    except Exception as exc:  # pragma: no cover - Windows 专属分支
+        if verbose:
+            print(f"无法读取 LongPathsEnabled: {exc}")
         rows.append(
             CheckItem(
                 "长路径支持",
@@ -247,7 +302,8 @@ def _check_windows_path_hints(out_dir: Path, raw_out: str) -> List[CheckItem]:
                 "请在本地组策略或注册表中确认已启用长路径。",
             )
         )
-    return rows
+
+    return rows, notes
 
 
 def _print_summary_table(items: List[CheckItem]) -> None:
@@ -298,9 +354,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     notes: List[str] = []
 
     # Python 检查
-    python_info, python_item = _check_python()
+    python_info, python_items, python_notes = _check_python()
     report["python"] = python_info
-    summary_items.append(python_item)
+    summary_items.extend(python_items)
+    notes.extend(python_notes)
 
     # 工具检查
     tools_payload: Dict[str, Any] = {}
@@ -320,8 +377,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Windows 特殊提示
     if platform_info["system"].lower() == "windows":
-        win_items = _check_windows_path_hints(out_dir, args.out)
+        win_items, win_notes = _check_windows_path_hints(out_dir, args.out, args.verbose)
         summary_items.extend(win_items)
+        notes.extend(win_notes)
 
     # 计算整体状态
     has_fail = any(item.status == "fail" for item in summary_items)
@@ -341,17 +399,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         for item in summary_items
     ]
 
+    # 打印摘要表格
+    _print_summary_table(summary_items)
+
     if notes:
         print("提示:")
         for note in notes:
             print(f" - {note}")
 
-    # 打印摘要表格
-    _print_summary_table(summary_items)
-
     # 写入 JSON 报告
     json_name = args.json or "env_report.json"
-    json_path = out_dir / json_name
+    json_path = Path(json_name)
+    if not json_path.is_absolute():
+        json_path = out_dir / json_path
+    json_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as exc:
@@ -362,9 +423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # 根据结果返回退出码
     if has_fail:
+        print("检测到失败项，请根据上方建议修复后重试。", file=sys.stderr)
         return 1
-    if has_warn:
-        return 0
     return 0
 
 

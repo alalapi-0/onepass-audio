@@ -318,7 +318,19 @@ python -m pip install -r requirements.txt
 python scripts/env_check.py --out out --verbose
 ```
 
-默认会在指定 `--out` 目录写入 `env_report.json`，其中包含各检查项的状态、建议与补充提示。`--verbose` 会额外打印探测命令与返回码，便于人工复现。
+默认会在指定 `--out` 目录写入 `env_report.json`，其中 `summary.notes` 汇总可忽略但需要关注的提醒，`checks` 数组与终端表格保持一致。`--verbose` 会额外打印探测命令与返回码，便于人工复现。
+
+```json
+{
+  "timestamp": "2025-11-05T10:00:00",
+  "platform": {"system": "Windows", "release": "10", "machine": "AMD64"},
+  "python": {"version": "3.11.6", "ok": true, "in_venv": true},
+  "summary": {"ok": true, "notes": ["opencc 未安装，繁简转换将被跳过。"]},
+  "checks": [
+    {"name": "Python 版本", "status": "ok", "detail": "当前版本 3.11.6", "advice": ""}
+  ]
+}
+```
 
 ### 日志位置与查看技巧
 
@@ -329,7 +341,7 @@ python scripts/env_check.py --out out --verbose
 ### 常见故障及建议
 
 - `ffmpeg` 或 `ffprobe` 未安装/未加入 PATH：按照官方指引安装，并确认命令行可直接运行 `ffmpeg -version`。
-- Windows 路径包含特殊字符、未转义反斜杠或禁用长路径：优先使用不含空格/点结尾的目录，必要时开启 `LongPathsEnabled` 策略。
+- Windows 路径包含特殊字符、未转义反斜杠或禁用长路径：优先使用不含空格/点结尾的目录，必要时在注册表启用 `LongPathsEnabled` 策略（自检会检测并提示）。
 - 输出目录不可写：将 `--out` 指向当前用户有读写权限的路径，或调整 ACL/权限设置。
 - `opencc` 未安装：自检会给出提示，繁简转换会被跳过；可按需安装 OpenCC 后重跑流程。
 
