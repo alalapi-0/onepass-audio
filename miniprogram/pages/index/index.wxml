@@ -1,0 +1,39 @@
+<!-- /miniprogram/pages/index/index.wxml -->
+<!-- 说明：小程序首页，包含一个画布与若干信息文本和按钮。通过数据绑定显示关卡、目标、分数等。 -->
+
+<view class="wrap">
+  <!-- 标题 -->
+  <view class="row">
+    <text class="title">Stage2048（关卡 2048）</text>
+  </view>
+
+  <!-- 画布：同时设置 CSS 尺寸与实际像素宽高，便于清晰绘制 -->
+  <!-- 绑定触摸事件以识别滑动方向 -->
+  <canvas
+    id="game"
+    canvas-id="game"
+    style="width: {{canvasPx}}px; height: {{canvasPx}}px;"
+    width="{{canvasPx}}"
+    height="{{canvasPx}}"
+    bindtouchstart="onTouchStart"
+    bindtouchend="onTouchEnd"
+  ></canvas>
+
+  <!-- 信息栏：关卡+目标 -->
+  <view class="row">
+    <text class="meta">关卡 {{level}}（{{size}}×{{size}}）</text>
+    <text class="meta">目标 {{target}}</text>
+  </view>
+
+  <!-- 信息栏：得分/总分/最佳 -->
+  <view class="row">
+    <text class="score">得分 {{score}}</text>
+    <text class="score">总分 {{totalScore}}</text>
+    <text class="score">最佳 {{bestScore}}</text>
+  </view>
+
+  <!-- 操作区：重开本关 -->
+  <view class="row">
+    <button class="btn" bindtap="onRestart">重开本关</button>
+  </view>
+</view>
