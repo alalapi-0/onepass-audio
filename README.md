@@ -8,6 +8,7 @@
 2. **第 2 轮：文本规范化与数据加载** —— 增补了 `onepass.textnorm`、`onepass.asr_loader` 等模块，围绕“词级对齐”细化了文本预处理流程。此时遇到的问题是兼容字符表不完整，导致规范化后仍存在漏网字符，需要在 `config/` 中维护自定义映射。
 3. **第 3 轮：交互主程序与批处理流程** —— 加入 `onepass_main.py` 交互入口、章节资源匹配与批量处理逻辑。过程中发现素材目录命名不一致、音频优先级选择困难，最终通过哈希表比对前缀和手动设定格式优先级解决。
 4. **第 4 轮：文档完善与可用性增强** —— 在最新 Prompt 中补充了运行说明、详细注释、环境准备指南，并修复了英语注释与中文内容风格不一致的问题。此阶段的主要挑战是“逐行中文注释”工作量较大，需要逐块核对关键模块。
+5. **第 5 轮：EDL 音频渲染落地** —— 新增 `onepass.edl_renderer` 库模块、`scripts/edl_render.py` 命令行脚本与主菜单入口，实现按剪辑清单一键导出干净音频，同时补充文档与 5 分钟跑通示例。
 
 ## 程序用途与最终产出
 
@@ -47,7 +48,7 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 1. **创建虚拟环境并安装依赖**（见下文“安装步骤”）。
 2. **整理素材目录**：将 JSON/TXT/音频放入同一文件夹，确保命名一致。
 3. **可选文本规范化**：使用 `python scripts/normalize_original.py` 或在主程序菜单选择“预处理：原文规范化”。
-4. **启动主流程**：运行 `python onepass_main.py`，按提示选择素材目录、输出目录、是否导出音频。
+4. **启动主流程**：运行 `python onepass_main.py`，在主菜单选择批量处理或 `R` 进入 EDL 渲染，按提示选择素材目录、输出目录与导出参数。
 5. **查看输出**：处理完成后在 `out/` 目录查看字幕、EDL、报告与可选音频，并按照日志提示核对未对齐样例。
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
@@ -57,7 +58,7 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 - 去口癖（可配置词表），流畅断句（SRT/VTT/TXT）
 - “同句保留最后一遍、删除前面重录”
 - 生成 EDL（剪辑清单）与 Adobe Audition 标记 CSV
-- （可选）按 EDL 一键导出干净音频（后续脚本补上）
+- （已实现）按 EDL 一键导出干净音频
 - 批处理整本书与汇总报告（后续补上）
 
 ## 目录结构
@@ -92,15 +93,101 @@ python -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-## 使用示例（占位）
+## 按 EDL 渲染干净音频
+
+### 交互式入口
+
+1. 运行 `python onepass_main.py`，主菜单输入 `R` 进入“按 EDL 渲染干净音频”。
+2. 拖拽或输入 `*.edl.json` 文件路径，随后指定 `audio_root`（默认 `materials/`）与输出目录（默认 `out/`，不存在会自动创建）。
+3. 可选填写目标采样率与声道数；留空则沿用源音频的参数。支持勾选 Dry-Run 仅打印命令。
+4. 程序会展示解析到的源音频、输出路径、保留片段数量与累计时长，并打印等价 CLI 命令。确认后即调用 `scripts/edl_render.py` 完成渲染。
+5. 渲染成功后终端会再次提示输出路径及保留时长，方便与剪辑日志核对。
+
+### CLI 调用示例
 
 ```bash
-# 单章：生成去口癖字幕 + 保留最后一遍 + EDL + Audition 标记
-python scripts/retake_keep_last.py --json data/asr-json/001.json --original data/original_txt/001.txt --outdir out
-
-# （可选）按 EDL 导出干净音频
-python scripts/edl_to_ffmpeg.py --audio data/audio/001.m4a --edl out/001.keepLast.edl.json --out out/001.clean.wav
+python scripts/edl_render.py \
+  --edl materials/demo/demo.keepLast.edl.json \
+  --audio-root materials \
+  --out out \
+  --samplerate 48000 \
+  --channels 1
 ```
+
+`--samplerate/--channels` 可省略，此时会沿用 EDL 中的建议设置或源音频原始参数。加上 `--dry-run` 可仅打印最终 `ffmpeg` 命令。
+
+### EDL JSON 结构与兼容性
+
+- **新式结构（推荐）**：
+
+```json
+{
+  "source_audio": "materials/demo/demo.wav",
+  "samplerate": 48000,
+  "channels": 1,
+  "segments": [
+    {"start": 0.50, "end": 2.20, "action": "keep"},
+    {"start": 3.00, "end": 4.40, "action": "keep"},
+    {"start": 5.80, "end": 8.10, "action": "keep"}
+  ]
+}
+```
+
+- **旧式兼容写法**（仅提供 `keep: true/false` 时也可自动转换）：
+
+```json
+{
+  "audio": "materials/demo/demo.wav",
+  "segments": [
+    {"start": 0.50, "end": 2.20, "keep": true},
+    {"start": 2.20, "end": 3.00, "keep": false},
+    {"start": 3.00, "end": 4.40, "keep": true},
+    {"start": 4.40, "end": 5.80, "keep": false},
+    {"start": 5.80, "end": 8.10, "keep": true}
+  ]
+}
+```
+
+若只提供 `actions` 列表（例如旧版 `*.keepLast.edl.json`），渲染器会自动将 `cut` 片段取补集并生成保留区间。
+
+### 常见问题排查
+
+- **找不到 ffmpeg/ffprobe**：请先安装 [FFmpeg](https://ffmpeg.org/download.html) 并将其加入 PATH。Windows 用户可使用 [ffmpeg.org](https://ffmpeg.org/download.html) 或 [Gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 提供的预编译包。
+- **路径含空格或中文**：保持引号或使用拖拽输入。渲染器内部统一使用 `pathlib.Path`，可跨平台处理。
+- **采样率/声道不一致**：若保留片段来自不同格式的源文件，建议显式传入 `--samplerate` 与 `--channels`，或在交互式入口中填写目标参数。
+- **EDL 全为 drop 动作**：渲染器会自动取补集；若最终保留时长为 0，会明确报错，提示检查剪辑清单。
+
+### 5 分钟跑通最小示例
+
+1. **准备虚拟环境**（可与主流程共用）：
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate  # Windows 使用 .\.venv\Scripts\activate
+   python -m pip install -r requirements.txt
+   ```
+
+2. **生成示例音频**（输出到 `materials/demo/demo.wav`，若目录不存在请先创建，macOS/Linux 可执行 `mkdir -p materials/demo`，Windows 使用 `mkdir materials\demo`）：
+
+   ```bash
+   mkdir -p materials/demo
+   ffmpeg -hide_banner -y -f lavfi -i "sine=frequency=440:duration=2" \
+     -f lavfi -t 0.8 -i anullsrc=r=48000:cl=mono \
+     -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[aout]" -map "[aout]" materials/demo/demo.wav
+   ```
+
+3. **编写示例 EDL**（保存为 `materials/demo/demo.keepLast.edl.json`，内容可直接复制上方“新式结构”示例）。
+
+4. **执行渲染**：
+
+   ```bash
+   python scripts/edl_render.py \
+     --edl materials/demo/demo.keepLast.edl.json \
+     --audio-root materials \
+     --out out
+   ```
+
+   成功后将在 `out/demo.clean.wav` 获得去噪后的音频，并在终端看到片段数量与累计保留时长。
 
 ## 文本规范化（原文预处理）
 
@@ -193,6 +280,10 @@ python onepass_main.py
 ## 免责声明与隐私
 
 仅处理你有权使用的音频与文本；请勿将受版权保护素材上传至公共仓库；建议在本地或受控环境中处理敏感数据。
+
+## 更新日志
+
+- 2025-11-01：新增 `onepass.edl_renderer` 模块与 `scripts/edl_render.py`，主菜单支持按 EDL 渲染干净音频，并补充文档示例与最小跑通流程。
 
 ## 路线图
 
