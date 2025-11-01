@@ -30,6 +30,7 @@ from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需�
     export_srt,
     export_txt,
 )
+from onepass.logging_utils import default_log_dir  # 引入统一日志目录工具
 from onepass.ux import (  # 引入命令行交互的工具函数
     print_error,  # 打印错误信息的工具
     print_header,  # 打印分组标题的工具
@@ -527,6 +528,96 @@ def _run_all_in_one_menu() -> None:  # 一键流水线入口
     else:
         print_success("流水线已完成。")
 
+
+def _run_env_check_menu() -> None:  # 环境自检流程
+    print_header("环境自检与日志位置")  # 显示步骤标题
+
+    script_path = ROOT_DIR / "scripts" / "env_check.py"  # 定位环境自检脚本
+    if not script_path.exists():  # 缺少脚本时直接提示
+        print_error("未找到 scripts/env_check.py，请先更新仓库。")
+        return
+
+    default_out_text = "out"  # 默认报告输出目录
+    out_raw = _clean_input_path(  # 获取用户输入
+        prompt_text("报告输出目录 (默认 out)", default=default_out_text, allow_empty=True)
+    )
+    if not out_raw:  # 用户直接回车沿用默认值
+        out_raw = default_out_text
+
+    out_path = Path(out_raw).expanduser()  # 支持 ~ 展开
+    if not out_path.is_absolute():  # 相对路径基于项目根目录
+        out_path = (ROOT_DIR / out_path).resolve()
+    else:
+        out_path = out_path.resolve()
+
+    try:
+        display_script = script_path.relative_to(ROOT_DIR)  # 优先展示相对路径
+    except ValueError:
+        display_script = script_path
+    command_preview = shlex.join([sys.executable, str(display_script), "--out", out_raw])  # 构建展示命令
+    print_info("将执行命令:")
+    print_info(command_preview)
+
+    try:
+        result = subprocess.run(  # 调用环境自检脚本
+            [sys.executable, str(script_path), "--out", str(out_path)],
+            check=False,
+        )
+    except Exception as exc:
+        print_error(f"执行环境自检失败: {exc}")
+        return
+
+    if result.returncode != 0:  # 非零退出码时提醒用户检查终端输出
+        print_warning("环境自检返回非零状态，请结合上方输出排查。")
+
+    report_path = out_path / "env_report.json"  # 默认报告文件
+    report_data: dict | None = None
+    if report_path.exists():
+        try:
+            report_data = json.loads(report_path.read_text(encoding="utf-8"))  # 读取 JSON 报告
+        except Exception as exc:
+            print_error(f"读取报告失败: {exc}")
+    else:
+        print_warning("未找到 env_report.json，请确认输出目录是否可写。")
+
+    try:
+        report_rel = report_path.relative_to(ROOT_DIR)
+    except ValueError:
+        report_rel = report_path
+    if report_path.exists():
+        print_success(f"环境检查报告位置: {report_rel}")
+
+    log_dir_path = (ROOT_DIR / default_log_dir()).resolve()  # 统一日志目录
+    try:
+        log_rel = log_dir_path.relative_to(ROOT_DIR)
+    except ValueError:
+        log_rel = log_dir_path
+    print_info(f"统一日志目录: {log_rel}")
+
+    if not report_data:  # 无可用报告时结束
+        return
+
+    problematic = [  # 汇总需要关注的检查项
+        item for item in report_data.get("checks", []) if item.get("status") in {"warn", "fail"}
+    ]
+    if problematic:
+        print_warning("检测到需要关注的项目：")
+        for item in problematic:
+            name = item.get("name", "未知检查")
+            status = item.get("status", "warn")
+            detail = item.get("detail", "无详细信息")
+            advice = item.get("advice")
+            print_warning(f"- {name} ({status}) {detail}")
+            if advice:
+                print_info(f"  建议: {advice}")
+    else:
+        print_success("所有检查项均通过。")
+
+    notes = report_data.get("summary", {}).get("notes", [])  # 输出额外提示
+    for note in notes:
+        print_info(f"提示: {note}")
+
+
 def _index_files_by_stem(paths: Iterable[Path]) -> Dict[str, Path]:  # 按文件名前缀建立索引
     index: Dict[str, Path] = {}  # 初始化映射字典
     for path in sorted(paths):  # 按名称排序遍历路径
@@ -837,6 +928,7 @@ def main() -> None:  # CLI 主入口
     print_info("[R] 按 EDL 渲染干净音频")
     print_info("[P] 预处理：原文规范化（输出 .norm.txt 与 normalize_report.csv）")
     print_info("[A] 一键流水线：规范化 → 保留最后一遍 → 渲染音频")
+    print_info("[E] 环境自检与日志位置")
     print_info("[Q] 退出程序")
 
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
@@ -852,6 +944,9 @@ def main() -> None:  # CLI 主入口
         return
     if choice_lower == "a":  # 一键流水线
         _run_all_in_one_menu()
+        return
+    if choice_lower == "e":
+        _run_env_check_menu()
         return
     if choice_lower == "q":  # 用户选择退出
         print_info("已退出。")

@@ -40,6 +40,7 @@ from onepass.text_norm import (  # 规范化工具
     run_opencc_if_available,
     scan_suspects,
 )
+from onepass.logging_utils import default_log_dir, setup_logger
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
@@ -51,7 +52,8 @@ LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 def _configure_logging() -> None:
     """初始化控制台日志格式。"""
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")  # 简洁输出
+    global LOGGER
+    LOGGER = setup_logger("onepass.cli", default_log_dir())  # 使用统一滚动日志配置
 
 
 def _build_cli_example(subcommand: str, parts: Sequence[str]) -> str:
@@ -125,6 +127,7 @@ def _process_single_text(path: Path, base_dir: Path, out_dir: Path, cmap: dict, 
             preserve_cjk_punct=bool(cmap.get("preserve_cjk_punct", False)),  # 是否保留中日韩标点
         )
     except Exception as exc:
+        LOGGER.exception("规范化流程失败: %s", path)
         return {
             "file": str(path),
             "orig_len": len(raw_text),
@@ -271,11 +274,13 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         ]
         + (["--dry-run"] if args.dry_run else []),
     )
+    LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
     LOGGER.info("等价命令: %s", cmd)
     try:
         result = run_prep_norm(Path(args.input), Path(args.output), Path(args.char_map), args.opencc, args.glob, args.dry_run)
     except Exception as exc:
-        LOGGER.error("处理失败: %s", exc)
+        LOGGER.exception("处理 prep-norm 失败")
+        print(f"处理失败: {exc}", file=sys.stderr)
         return 1
     summary = result["summary"]
     LOGGER.info(
@@ -339,6 +344,7 @@ def _process_retake_item(
             "message": "处理成功",
         }
     except Exception as exc:
+        LOGGER.exception("保留最后一遍处理失败: %s", words_path)
         item = {
             "stem": stem,
             "words_json": safe_rel(materials_base or words_path.parent, words_path),
@@ -519,12 +525,14 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--samplerate", str(args.samplerate)])
     if args.channels:
         parts.extend(["--channels", str(args.channels)])
+    LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
     try:
         payload = run_retake_keep_last(args, report_path=Path(args.out) / "batch_report.json")
     except Exception as exc:
-        LOGGER.error("处理失败: %s", exc)
+        LOGGER.exception("处理 retake-keep-last 失败")
+        print(f"处理失败: {exc}", file=sys.stderr)
         return 1
     summary = payload["summary"]
     LOGGER.info(
@@ -578,6 +586,7 @@ def _process_render_item(
             "message": "渲染成功",
         }
     except Exception as exc:
+        LOGGER.exception("渲染任务失败: %s", edl_path)
         return {
             "edl": safe_rel(edl_path.parent, edl_path),
             "source_audio": "",
@@ -678,11 +687,18 @@ def handle_render_audio(args: argparse.Namespace) -> int:
         parts.extend(["--samplerate", str(args.samplerate)])
     if args.channels:
         parts.extend(["--channels", str(args.channels)])
+    LOGGER.info(
+        "开始渲染任务: 模式=%s 源音频=%s 输出=%s",
+        "单文件" if args.edl else "批处理",
+        args.audio_root,
+        args.out,
+    )
     LOGGER.info("等价命令: %s", _build_cli_example("render-audio", parts))
     try:
         payload = run_render_audio(args, report_path=Path(args.out) / "batch_report.json")
     except Exception as exc:
-        LOGGER.error("处理失败: %s", exc)
+        LOGGER.exception("处理 render-audio 失败")
+        print(f"处理失败: {exc}", file=sys.stderr)
         return 1
     summary = payload["summary"]
     LOGGER.info(
@@ -802,12 +818,20 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--channels", str(args.channels)])
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
+    LOGGER.info(
+        "开始流水线任务: 素材=%s 音频=%s 输出=%s 渲染=%s",
+        args.materials,
+        args.audio_root,
+        args.out,
+        bool(args.render),
+    )
     LOGGER.info("等价命令: %s", _build_cli_example("all-in-one", parts))
 
     try:
         report = run_all_in_one(args)
     except Exception as exc:
-        LOGGER.error("流水线执行失败: %s", exc)
+        LOGGER.exception("处理 all-in-one 流水线失败")
+        print(f"流水线执行失败: {exc}", file=sys.stderr)
         return 1
     summary = report.get("summary", {})
     LOGGER.info(
@@ -899,7 +923,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    LOGGER.info("启动 onepass_cli，子命令=%s", args.command)
+    try:
+        return args.func(args)
+    except Exception as exc:
+        LOGGER.exception("命令执行过程中出现未捕获异常")
+        print(f"执行失败: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":  # pragma: no cover

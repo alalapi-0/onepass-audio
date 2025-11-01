@@ -222,6 +222,7 @@ python scripts/edl_render.py \
 - [x] 按 EDL 一键导出干净音频
 - [x] 原文规范化（可配置）
 - [x] 统一命令行与批处理报告（含整书汇总）
+- [x] 环境自检与统一日志
 
 ## 目录结构
 
@@ -254,6 +255,33 @@ python -m venv .venv
 # 安装依赖（将于“依赖与配置”步骤生成 requirements.txt）
 python -m pip install -r requirements.txt
 ```
+
+## 环境自检与常见故障排查
+
+为了便于排查依赖、权限与路径问题，本轮新增了 `scripts/env_check.py` 自检脚本。它会检测 Python 版本、虚拟环境、`ffmpeg`/`ffprobe`/`opencc` 可用性、平台信息以及 `out/`、`materials/` 等目录的读写权限，并在终端输出摘要表格与修复建议。
+
+### 快速运行
+
+```bash
+python scripts/env_check.py --out out --verbose
+```
+
+默认会在指定 `--out` 目录写入 `env_report.json`，其中包含各检查项的状态、建议与补充提示。`--verbose` 会额外打印探测命令与返回码，便于人工复现。
+
+### 日志位置与查看技巧
+
+- 所有脚本与 CLI 会自动写入 `out/logs/YYYY-MM-DD/onepass-YYYYMMDD.log`，并同步输出到控制台。
+- 建议在编辑器或终端中搜索 `[ERROR]`、`[WARNING]` 或 `exception` 关键字快速定位异常。
+- 日志目录会在首次运行时自动创建，也可通过主菜单 `[E]` 快速查看实际路径。
+
+### 常见故障及建议
+
+- `ffmpeg` 或 `ffprobe` 未安装/未加入 PATH：按照官方指引安装，并确认命令行可直接运行 `ffmpeg -version`。
+- Windows 路径包含特殊字符、未转义反斜杠或禁用长路径：优先使用不含空格/点结尾的目录，必要时开启 `LongPathsEnabled` 策略。
+- 输出目录不可写：将 `--out` 指向当前用户有读写权限的路径，或调整 ACL/权限设置。
+- `opencc` 未安装：自检会给出提示，繁简转换会被跳过；可按需安装 OpenCC 后重跑流程。
+
+遇到问题时，建议先运行环境自检并附上 `env_report.json` 与最新日志片段，有助于快速定位问题。主菜单新增的 `[E]` 选项会引导完成以上步骤。
 
 ## 按 EDL 渲染干净音频
 
@@ -445,6 +473,7 @@ python onepass_main.py
 
 ## 更新日志
 
+- 2025-11-05：新增 `scripts/env_check.py` 环境自检脚本、统一日志工具，并在主菜单/CLI 接入日志，补充排障文档。
 - 2025-11-04：新增 `scripts/onepass_cli.py` 统一命令行、`onepass/batch_utils.py` 批处理工具以及主菜单 `[A]` 一键流水线入口，覆盖整书批处理与报告输出。
 - 2025-11-03：新增 `config/default_char_map.json`、`scripts/normalize_original.py` 与主菜单 `[P]` 原文规范化入口，提供可配置管线与归一报表。
 - 2025-11-02：新增统一 ASR 适配层、`scripts/retake_keep_last.py`、主菜单 `[K]` 单文件流程与示例素材，提供“保留最后一遍”一站式导出。

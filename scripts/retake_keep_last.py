@@ -24,6 +24,7 @@ from onepass.retake_keep_last import (
     export_srt,
     export_txt,
 )
+from onepass.logging_utils import default_log_dir, setup_logger
 
 
 def _derive_stem(words_path: Path, text_path: Path) -> str:
@@ -55,14 +56,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--channels", type=int, help="可选：EDL 建议声道数")
     args = parser.parse_args(argv)
 
+    logger = setup_logger(__name__, default_log_dir())
     words_json = Path(args.words_json)
     text_path = Path(args.text)
     out_dir = Path(args.out)
+
+    logger.info(
+        "启动保留最后一遍导出",
+        extra={"words": str(words_json), "text": str(text_path), "out": str(out_dir)},
+    )
 
     try:
         # 通过统一适配层读取词级 JSON
         doc = load_words(words_json)
     except Exception as exc:  # pragma: no cover - CLI 交互路径
+        logger.exception("加载词级 JSON 失败")
         print(f"加载词级 JSON 失败: {exc}", file=sys.stderr)
         return 1
 
@@ -70,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
         # 调用核心策略，传入词序列与原文路径
         result = compute_retake_keep_last(list(doc), text_path)
     except Exception as exc:  # pragma: no cover - CLI 交互路径
+        logger.exception("保留最后一遍计算失败")
         print(f"保留最后一遍计算失败: {exc}", file=sys.stderr)
         return 1
 
@@ -96,6 +105,16 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     stats = result.stats
+    logger.info(
+        "导出完成: stem=%s keep=%s 严格匹配=%s 回退=%s 未匹配=%s",
+        stem,
+        stats.get("matched_lines"),
+        stats.get("strict_matches"),
+        stats.get("fallback_matches"),
+        stats.get("unmatched_lines"),
+    )
+    if stats.get("fallback_matches"):
+        logger.warning("存在回退匹配 %s 条，建议检查原始稿。", stats.get("fallback_matches"))
     # 打印统计摘要，便于快速了解匹配质量
     print(
         "总词数 {total_words}，匹配行数 {matched_lines}，严格匹配 {strict_matches}，"
@@ -106,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"已生成: {txt_path}")
     print(f"已生成: {markers_path}")
     print(f"已生成: {edl_path}")
+
+    logger.info("输出文件: %s, %s, %s, %s", srt_path, txt_path, markers_path, edl_path)
 
     return 0
 
