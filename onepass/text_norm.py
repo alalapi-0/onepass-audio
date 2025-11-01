@@ -321,20 +321,13 @@ def scan_suspects(s: str, max_examples: int = 8) -> dict:
 def normalize_for_align(text: str) -> str:
     """规范化文本以便做粗对齐。"""
 
-    # 去掉零宽字符与控制字符，避免隐形噪声干扰匹配
-    text = text.translate(_REMOVE_ZERO_WIDTH)
-    # 使用 NFKC 统一全半角形态
-    text = unicodedata.normalize("NFKC", text)
-    # 仅对 ASCII 字母做小写化处理，避免影响 CJK 字符
-    text = text.translate(_ASCII_UPPER)
-    # 常见句读符转为空格，保留停顿的影子效果
-    text = text.translate(_PUNCT_TO_SPACE)
-    # 其他标点全部删除
-    text = text.translate(_REMOVE_OTHER_PUNCT)
-    # 合并多余空白为单个空格
-    text = " ".join(text.split())
-    # 返回去除首尾空白的结果
-    return text.strip()
+    text = text.translate(_REMOVE_ZERO_WIDTH)  # 删除零宽与控制字符
+    text = unicodedata.normalize("NFKC", text)  # 使用 NFKC 统一全半角
+    text = text.translate(_ASCII_UPPER)  # 将 ASCII 字母转换为小写
+    text = text.translate(_PUNCT_TO_SPACE)  # 常见句读符号替换为空格
+    text = text.translate(_REMOVE_OTHER_PUNCT)  # 其他标点直接移除
+    text = " ".join(text.split())  # 折叠多余空白为单空格
+    return text.strip()  # 去掉首尾空白后返回
 
 
 def _remove_spaces(text: str) -> str:
@@ -346,26 +339,20 @@ def _remove_spaces(text: str) -> str:
 def cjk_or_latin_seq(words: list[str]) -> str:
     """将词序列拼接为对齐用字符串。"""
 
-    joined: list[str] = []
-    for word in words:
-        # 每个词去掉空白后拼接，中文自然按字符粒度保留
-        joined.append(_remove_spaces(word))
-    # 直接拼接得到用于匹配的字符串
-    return "".join(joined)
+    joined: list[str] = []  # 初始化结果列表
+    for word in words:  # 遍历词序列
+        joined.append(_remove_spaces(word))  # 去掉空白后写入结果
+    return "".join(joined)  # 拼接成连续字符串
 
 
 def build_char_index_map(word_texts: list[str]) -> list[tuple[int, int]]:
     """构建词到字符的索引映射。"""
 
-    mapping: list[tuple[int, int]] = []
-    cursor = 0
-    for text in word_texts:
-        # 去掉空白后得到用于匹配的字符序列
-        cleaned = _remove_spaces(text)
-        # 当前词在拼接字符串中的起始位置
-        start = cursor
-        # 光标向后移动该词的字符长度
-        cursor += len(cleaned)
-        # 记录该词的字符区间 [start, cursor)
-        mapping.append((start, cursor))
-    return mapping
+    mapping: list[tuple[int, int]] = []  # 存储区间的结果列表
+    cursor = 0  # 记录当前字符位置
+    for text in word_texts:  # 遍历每个词的文本
+        cleaned = _remove_spaces(text)  # 去掉空白获取用于匹配的内容
+        start = cursor  # 记录当前词的起始下标
+        cursor += len(cleaned)  # 根据字符长度推进光标
+        mapping.append((start, cursor))  # 保存区间 [start, cursor)
+    return mapping  # 返回索引映射
