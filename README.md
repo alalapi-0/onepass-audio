@@ -53,6 +53,32 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
 
+## 原文规范化（可配置）
+
+在正式对齐前先清洗原稿，可以显著降低零宽字符、兼容字和混排空白造成的错位，从而提高“保留最后一遍”匹配的成功率。项目提供了可编辑的
+`config/default_char_map.json`，对常见中文排版场景进行兜底处理：
+
+- `delete`：列出需要直接删除的字符，默认涵盖零宽空白与 BOM。
+- `map`：指定需要替换的兼容字符与标点，例如弯引号、破折号、中文逗号等。
+- `normalize_width` / `preserve_cjk_punct`：控制是否执行 NFKC 宽度归一，并在归一后回写全角中文标点。
+- `normalize_space`：折叠多余空白、清理行首尾空格，避免对齐时出现看不见的分隔符。
+
+如需繁简转换，可额外安装 OpenCC；脚本会先检测本地是否存在 `opencc` 可执行文件，缺失时会在报表中提示“跳过转换”，同时保留原文内容。
+
+最小示例：
+
+1. 在 `materials/example/` 目录放置 `demo.txt` 原文。
+2. 运行
+
+   ```bash
+   python scripts/normalize_original.py --in materials/example/demo.txt --out out/norm --char-map config/default_char_map.json --opencc none
+   ```
+
+3. 检查 `out/norm/demo.norm.txt` 与 `out/normalize_report.csv`，前者为清洗后的文本，后者记录删除/替换次数、空白折叠、OpenCC 状态以及可疑字符示例。
+
+推荐流程是：**先执行原文规范化**，再运行“保留最后一遍”生成字幕/EDL，最后按需调用 EDL 音频渲染。如此可以最大化减少对齐误差，并保证后续报
+表可以直接复用同一份清洗结果。
+
 ## 保留最后一遍流程
 
 ### 输入与输出概览
@@ -124,6 +150,7 @@ python scripts/edl_render.py \
 - [x] ASR 适配层 + 保留最后一遍策略
 - 生成 EDL（剪辑清单）与 Adobe Audition 标记 CSV
 - （已实现）按 EDL 一键导出干净音频
+- （已实现）原文规范化（可配置）
 - 批处理整本书与汇总报告（后续补上）
 
 ## 目录结构
@@ -348,6 +375,7 @@ python onepass_main.py
 
 ## 更新日志
 
+- 2025-11-03：新增 `config/default_char_map.json`、`scripts/normalize_original.py` 与主菜单 `[P]` 原文规范化入口，提供可配置管线与归一报表。
 - 2025-11-02：新增统一 ASR 适配层、`scripts/retake_keep_last.py`、主菜单 `[K]` 单文件流程与示例素材，提供“保留最后一遍”一站式导出。
 - 2025-11-01：新增 `onepass.edl_renderer` 模块与 `scripts/edl_render.py`，主菜单支持按 EDL 渲染干净音频，并补充文档示例与最小跑通流程。
 
