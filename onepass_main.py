@@ -46,7 +46,7 @@ from onepass.ux import (  # 引入命令行交互的工具函数
 ROOT_DIR = Path(__file__).resolve().parent  # 计算项目根目录，方便拼接相对路径
 DEFAULT_MATERIALS_DIR = ROOT_DIR / "materials"  # 默认素材目录，存放 JSON/TXT/音频
 DEFAULT_OUT_DIR = ROOT_DIR / "out"  # 默认输出目录，统一存放产出文件
-DEFAULT_NORMALIZED_DIR = ROOT_DIR / "data" / "original_txt_norm"  # 默认的规范文本目录
+DEFAULT_NORMALIZED_DIR = ROOT_DIR / "out" / "norm"  # 默认的规范文本目录
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化脚本的默认报告路径
 DEFAULT_SCORE_THRESHOLD = 80  # 对齐得分的默认阈值，低于则提示人工确认
 AUDIO_PRIORITY = {  # 音频格式优先级映射，数值越小优先级越高
@@ -129,6 +129,116 @@ def _prompt_optional_int(prompt: str) -> int | None:  # 允许留空的正整数
             print_warning("数值必须大于 0。")
             continue
         return value
+
+
+def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚本
+    print_header("预处理：原文规范化")  # 显示步骤标题
+
+    target_raw = _clean_input_path(prompt_text("输入文件或目录路径", allow_empty=False))  # 获取输入路径
+    target_path = Path(target_raw).expanduser().resolve()  # 解析为绝对路径
+    if not target_path.exists():  # 路径不存在直接报错
+        print_error("指定的文件或目录不存在，请检查后重试。")
+        return
+
+    glob_pattern = ""
+    if target_path.is_dir():  # 目录模式可配置
+        glob_pattern = _clean_input_path(
+            prompt_text("匹配模式 (默认 *.txt)", default="*.txt", allow_empty=True)
+        )
+        if not glob_pattern:
+            glob_pattern = "*.txt"
+
+    DEFAULT_NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)  # 确保默认输出存在
+    out_raw = _clean_input_path(
+        prompt_text(
+            "输出目录 (必须位于 out/ 下)",
+            default=str(DEFAULT_NORMALIZED_DIR),
+            allow_empty=False,
+        )
+    )
+    out_dir = Path(out_raw).expanduser()
+    if not out_dir.is_absolute():  # 相对路径基于项目根目录
+        out_dir = (ROOT_DIR / out_dir).resolve()
+    else:
+        out_dir = out_dir.resolve()
+
+    out_root = (ROOT_DIR / "out").resolve()  # out 根目录
+    try:
+        out_dir.relative_to(out_root)  # 校验输出目录位置
+    except ValueError:
+        print_error(f"输出目录必须位于 {out_root} 内。")
+        return
+
+    opencc_mode = _clean_input_path(
+        prompt_text("opencc 模式 (none/t2s/s2t)", default="none", allow_empty=False)
+    ).lower()
+    if opencc_mode not in {"none", "t2s", "s2t"}:  # 校验 opencc 模式
+        print_error("opencc 模式仅支持 none/t2s/s2t。")
+        return
+
+    char_map_path = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
+    if not char_map_path.exists():  # 缺少配置文件
+        print_error("未找到 config/default_char_map.json，请先拉取仓库最新配置。")
+        return
+
+    script_path = ROOT_DIR / "scripts" / "normalize_original.py"  # 脚本路径
+    if not script_path.exists():  # 缺少脚本
+        print_error("未找到 scripts/normalize_original.py，请确认仓库已更新。")
+        return
+
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--in",
+        str(target_path),
+        "--out",
+        str(out_dir),
+        "--char-map",
+        str(char_map_path),
+        "--opencc",
+        opencc_mode,
+    ]
+    if glob_pattern:
+        cmd.extend(["--glob", glob_pattern])
+
+    dry_run = prompt_yes_no("是否仅生成报表 (Dry-Run)?", default=False)
+    if dry_run:
+        cmd.append("--dry-run")
+
+    print_info("即将执行命令:")
+    print_info(shlex.join(cmd))
+    if not prompt_yes_no("确认执行上述命令?", default=True):
+        print_warning("已取消原文规范化。")
+        return
+
+    out_dir.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
+    before_files = set(out_dir.rglob("*.norm.txt"))  # 记录执行前的 norm 文件
+
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))  # 执行脚本
+    except FileNotFoundError as exc:
+        print_error(f"无法调用规范化脚本: {exc}")
+        return
+
+    if result.returncode != 0:
+        print_error("规范化脚本执行失败，请根据上方输出排查问题。")
+        return
+
+    report_path = DEFAULT_NORMALIZE_REPORT
+    if report_path.exists():
+        print_info(f"报表: {report_path}")
+    else:
+        print_warning("未找到 normalize_report.csv，请确认脚本输出。")
+
+    if dry_run:
+        print_success("Dry-Run 已完成，可根据上方命令实际执行。")
+        return
+
+    after_files = set(out_dir.rglob("*.norm.txt"))  # 执行后的 norm 文件
+    new_files = [p for p in after_files - before_files if p.is_file()]
+    print_success(f"本次共生成 {len(new_files)} 个规范化文本。输出目录: {out_dir}")
+    if not new_files:
+        print_warning("未检测到新增 .norm.txt，可能输入为空或文件已存在。")
 
 
 def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本
@@ -298,31 +408,37 @@ def _ensure_normalized_text_path(chapter: ChapterResources) -> Path:  # 确保�
         print_warning("未找到 scripts/normalize_original.py，将继续使用原始 TXT。")  # 给出警告
         return chapter.original_txt  # 回退使用原稿
 
+    char_map = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射路径
+    if not char_map.exists():  # 缺少配置时给出提示
+        print_warning("未找到 config/default_char_map.json，将继续使用原始 TXT。")
+        return chapter.original_txt
+
     message = (  # 组合交互提示文字
         "未检测到规范化文本，是否现在调用 scripts/normalize_original.py?\n"
         f"原稿: {chapter.original_txt}\n"
-        f"输出: {norm_path}\n"
-        "生成 CSV 报告: out/normalize_report.csv"
+        f"输出目录: {DEFAULT_NORMALIZED_DIR}\n"
+        "生成报表: out/normalize_report.csv"
     )
     if not prompt_yes_no(message, default=True):  # 如果用户选择不执行
         return chapter.original_txt  # 直接回退使用原稿
 
     DEFAULT_NORMALIZED_DIR.mkdir(parents=True, exist_ok=True)  # 确保规范化输出目录存在
     DEFAULT_OUT_DIR.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在以写入报告
-    report_path = DEFAULT_NORMALIZE_REPORT  # 报告文件路径
-    report_path.parent.mkdir(parents=True, exist_ok=True)  # 创建报告目录
+    DEFAULT_NORMALIZE_REPORT.parent.mkdir(parents=True, exist_ok=True)  # 创建报告目录
+
+    before_files = set(DEFAULT_NORMALIZED_DIR.glob("*.norm.txt"))  # 记录执行前已有文件
 
     cmd = [  # 构建调用规范化脚本的命令行参数
         sys.executable,  # 使用当前 Python 解释器
         str(script_path),  # 规范化脚本路径
         "--in",  # 输入参数标志
         str(chapter.original_txt),  # 原始文本路径
-        "--out",  # 输出参数标志
-        str(norm_path),  # 规范化文本输出路径
-        "--report",  # 报告参数标志
-        str(report_path),  # 报告文件路径
-        "--mode",  # 运行模式标志
-        "align",  # 选择对齐模式
+        "--out",  # 输出目录参数
+        str(DEFAULT_NORMALIZED_DIR),  # 输出目录
+        "--char-map",  # 指定字符映射
+        str(char_map),  # 映射文件路径
+        "--opencc",  # 繁简转换模式
+        "none",  # 默认不调用 opencc
     ]
 
     print_info("正在规范化原稿，稍候…")  # 告知用户脚本正在执行
@@ -332,11 +448,20 @@ def _ensure_normalized_text_path(chapter: ChapterResources) -> Path:  # 确保�
         print_error(f"无法调用规范化脚本: {exc}")  # 打印错误信息
         return chapter.original_txt  # 回退使用原稿
 
-    if result.returncode == 0 and norm_path.exists():  # 如果脚本执行成功且输出存在
+    if result.returncode != 0:  # 脚本执行失败
+        print_warning("规范化脚本执行失败，将继续使用原始 TXT。")
+        return chapter.original_txt
+
+    after_files = set(DEFAULT_NORMALIZED_DIR.glob("*.norm.txt"))  # 统计执行后的文件
+    if norm_path in after_files and norm_path not in before_files:  # 成功生成目标文件
         print_success(f"已生成规范文本: {norm_path.name}")  # 提示生成成功
         return norm_path  # 返回新生成的规范文本
 
-    print_warning("规范化脚本执行失败，将继续使用原始 TXT。")  # 未生成结果时提示
+    if norm_path.exists():  # 已存在同名文件
+        print_info(f"复用已有规范文本: {norm_path.name}")
+        return norm_path
+
+    print_warning("规范化脚本未生成目标文件，将继续使用原始 TXT。")
     return chapter.original_txt  # 回退使用原稿
 
 
@@ -525,6 +650,7 @@ def main() -> None:  # CLI 主入口
     print_info("[1] 批量处理素材，生成字幕/EDL/标记")
     print_info("[K] 单文件：词级 JSON + 原文 → SRT/TXT/EDL/Markers")
     print_info("[R] 按 EDL 渲染干净音频")
+    print_info("[P] 预处理：原文规范化（输出 .norm.txt 与 normalize_report.csv）")
     print_info("[Q] 退出程序")
 
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
@@ -534,6 +660,9 @@ def main() -> None:  # CLI 主入口
         return
     if choice_lower == "r":  # 仅执行音频渲染
         _run_edl_render_menu()
+        return
+    if choice_lower == "p":  # 调用原文规范化流程
+        _run_normalize_original_menu()
         return
     if choice_lower == "q":  # 用户选择退出
         print_info("已退出。")
