@@ -14,6 +14,11 @@
 /data/asr-json/*
 !/data/asr-json/.gitkeep
 /materials/**/*.wav
+/materials/example/**/*.wav
+/materials/example/**/*.mp3
+/materials/example/**/*.m4a
+/materials/example/**/*.flac
+/out/**/*.wav
 __pycache__/
 *.pyc
 *.pyo
