@@ -205,7 +205,31 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
     if dry_run:
         cmd.append("--dry-run")
 
-    print_info("即将执行命令:")
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if cli_script.exists():
+        cli_cmd = [
+            sys.executable,
+            str(cli_script),
+            "prep-norm",
+            "--in",
+            str(target_path),
+            "--out",
+            str(out_dir),
+            "--char-map",
+            str(char_map_path),
+            "--opencc",
+            opencc_mode,
+        ]
+        if glob_pattern:
+            cli_cmd.extend(["--glob", glob_pattern])
+        if dry_run:
+            cli_cmd.append("--dry-run")
+        print_info("统一 CLI 等价命令:")
+        print_info(shlex.join(cli_cmd))
+    else:
+        print_warning("未找到 scripts/onepass_cli.py，暂无法展示统一 CLI 命令。")
+
+    print_info("内部将执行旧版脚本命令:")
     print_info(shlex.join(cmd))
     if not prompt_yes_no("确认执行上述命令?", default=True):
         print_warning("已取消原文规范化。")
@@ -313,11 +337,33 @@ def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本
     if channels is not None:
         cmd.extend(["--channels", str(channels)])
 
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if cli_script.exists():
+        cli_cmd = [
+            sys.executable,
+            str(cli_script),
+            "render-audio",
+            "--edl",
+            str(edl_path),
+            "--audio-root",
+            str(audio_root),
+            "--out",
+            str(out_dir),
+        ]
+        if samplerate is not None:
+            cli_cmd.extend(["--samplerate", str(samplerate)])
+        if channels is not None:
+            cli_cmd.extend(["--channels", str(channels)])
+        print_info("统一 CLI 等价命令:")
+        print_info(shlex.join(cli_cmd))
+    else:
+        print_warning("未找到 scripts/onepass_cli.py，暂无法展示统一 CLI 命令。")
+
     dry_run = prompt_yes_no("是否仅预览渲染命令 (Dry-Run)?", default=False)
     if dry_run:
         cmd.append("--dry-run")
 
-    print_info("即将执行命令:")
+    print_info("内部将执行旧版脚本命令:")
     print_info(shlex.join(cmd))
 
     if not prompt_yes_no("确认执行上述命令?", default=True):
@@ -341,6 +387,145 @@ def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本
     print_success(f"已完成干净音频渲染: {out_path}")
     print_info(f"保留片段 {len(keeps)} 段，总计 {keep_duration:.3f}s")
 
+
+def _run_all_in_one_menu() -> None:  # 一键流水线入口
+    print_header("一键流水线：规范化 → 保留最后一遍 → 渲染音频")
+
+    materials_dir = _prompt_materials_directory()  # 素材目录
+    default_audio_root = materials_dir  # 默认音频根目录
+    audio_root = prompt_existing_directory(
+        "音频搜索根目录",
+        default=default_audio_root,
+    )
+
+    suggested_out = DEFAULT_OUT_DIR / materials_dir.name  # 建议的输出目录
+    out_raw = _clean_input_path(
+        prompt_text(
+            "输出目录 (默认 out/<素材名>)",
+            default=str(suggested_out),
+            allow_empty=True,
+        )
+    )
+    if not out_raw:
+        out_raw = str(suggested_out)
+    out_dir = Path(out_raw).expanduser()
+    if not out_dir.is_absolute():
+        out_dir = (ROOT_DIR / out_dir).resolve()
+    else:
+        out_dir = out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    do_norm = prompt_yes_no("是否执行文本规范化阶段?", default=True)
+    norm_glob = "*.txt"
+    opencc_mode = "none"
+    norm_dry_run = False
+    char_map_path = ROOT_DIR / "config" / "default_char_map.json"
+    if do_norm:
+        opencc_mode = _clean_input_path(
+            prompt_text("opencc 模式 (none/t2s/s2t)", default="none", allow_empty=False)
+        ).lower()
+        if opencc_mode not in {"none", "t2s", "s2t"}:
+            print_error("opencc 模式仅支持 none/t2s/s2t。")
+            return
+        norm_glob_raw = _clean_input_path(
+            prompt_text("规范化匹配模式 (默认 *.txt)", default="*.txt", allow_empty=True)
+        )
+        if norm_glob_raw:
+            norm_glob = norm_glob_raw
+        norm_dry_run = prompt_yes_no("规范化阶段是否仅生成报表 (Dry-Run)?", default=False)
+        if not char_map_path.exists():
+            print_error("未找到 config/default_char_map.json，请先准备字符映射配置。")
+            return
+
+    glob_words_raw = _clean_input_path(
+        prompt_text("词级 JSON 匹配模式 (默认 *.words.json)", default="*.words.json", allow_empty=True)
+    )
+    glob_words = glob_words_raw or "*.words.json"
+
+    glob_text_raw = _clean_input_path(
+        prompt_text(
+            "文本匹配模式，多个以空格或分号分隔 (默认 *.norm.txt *.txt)",
+            default="*.norm.txt *.txt",
+            allow_empty=True,
+        )
+    )
+    glob_text_patterns = [part for part in glob_text_raw.replace(";", " ").split() if part] if glob_text_raw else ["*.norm.txt", "*.txt"]
+
+    run_render = prompt_yes_no("是否在结尾执行音频渲染?", default=True)
+    glob_edl_patterns = ["*.keepLast.edl.json"]
+    samplerate = None
+    channels = None
+    if run_render:
+        glob_edl_raw = _clean_input_path(
+            prompt_text(
+                "EDL 匹配模式 (默认 *.keepLast.edl.json)",
+                default="*.keepLast.edl.json",
+                allow_empty=True,
+            )
+        )
+        if glob_edl_raw:
+            glob_edl_patterns = [part for part in glob_edl_raw.replace(";", " ").split() if part]
+        samplerate = _prompt_optional_int("渲染采样率 (Hz，可留空)")
+        channels = _prompt_optional_int("渲染声道数 (可留空)")
+
+    workers = _prompt_optional_int("并发线程数 (可留空)")
+
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if not cli_script.exists():
+        print_error("未找到 scripts/onepass_cli.py，无法执行统一流水线。")
+        return
+
+    cli_cmd = [
+        sys.executable,
+        str(cli_script),
+        "all-in-one",
+        "--materials",
+        str(materials_dir),
+        "--audio-root",
+        str(audio_root),
+        "--out",
+        str(out_dir),
+        "--glob-words",
+        glob_words,
+    ]
+    for pattern in glob_text_patterns:
+        cli_cmd.extend(["--glob-text", pattern])
+    if do_norm:
+        cli_cmd.extend(["--do-norm", "--opencc", opencc_mode, "--norm-glob", norm_glob, "--char-map", str(char_map_path)])
+        if norm_dry_run:
+            cli_cmd.append("--dry-run")
+    if run_render:
+        cli_cmd.append("--render")
+        for pattern in glob_edl_patterns:
+            cli_cmd.extend(["--glob-edl", pattern])
+    if samplerate:
+        cli_cmd.extend(["--samplerate", str(samplerate)])
+    if channels:
+        cli_cmd.extend(["--channels", str(channels)])
+    if workers:
+        cli_cmd.extend(["--workers", str(workers)])
+
+    print_info("统一 CLI 等价命令:")
+    print_info(shlex.join(cli_cmd))
+    if not prompt_yes_no("确认执行上述命令?", default=True):
+        print_warning("已取消一键流水线。")
+        return
+
+    try:
+        result = subprocess.run(cli_cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用统一 CLI: {exc}")
+        return
+
+    if result.returncode != 0:
+        print_error("统一流水线执行失败，请根据上方输出排查问题。")
+        return
+
+    report_path = out_dir / "batch_report.json"
+    if report_path.exists():
+        print_success(f"流水线已完成，报告位置: {report_path}")
+    else:
+        print_success("流水线已完成。")
 
 def _index_files_by_stem(paths: Iterable[Path]) -> Dict[str, Path]:  # 按文件名前缀建立索引
     index: Dict[str, Path] = {}  # 初始化映射字典
@@ -651,6 +836,7 @@ def main() -> None:  # CLI 主入口
     print_info("[K] 单文件：词级 JSON + 原文 → SRT/TXT/EDL/Markers")
     print_info("[R] 按 EDL 渲染干净音频")
     print_info("[P] 预处理：原文规范化（输出 .norm.txt 与 normalize_report.csv）")
+    print_info("[A] 一键流水线：规范化 → 保留最后一遍 → 渲染音频")
     print_info("[Q] 退出程序")
 
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
@@ -663,6 +849,9 @@ def main() -> None:  # CLI 主入口
         return
     if choice_lower == "p":  # 调用原文规范化流程
         _run_normalize_original_menu()
+        return
+    if choice_lower == "a":  # 一键流水线
+        _run_all_in_one_menu()
         return
     if choice_lower == "q":  # 用户选择退出
         print_info("已退出。")
@@ -749,6 +938,24 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
     out_dir = Path(out_raw).expanduser().resolve()  # 解析成绝对路径
     out_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
 
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if cli_script.exists():
+        cli_cmd = [
+            sys.executable,
+            str(cli_script),
+            "retake-keep-last",
+            "--words-json",
+            str(json_path),
+            "--text",
+            str(txt_path),
+            "--out",
+            str(out_dir),
+        ]
+        print_info("统一 CLI 等价命令:")
+        print_info(shlex.join(cli_cmd))
+    else:
+        print_warning("未找到 scripts/onepass_cli.py，暂无法展示统一 CLI 命令。")
+
     try:
         doc = load_words(json_path)  # 加载词级 JSON
     except Exception as exc:  # pragma: no cover - 交互流程
@@ -783,18 +990,4 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
     print_success(f"已生成文本: {txt_out_path}")
     print_success(f"已生成 Audition 标记: {markers_path}")
     print_success(f"已生成 EDL: {edl_path}")
-
-    script_path = ROOT_DIR / "scripts" / "retake_keep_last.py"  # 构建 CLI 命令用于复用
-    if script_path.exists():
-        cmd = [
-            sys.executable,
-            str(script_path),
-            "--words-json",
-            str(json_path),
-            "--text",
-            str(txt_path),
-            "--out",
-            str(out_dir),
-        ]
-        print_info(f"等价 CLI: {shlex.join(cmd)}")  # 打印便于批处理的命令
 

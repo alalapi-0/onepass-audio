@@ -53,6 +53,76 @@ OnePass Audio 面向“单人快速录制有声内容”场景，帮助播主/�
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
 
+## 统一命令行与整书批处理
+
+为方便自动化集成与整书批处理，本项目新增 `scripts/onepass_cli.py`，将前三轮的独立脚本封装为四个子命令，语义保持一致：
+
+- **`prep-norm`**：对单个文件或整个目录执行文本规范化，输出 `<stem>.norm.txt` 并追加 `out/normalize_report.csv`。
+- **`retake-keep-last`**：根据词级 JSON 与原文 TXT 导出 SRT/TXT/EDL/Markers，可单文件运行，也支持目录批量配对与汇总报告。
+- **`render-audio`**：读取 `*.edl.json` 并按保留片段渲染干净音频，支持递归批量模式，结果追加到 `batch_report.json` 的 `render_audio` 小节。
+- **`all-in-one`**：一键串联规范化 → 保留最后一遍 → 可选渲染音频，面向“整书跑通”场景，输出统一的 `batch_report.json` 汇总。
+
+### 常用命令示例
+
+```bash
+# 仅规范化某目录下的 TXT，并在 out/norm/ 写出 <stem>.norm.txt
+python scripts/onepass_cli.py prep-norm \
+  --in materials/example \
+  --out out/norm \
+  --char-map config/default_char_map.json \
+  --opencc none \
+  --glob "*.txt"
+
+# 单文件保留最后一遍 → SRT/TXT/EDL/Markers
+python scripts/onepass_cli.py retake-keep-last \
+  --words-json materials/example/demo.words.json \
+  --text materials/example/demo.txt \
+  --out out
+
+# 目录批量模式，按 stem 自动匹配 *.words.json ↔ *.norm.txt/ *.txt
+python scripts/onepass_cli.py retake-keep-last \
+  --materials materials/book1 \
+  --out out/book1 \
+  --glob-words "*.words.json" \
+  --glob-text "*.norm.txt" "*.txt" \
+  --workers 4
+
+# 按 EDL 渲染干净音频（目录递归）
+python scripts/onepass_cli.py render-audio \
+  --materials out/book1 \
+  --audio-root materials/book1 \
+  --glob-edl "*.keepLast.edl.json" \
+  --out out/book1/audio \
+  --workers 4
+
+# 整书一键流程：规范化 + 保留最后一遍 + 渲染音频
+python scripts/onepass_cli.py all-in-one \
+  --materials materials/book1 \
+  --audio-root materials/book1 \
+  --out out/book1 \
+  --do-norm --opencc none --norm-glob "*.txt" \
+  --glob-words "*.words.json" \
+  --glob-text "*.norm.txt" "*.txt" \
+  --render --glob-edl "*.keepLast.edl.json" \
+  --samplerate 48000 --channels 1 \
+  --workers 4
+```
+
+### 配对规则与命名约定
+
+- 批处理模式下以词级 JSON 的文件名前缀（去掉 `.words.json`）为基准，优先寻找 `<stem>.norm.txt`，若缺失则回退 `<stem>.txt`。
+- 所有生成文件都保留同一 `stem` 前缀：`<stem>.keepLast.srt/.txt/.edl.json/.audition_markers.csv` 与 `<stem>.clean.wav`。
+- `batch_report.json` 会分阶段记录 `items` 与 `summary`，方便统计成功、失败、耗时及聚合指标。
+
+### 并发参数与平台注意事项
+
+- `--workers` 允许并发处理多个条目，未指定时默认为串行；在 Windows 平台批量调用时，请确保入口脚本带有 `if __name__ == "__main__":` 保护。
+- 渲染阶段若不指定 `--samplerate`/`--channels`，将沿用 EDL 中的建议或源音频探测结果。
+
+### 与交互入口的关系
+
+主菜单 `[P]`、`[K]`、`[R]` 以及新增的 `[A]` 选项均会回显等价的统一 CLI 命令，便于将交互式操作迁移到自动化流水线。更细致的文本规范化、保留最后一遍与渲染音频说明，可继续参考下方对应章节。
+
 ## 原文规范化（可配置）
 
 在正式对齐前先清洗原稿，可以显著降低零宽字符、兼容字和混排空白造成的错位，从而提高“保留最后一遍”匹配的成功率。项目提供了可编辑的
@@ -146,12 +216,12 @@ python scripts/edl_render.py \
 
 ## 功能清单（当前与计划）
 
-- 去口癖（可配置词表），流畅断句（SRT/VTT/TXT）
+- [x] 去口癖（可配置词表），流畅断句（SRT/VTT/TXT）
 - [x] ASR 适配层 + 保留最后一遍策略
-- 生成 EDL（剪辑清单）与 Adobe Audition 标记 CSV
-- （已实现）按 EDL 一键导出干净音频
-- （已实现）原文规范化（可配置）
-- 批处理整本书与汇总报告（后续补上）
+- [x] 生成 EDL（剪辑清单）与 Adobe Audition 标记 CSV
+- [x] 按 EDL 一键导出干净音频
+- [x] 原文规范化（可配置）
+- [x] 统一命令行与批处理报告（含整书汇总）
 
 ## 目录结构
 
@@ -375,6 +445,7 @@ python onepass_main.py
 
 ## 更新日志
 
+- 2025-11-04：新增 `scripts/onepass_cli.py` 统一命令行、`onepass/batch_utils.py` 批处理工具以及主菜单 `[A]` 一键流水线入口，覆盖整书批处理与报告输出。
 - 2025-11-03：新增 `config/default_char_map.json`、`scripts/normalize_original.py` 与主菜单 `[P]` 原文规范化入口，提供可配置管线与归一报表。
 - 2025-11-02：新增统一 ASR 适配层、`scripts/retake_keep_last.py`、主菜单 `[K]` 单文件流程与示例素材，提供“保留最后一遍”一站式导出。
 - 2025-11-01：新增 `onepass.edl_renderer` 模块与 `scripts/edl_render.py`，主菜单支持按 EDL 渲染干净音频，并补充文档示例与最小跑通流程。
