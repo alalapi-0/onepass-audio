@@ -48,20 +48,27 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-dup-gap-sec",
         type=float,
-        default=MAX_DUP_GAP_SEC,
+        default=None,
         help=f"判定重录的最大近邻间隔（默认 {MAX_DUP_GAP_SEC:g} 秒）",
     )
     parser.add_argument(
         "--merge-adj-gap-sec",
         type=float,
-        default=MERGE_ADJ_GAP_SEC,
+        default=None,
         help=f"命中合并的最大间隙（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
     )
     parser.add_argument(
-        "--low-conf-threshold",
+        "--low-conf",
         type=float,
-        default=LOW_CONF,
+        default=None,
         help=f"低置信判定阈值（默认 {LOW_CONF:.2f}）",
+    )
+    parser.add_argument(
+        "--low-conf-threshold",
+        dest="low_conf",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--source-audio", help="可选：EDL 中记录的源音频相对路径")
     parser.add_argument("--samplerate", type=int, help="可选：EDL 建议采样率")
@@ -89,14 +96,17 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # pragma: no cover - I/O 依赖于外部环境
         print(f"读取词级 JSON 失败: {exc}", file=sys.stderr)
         return 1
+    max_dup_gap = args.max_dup_gap_sec if args.max_dup_gap_sec is not None else MAX_DUP_GAP_SEC
+    merge_gap = args.merge_adj_gap_sec if args.merge_adj_gap_sec is not None else MERGE_ADJ_GAP_SEC
+    low_conf = args.low_conf if args.low_conf is not None else LOW_CONF
     try:
         result = compute_sentence_review(
             list(doc),
             text_path,
             min_sent_chars=args.min_sent_chars,
-            max_dup_gap_sec=args.max_dup_gap_sec,
-            merge_gap_sec=args.merge_adj_gap_sec,
-            low_conf=args.low_conf_threshold,
+            max_dup_gap_sec=max_dup_gap,
+            merge_gap_sec=merge_gap,
+            low_conf=low_conf,
         )
     except Exception as exc:  # pragma: no cover - 依赖外部文件
         print(f"句子级审阅匹配失败: {exc}", file=sys.stderr)
