@@ -923,6 +923,38 @@ def _process_chapter(  # 处理单章素材并汇总结果
     )
 
 
+def _run_singlefile_menu():
+    """
+    单文件：词级 JSON + 原文（txt/norm.txt） → SRT/TXT/EDL/Markers
+    这里用 scripts/onepass_cli.py 的 'single' 子命令兜底：
+    python scripts/onepass_cli.py single --json <json> --text <txt> --out <dir>
+    若你的 CLI 子命令名字不同，请把下面的 'single' 改成实际的子命令。
+    """
+    import os, sys, subprocess
+
+    print("\n[单文件处理] 词级 JSON + 原文 → SRT/TXT/EDL/Markers")
+    json_path = input("词级 JSON 路径：").strip().strip('"')
+    text_path = input("原文 TXT路径：").strip().strip('"')
+    out_dir  = input("输出目录（默认 ./out/single）：").strip() or "./out/single"
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    cli = os.path.join('scripts', 'onepass_cli.py')
+    if not os.path.exists(cli):
+        print("[错误] 未找到 scripts/onepass_cli.py，请确认路径。")
+        return
+
+    # 如果你的 CLI 子命令不是 'single'，这里改成实际的（例如 'mk-edl' 等）
+    cmd = [sys.executable, cli, 'single', '--json', json_path, '--text', text_path, '--out', out_dir]
+    print(">>>", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+        print("[OK] 单文件已处理完成。输出目录：", out_dir)
+    except subprocess.CalledProcessError as e:
+        print("[失败] 子进程返回非零：", e.returncode)
+
+
+
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
 
@@ -938,7 +970,7 @@ def main() -> None:  # CLI 主入口
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
     choice_lower = choice.lower()
     if choice_lower == "k":  # 进入单文件保留最后一遍流程
-        _run_retake_keep_last_menu()
+        _run_singlefile_menu()  # 单文件：JSON+TXT → SRT/TXT/EDL/Markers
         return
     if choice_lower == "r":  # 仅执行音频渲染
         _run_edl_render_menu()

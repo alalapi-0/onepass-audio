@@ -442,11 +442,11 @@ def main(
 # =========================
 if __name__ == "__main__":
     # —— 基本范围 ——
-    ROOT_DIR = r"E:\nexus\word_json"    # 目标文件夹
+    ROOT_DIR = r"E:\onepass-audio\out\norm"    # 目标文件夹
     INCLUDE_SUBDIRS = True               # 是否递归子目录
     ONLY_EXTS = []                       # 仅处理这些扩展名（如[".jpg",".png",".txt"]），空列表=不限
     EXCLUDE_EXTS = []                    # 排除这些扩展名
-    ONLY_IF_NAME_CONTAINS = ".words"         # 仅当文件名包含此子串时才处理，如 "副本"
+    ONLY_IF_NAME_CONTAINS = ".norm"         # 仅当文件名包含此子串时才处理，如 "副本"
     KEEP_FULL_SUFFIX = False              # True: 保持多后缀（.tar.gz），False: 只保留最后一个
 
     # —— 规则执行顺序（可调整顺序或删改）——
@@ -469,7 +469,7 @@ if __name__ == "__main__":
 
     # —— 具体规则：仅填写/开启的会生效 ——
     # 1) 删除固定字段（示例：["副本", "(1)", " - 快照"]）
-    DELETE_SUBSTRINGS: List[str] = [".words"]  # ← 填写生效
+    DELETE_SUBSTRINGS: List[str] = [".norm"]  # ← 填写生效
 
     # 2) 批量替换（示例：{" ": "_", "（": "(", "）": ")"}）
     REPLACE_MAP: Dict[str, str] = {}   # ← 填写生效
