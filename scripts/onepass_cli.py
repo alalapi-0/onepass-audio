@@ -37,10 +37,15 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     MAX_WINDOW_SEC,
     MIN_SENT_CHARS,
     compute_retake_keep_last,
+    compute_sentence_review,
     export_audition_markers,
     export_edl_json,
     export_srt,
     export_txt,
+    export_sentence_edl_json,
+    export_sentence_markers,
+    export_sentence_srt,
+    export_sentence_txt,
 )
 from onepass.text_norm import (  # 规范化工具
     load_char_map,
@@ -48,6 +53,7 @@ from onepass.text_norm import (  # 规范化工具
     run_opencc_if_available,
     scan_suspects,
 )
+from onepass.sent_align import LOW_CONF, MERGE_ADJ_GAP_SEC
 from onepass.logging_utils import default_log_dir, setup_logger
 
 
@@ -302,18 +308,53 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
     return 0
 
 
-def _export_retake_outputs(result, stem: str, out_dir: Path, source_audio: Optional[str], samplerate: Optional[int], channels: Optional[int]) -> dict:
-    """根据保留最后一遍结果导出所有产物。"""
+def _export_retake_outputs(
+    result,
+    stem: str,
+    out_dir: Path,
+    source_audio: Optional[str],
+    samplerate: Optional[int],
+    channels: Optional[int],
+    *,
+    sentence_mode: bool,
+    review_only: bool,
+) -> dict:
+    """根据处理结果导出字幕、标记与 EDL。"""
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    srt_path = out_dir / f"{stem}.keepLast.srt"
-    txt_path = out_dir / f"{stem}.keepLast.txt"
-    markers_path = out_dir / f"{stem}.audition_markers.csv"
-    edl_path = out_dir / f"{stem}.keepLast.edl.json"
-    export_srt(result.keeps, srt_path)
-    export_txt(result.keeps, txt_path)
-    export_audition_markers(result.keeps, markers_path)
-    export_edl_json(result.edl_keep_segments, source_audio, edl_path, samplerate=samplerate, channels=channels)
+    if sentence_mode:
+        srt_path = out_dir / f"{stem}.sentence.keep.srt"
+        txt_path = out_dir / f"{stem}.sentence.keep.txt"
+        markers_path = out_dir / f"{stem}.sentence.audition_markers.csv"
+        edl_path = out_dir / f"{stem}.sentence.edl.json"
+        export_sentence_srt(result.hits, srt_path)
+        export_sentence_txt(result.hits, txt_path)
+        export_sentence_markers(result.hits, result.review_points, markers_path)
+        export_sentence_edl_json(
+            result.edl_keep_segments,
+            result.audio_start,
+            result.audio_end,
+            edl_path,
+            review_only=review_only,
+            source_audio_rel=source_audio,
+            samplerate=samplerate,
+            channels=channels,
+        )
+    else:
+        srt_path = out_dir / f"{stem}.keepLast.srt"
+        txt_path = out_dir / f"{stem}.keepLast.txt"
+        markers_path = out_dir / f"{stem}.audition_markers.csv"
+        edl_path = out_dir / f"{stem}.keepLast.edl.json"
+        export_srt(result.keeps, srt_path)
+        export_txt(result.keeps, txt_path)
+        export_audition_markers(result.keeps, markers_path)
+        export_edl_json(
+            result.edl_keep_segments,
+            source_audio,
+            edl_path,
+            samplerate=samplerate,
+            channels=channels,
+        )
     return {
         "srt": srt_path,
         "txt": txt_path,
@@ -334,21 +375,59 @@ def _process_retake_item(
     min_sent_chars: int,
     max_dup_gap_sec: float,
     max_window_sec: float,
+    sentence_strict: bool,
+    review_only: bool,
+    merge_adj_gap_sec: float,
+    low_conf: float,
 ) -> Tuple[str, dict]:
     """处理单个词级 JSON + 文本的组合。"""
 
     stem = stem_from_words_json(words_path)  # 解析输出前缀
     try:
         doc = load_words(words_path)  # 读取词级 JSON
-        result = compute_retake_keep_last(
-            list(doc),
-            text_path,
-            min_sent_chars=min_sent_chars,
-            max_dup_gap_sec=max_dup_gap_sec,
-            max_window_sec=max_window_sec,
-        )  # 执行核心算法
-        outputs = _export_retake_outputs(result, stem, out_dir, source_audio, samplerate, channels)  # 导出产物
-        stats = dict(result.stats)  # 复制统计信息
+        if sentence_strict:
+            result = compute_sentence_review(
+                list(doc),
+                text_path,
+                min_sent_chars=min_sent_chars,
+                max_dup_gap_sec=max_dup_gap_sec,
+                merge_gap_sec=merge_adj_gap_sec,
+                low_conf=low_conf,
+            )
+            outputs = _export_retake_outputs(
+                result,
+                stem,
+                out_dir,
+                source_audio,
+                samplerate,
+                channels,
+                sentence_mode=True,
+                review_only=review_only,
+            )
+            stats = dict(result.stats)
+            stats["review_only"] = bool(review_only)
+            stats["sentence_strict"] = True
+        else:
+            result = compute_retake_keep_last(
+                list(doc),
+                text_path,
+                min_sent_chars=min_sent_chars,
+                max_dup_gap_sec=max_dup_gap_sec,
+                max_window_sec=max_window_sec,
+            )  # 执行核心算法
+            outputs = _export_retake_outputs(
+                result,
+                stem,
+                out_dir,
+                source_audio,
+                samplerate,
+                channels,
+                sentence_mode=False,
+                review_only=False,
+            )  # 导出产物
+            stats = dict(result.stats)  # 复制统计信息
+            stats["sentence_strict"] = False
+            stats["review_only"] = False
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
         item = {
             "stem": stem,
@@ -382,6 +461,10 @@ def _run_retake_batch(
     min_sent_chars: int,
     max_dup_gap_sec: float,
     max_window_sec: float,
+    sentence_strict: bool,
+    review_only: bool,
+    merge_adj_gap_sec: float,
+    low_conf: float,
 ) -> dict:
     """执行目录批处理的配对与导出。"""
 
@@ -426,6 +509,10 @@ def _run_retake_batch(
                         min_sent_chars,
                         max_dup_gap_sec,
                         max_window_sec,
+                        sentence_strict,
+                        review_only,
+                        merge_adj_gap_sec,
+                        low_conf,
                     )
                 )  # 提交任务
             for future in as_completed(futures):  # 收集结果
@@ -462,6 +549,10 @@ def _run_retake_batch(
                     min_sent_chars,
                     max_dup_gap_sec,
                     max_window_sec,
+                    sentence_strict,
+                    review_only,
+                    merge_adj_gap_sec,
+                    low_conf,
                 )  # 直接处理
                 items.append(item)
                 if item["status"] != "ok":  # 更新失败计数
@@ -495,6 +586,10 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.min_sent_chars,
             args.max_dup_gap_sec,
             args.max_window_sec,
+            args.sentence_strict,
+            args.review_only,
+            args.merge_adj_gap_sec,
+            args.low_conf_threshold,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
@@ -512,6 +607,10 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.min_sent_chars,
             args.max_dup_gap_sec,
             args.max_window_sec,
+            args.sentence_strict,
+            args.review_only,
+            args.merge_adj_gap_sec,
+            args.low_conf_threshold,
         )
         items = result["items"]
         summary = result["summary"]
@@ -527,6 +626,13 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "len_gate_skipped",
         "neighbor_gap_skipped",
         "max_window_splits",
+        "total_sentences",
+        "matched_sentences",
+        "low_conf_sentences",
+        "unmatched_sentences",
+        "strict_hit_sentences",
+        "fuzzy_hit_sentences",
+        "keep_span_count",
     ]  # 汇总字段
     aggregated = {
         key: sum(int(item.get("stats", {}).get(key, 0)) for item in items if item.get("status") == "ok")
@@ -545,6 +651,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
 def handle_retake_keep_last(args: argparse.Namespace) -> int:
     """处理 retake-keep-last 子命令。"""
 
+    if args.review_only and not args.sentence_strict:
+        raise ValueError("--review-only 仅在启用 --sentence-strict 时可用。")
     parts: list[str] = []
     if args.words_json:
         parts.extend([
@@ -578,6 +686,14 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
     if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
         parts.extend(["--max-window-sec", str(args.max_window_sec)])
+    if float(args.merge_adj_gap_sec) != float(MERGE_ADJ_GAP_SEC):
+        parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
+    if float(args.low_conf_threshold) != float(LOW_CONF):
+        parts.extend(["--low-conf-threshold", str(args.low_conf_threshold)])
+    if args.sentence_strict:
+        parts.append("--sentence-strict")
+    if args.review_only:
+        parts.append("--review-only")
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -809,6 +925,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         min_sent_chars=args.min_sent_chars,
         max_dup_gap_sec=args.max_dup_gap_sec,
         max_window_sec=args.max_window_sec,
+        merge_adj_gap_sec=args.merge_adj_gap_sec,
+        low_conf_threshold=args.low_conf_threshold,
+        sentence_strict=args.sentence_strict,
+        review_only=args.review_only,
     )
     retake_result = run_retake_keep_last(retake_namespace, report_path=report_path, write_report=False)
     report["retake_keep_last"] = retake_result
@@ -848,6 +968,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
 def handle_all_in_one(args: argparse.Namespace) -> int:
     """处理 all-in-one 子命令。"""
 
+    if args.review_only and not args.sentence_strict:
+        raise ValueError("--review-only 仅能与 --sentence-strict 搭配使用。")
     parts: list[str] = [
         "--materials",
         str(Path(args.materials)),
@@ -880,6 +1002,14 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
     if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
         parts.extend(["--max-window-sec", str(args.max_window_sec)])
+    if float(args.merge_adj_gap_sec) != float(MERGE_ADJ_GAP_SEC):
+        parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
+    if float(args.low_conf_threshold) != float(LOW_CONF):
+        parts.extend(["--low-conf-threshold", str(args.low_conf_threshold)])
+    if args.sentence_strict:
+        parts.append("--sentence-strict")
+    if args.review_only:
+        parts.append("--review-only")
     LOGGER.info(
         "开始流水线任务: 素材=%s 音频=%s 输出=%s 渲染=%s",
         args.materials,
@@ -957,13 +1087,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_WINDOW_SEC,
         help=f"单个 drop 窗口的最长持续时间，单位秒（默认 {MAX_WINDOW_SEC:g}）",
     )
+    retake.add_argument(
+        "--merge-adj-gap-sec",
+        type=float,
+        default=MERGE_ADJ_GAP_SEC,
+        help=f"句子级命中合并间隔阈值（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
+    )
+    retake.add_argument(
+        "--low-conf-threshold",
+        type=float,
+        default=LOW_CONF,
+        help=f"句子命中置信度阈值（默认 {LOW_CONF:.2f}）",
+    )
+    retake.add_argument("--sentence-strict", action="store_true", help="启用句子级审阅模式")
+    retake.add_argument(
+        "--review-only",
+        action="store_true",
+        help="句子级模式下仅打点不裁剪，EDL 保留整段",
+    )
     retake.set_defaults(func=handle_retake_keep_last)
 
     render = subparsers.add_parser("render-audio", help="按 EDL 渲染干净音频")
     group_r = render.add_mutually_exclusive_group(required=True)
     group_r.add_argument("--edl", help="单文件模式：EDL JSON")
     group_r.add_argument("--materials", help="目录批处理模式：EDL 搜索根目录")
-    render.add_argument("--glob-edl", nargs="+", default=["*.keepLast.edl.json"], help="批处理模式：EDL 匹配模式")
+    render.add_argument(
+        "--glob-edl",
+        nargs="+",
+        default=["*.keepLast.edl.json", "*.sentence.edl.json"],
+        help="批处理模式：EDL 匹配模式",
+    )
     render.add_argument("--workers", type=int, help="批处理并发度")
     render.add_argument("--audio-root", required=True, help="源音频搜索根目录")
     render.add_argument("--out", required=True, help="输出目录")
@@ -988,7 +1141,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="保留最后一遍：文本匹配模式",
     )
     pipeline.add_argument("--render", action="store_true", help="执行渲染阶段")
-    pipeline.add_argument("--glob-edl", nargs="+", default=["*.keepLast.edl.json"], help="渲染阶段 EDL 匹配模式")
+    pipeline.add_argument(
+        "--glob-edl",
+        nargs="+",
+        default=["*.keepLast.edl.json", "*.sentence.edl.json"],
+        help="渲染阶段 EDL 匹配模式",
+    )
     pipeline.add_argument("--samplerate", type=int, help="渲染采样率")
     pipeline.add_argument("--channels", type=int, help="渲染声道数")
     pipeline.add_argument("--workers", type=int, help="批处理并发度 (Windows 需入口保护)")
@@ -1009,6 +1167,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=MAX_WINDOW_SEC,
         help=f"单个 drop 窗口的最长持续时间，单位秒（默认 {MAX_WINDOW_SEC:g}）",
+    )
+    pipeline.add_argument(
+        "--merge-adj-gap-sec",
+        type=float,
+        default=MERGE_ADJ_GAP_SEC,
+        help=f"句子级命中合并间隔阈值（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
+    )
+    pipeline.add_argument(
+        "--low-conf-threshold",
+        type=float,
+        default=LOW_CONF,
+        help=f"句子命中置信度阈值（默认 {LOW_CONF:.2f}）",
+    )
+    pipeline.add_argument("--sentence-strict", action="store_true", help="流水线中启用句子级审阅模式")
+    pipeline.add_argument(
+        "--review-only",
+        action="store_true",
+        help="句子级模式下仅打点不裁剪，EDL 保留整段",
     )
     pipeline.set_defaults(func=handle_all_in_one)
 

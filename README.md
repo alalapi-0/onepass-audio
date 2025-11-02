@@ -195,7 +195,7 @@ python scripts/onepass_cli.py retake-keep-last \
 python scripts/onepass_cli.py render-audio \
   --materials out/book1 \
   --audio-root materials/book1 \
-  --glob-edl "*.keepLast.edl.json" \
+  --glob-edl "*.keepLast.edl.json" "*.sentence.edl.json" \
   --out out/book1/audio \
   --workers 4
 
@@ -207,16 +207,46 @@ python scripts/onepass_cli.py all-in-one \
   --do-norm --opencc none --norm-glob "*.txt" \
   --glob-words "*.words.json" \
   --glob-text "*.norm.txt" "*.txt" \
-  --render --glob-edl "*.keepLast.edl.json" \
+  --render --glob-edl "*.keepLast.edl.json" "*.sentence.edl.json" \
   --samplerate 48000 --channels 1 \
   --workers 4
 ```
+
+### 句子级审阅（不剪未匹配，只打点）
+
+- **适用场景**：重录次数多、原稿存在微调导致逐行匹配不稳定时，先生成整句命中与审阅标记，再由人工在 AU/DAW 中复核；尤其适合对“误剪”极度敏感的长节目。 
+- **优点**：只保留整句完全命中的片段，未匹配与低置信句一律打点提醒，EDL 默认为整段 keep ⇒ 基本零误剪风险。缺点是需要人工在打点处做二次确认。
+- **输出文件**：`*.sentence.keep.srt`、`*.sentence.keep.txt`、`*.sentence.audition_markers.csv`、`*.sentence.edl.json`。标记中 `L*` 代表命中的句子，`R*` 以 `[REVIEW]`/`[LOW]` 前缀提示未匹配或低置信候选。
+
+最小命令示例（纯审阅，不剪音频）：
+
+```bash
+python scripts/onepass_cli.py retake-keep-last \
+  --words-json materials/example/demo.words.json \
+  --text materials/example/demo.txt \
+  --out out \
+  --sentence-strict --review-only
+```
+
+若仅需调试单个素材，可使用 `scripts/sentence_review.py`：
+
+```bash
+python scripts/sentence_review.py \
+  --words-json materials/example/demo.words.json \
+  --text materials/example/demo.txt \
+  --out out/sentence-demo \
+  --sentence-strict --review-only
+```
+
+将 `*.sentence.audition_markers.csv` 导入 Adobe Audition 后，`L*` 标记精确落在匹配成功的整句上；`R*` 标记则提示缺口或低置信命中，可沿时间轴逐一复核并手动剪辑。
 
 #### 重录去重阈值说明
 
 - `--min-sent-chars`：句长下限，默认 12。规范化后字符数不足此值的句子不会触发“只保留最后一遍”，避免“我们/因此”等短词被误判为重复段落。
 - `--max-dup-gap-sec`：相邻命中间隔阈值（秒），默认 30。仅当两次出现的起始时间差不超过该值时，才会丢弃较早的一次命中。
 - `--max-window-sec`：单个 drop 段的最长持续时间（秒），默认 90。超出时会自动拆分，避免 EDL 中出现数十分钟的超长剪切。
+- `--merge-adj-gap-sec`：句子级模式下用于合并相邻命中的间隙阈值（秒），默认 1.2，可避免同一段话被拆成多个 keep 段。
+- `--low-conf-threshold`：句子级模式下的相似度阈值，低于该值的命中会以 `[LOW]` 标记提醒人工复核。
 
 ### 配对规则与命名约定
 

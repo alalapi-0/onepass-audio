@@ -3,21 +3,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 import csv
 import json
 
 from .asr_loader import Word
+from .sent_align import (
+    LOW_CONF as SENT_LOW_CONF,
+    MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
+    MERGE_ADJ_GAP_SEC,
+    MIN_SENT_CHARS as SENT_MIN_SENT_CHARS,
+    MatchHit,
+    ReviewPoint,
+    KeepSpan as SentenceKeepSpan,
+    align_sentences_from_text,
+)
 from .text_norm import build_char_index_map, cjk_or_latin_seq, normalize_for_align
 
 __all__ = [
     "KeepSpan",
     "RetakeResult",
+    "SentenceReviewResult",
     "compute_retake_keep_last",
+    "compute_sentence_review",
     "export_srt",
     "export_txt",
     "export_audition_markers",
     "export_edl_json",
+    "export_sentence_srt",
+    "export_sentence_txt",
+    "export_sentence_markers",
+    "export_sentence_edl_json",
 ]
 
 MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
@@ -25,6 +41,19 @@ MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
 MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
 PAD_BEFORE = 0.00  # 预留向前补偿（当前轮保持为 0）
 PAD_AFTER = 0.00  # 预留向后补偿（当前轮保持为 0）
+
+
+@dataclass(slots=True)
+class SentenceReviewResult:
+    """句子级审阅模式的输出结构。"""
+
+    hits: list[MatchHit]
+    keep_spans: list[SentenceKeepSpan]
+    review_points: list[ReviewPoint]
+    edl_keep_segments: list[tuple[float, float]]
+    stats: dict
+    audio_start: float
+    audio_end: float
 
 
 @dataclass(slots=True)
@@ -236,6 +265,60 @@ def compute_retake_keep_last(
     return RetakeResult(keeps=keeps, edl_keep_segments=edl_keep_segments, drops=drops, stats=stats)  # 返回结果
 
 
+def compute_sentence_review(
+    words: list[Word],
+    original_txt: Path,
+    *,
+    puncts: str | None = None,
+    min_sent_chars: int = SENT_MIN_SENT_CHARS,
+    max_dup_gap_sec: float = SENT_MAX_DUP_GAP_SEC,
+    merge_gap_sec: float = MERGE_ADJ_GAP_SEC,
+    low_conf: float = SENT_LOW_CONF,
+) -> SentenceReviewResult:
+    """执行句子级审阅模式的匹配与统计。"""
+
+    if not words:
+        raise ValueError("词序列为空，无法执行句子级审阅逻辑。")
+    try:
+        raw_text = original_txt.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"未找到原文 TXT: {original_txt}. 请确认路径是否正确。") from exc
+    except OSError as exc:
+        raise OSError(f"读取原文 TXT 失败: {exc}. 请检查文件权限或是否被占用。") from exc
+
+    align_result = align_sentences_from_text(
+        raw_text,
+        words,
+        puncts=puncts,
+        min_sent_chars=min_sent_chars,
+        max_dup_gap_sec=max_dup_gap_sec,
+        merge_gap_sec=merge_gap_sec,
+        low_conf=low_conf,
+    )
+    keep_segments = [(span.start, span.end) for span in align_result.keep_spans]
+    audio_start = words[0].start
+    audio_end = words[-1].end
+    stats = dict(align_result.stats)
+    stats.update(
+        {
+            "total_words": len(words),
+            "audio_start": audio_start,
+            "audio_end": audio_end,
+            "keep_segments": len(keep_segments),
+        }
+    )
+    hits_sorted = sorted(align_result.hits, key=lambda item: (item.start_time, item.end_time))
+    return SentenceReviewResult(
+        hits=hits_sorted,
+        keep_spans=align_result.keep_spans,
+        review_points=align_result.review_points,
+        edl_keep_segments=keep_segments,
+        stats=stats,
+        audio_start=audio_start,
+        audio_end=audio_end,
+    )
+
+
 def _merge_segments(segments: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
     """合并重叠或相邻的时间片段。"""
 
@@ -376,6 +459,100 @@ def export_edl_json(
     content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"  # 序列化 JSON
     out_path.write_text(content, encoding="utf-8")  # 写出文件
     return out_path  # 返回输出路径
+
+
+def export_sentence_srt(hits: Sequence[MatchHit], out_path: Path) -> Path:
+    """将句子级命中导出为 SRT 字幕。"""
+
+    sorted_hits = sorted(hits, key=lambda item: (item.start_time, item.end_time))
+    lines: list[str] = []
+    for index, hit in enumerate(sorted_hits, start=1):
+        lines.append(str(index))
+        lines.append(f"{_format_timestamp(hit.start_time)} --> {_format_timestamp(hit.end_time)}")
+        lines.append(hit.sent_text)
+        lines.append("")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return out_path
+
+
+def export_sentence_txt(hits: Sequence[MatchHit], out_path: Path) -> Path:
+    """导出句子级命中的纯文本稿。"""
+
+    sorted_hits = sorted(hits, key=lambda item: (item.start_time, item.end_time))
+    content = "\n".join(hit.sent_text for hit in sorted_hits)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
+
+
+def export_sentence_markers(
+    hits: Sequence[MatchHit],
+    review_points: Sequence[ReviewPoint],
+    out_path: Path,
+) -> Path:
+    """导出句子级命中与审阅点的 Audition 标记。"""
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Name", "Start", "Duration", "Type", "Description"])
+        for hit in sorted(hits, key=lambda item: (item.start_time, item.end_time)):
+            duration = max(0.0, hit.end_time - hit.start_time)
+            writer.writerow(
+                [
+                    f"L{hit.sent_idx}",
+                    f"{hit.start_time:.3f}",
+                    f"{duration:.3f}",
+                    "cue",
+                    hit.sent_text[:24],
+                ]
+            )
+        for point in review_points:
+            description_prefix = "[LOW]" if point.kind == "low_conf" else "[REVIEW]"
+            description = f"{description_prefix} {point.sent_text[:24]}".strip()
+            writer.writerow(
+                [
+                    f"R{point.sent_idx}",
+                    f"{max(0.0, point.at_time):.3f}",
+                    "0.000",
+                    "cue",
+                    description,
+                ]
+            )
+    return out_path
+
+
+def export_sentence_edl_json(
+    keep_segments: Sequence[tuple[float, float]],
+    audio_start: float,
+    audio_end: float,
+    out_path: Path,
+    *,
+    review_only: bool,
+    source_audio_rel: str | None = None,
+    samplerate: int | None = None,
+    channels: int | None = None,
+) -> Path:
+    """根据句子级命中导出专用 EDL JSON。"""
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if review_only:
+        segments = [{"start": audio_start, "end": audio_end, "action": "keep"}]
+    else:
+        segments = [
+            {"start": start, "end": end, "action": "keep"}
+            for start, end in keep_segments
+        ]
+    payload = {
+        "source_audio": source_audio_rel,
+        "samplerate": samplerate,
+        "channels": channels,
+        "segments": segments,
+    }
+    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    out_path.write_text(content, encoding="utf-8")
+    return out_path
 
 
 def _format_timestamp(seconds: float) -> str:
