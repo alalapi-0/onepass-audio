@@ -33,7 +33,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     resolve_source_audio,
 )
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
-    MAX_DUP_GAP_SEC,
+    MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
     MAX_WINDOW_SEC,
     MIN_SENT_CHARS,
     compute_retake_keep_last,
@@ -53,7 +53,11 @@ from onepass.text_norm import (  # 规范化工具
     run_opencc_if_available,
     scan_suspects,
 )
-from onepass.sent_align import LOW_CONF, MERGE_ADJ_GAP_SEC
+from onepass.sent_align import (
+    LOW_CONF as SENT_LOW_CONF,
+    MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
+    MERGE_ADJ_GAP_SEC,
+)
 from onepass.logging_utils import default_log_dir, setup_logger
 
 
@@ -373,7 +377,8 @@ def _process_retake_item(
     materials_base: Optional[Path],
     out_base: Path,
     min_sent_chars: int,
-    max_dup_gap_sec: float,
+    line_max_dup_gap_sec: float,
+    sentence_max_dup_gap_sec: float,
     max_window_sec: float,
     sentence_strict: bool,
     review_only: bool,
@@ -390,7 +395,7 @@ def _process_retake_item(
                 list(doc),
                 text_path,
                 min_sent_chars=min_sent_chars,
-                max_dup_gap_sec=max_dup_gap_sec,
+                max_dup_gap_sec=sentence_max_dup_gap_sec,
                 merge_gap_sec=merge_adj_gap_sec,
                 low_conf=low_conf,
             )
@@ -412,7 +417,7 @@ def _process_retake_item(
                 list(doc),
                 text_path,
                 min_sent_chars=min_sent_chars,
-                max_dup_gap_sec=max_dup_gap_sec,
+                max_dup_gap_sec=line_max_dup_gap_sec,
                 max_window_sec=max_window_sec,
             )  # 执行核心算法
             outputs = _export_retake_outputs(
@@ -459,7 +464,8 @@ def _run_retake_batch(
     text_patterns: list[str],
     workers: Optional[int],
     min_sent_chars: int,
-    max_dup_gap_sec: float,
+    line_max_dup_gap_sec: float,
+    sentence_max_dup_gap_sec: float,
     max_window_sec: float,
     sentence_strict: bool,
     review_only: bool,
@@ -507,7 +513,8 @@ def _run_retake_batch(
                         materials_dir,
                         out_dir,
                         min_sent_chars,
-                        max_dup_gap_sec,
+                        line_max_dup_gap_sec,
+                        sentence_max_dup_gap_sec,
                         max_window_sec,
                         sentence_strict,
                         review_only,
@@ -547,7 +554,8 @@ def _run_retake_batch(
                     materials_dir,
                     out_dir,
                     min_sent_chars,
-                    max_dup_gap_sec,
+                    line_max_dup_gap_sec,
+                    sentence_max_dup_gap_sec,
                     max_window_sec,
                     sentence_strict,
                     review_only,
@@ -571,6 +579,17 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
 
     out_dir = Path(args.out).expanduser().resolve()  # 解析输出目录
     out_dir.mkdir(parents=True, exist_ok=True)  # 确保存在
+    if args.max_dup_gap_sec is None:
+        line_max_dup_gap_sec = LINE_MAX_DUP_GAP_SEC
+        sentence_max_dup_gap_sec = SENT_MAX_DUP_GAP_SEC
+    else:
+        value = float(args.max_dup_gap_sec)
+        line_max_dup_gap_sec = value
+        sentence_max_dup_gap_sec = value
+    merge_adj_gap_sec = (
+        float(args.merge_adj_gap_sec) if args.merge_adj_gap_sec is not None else MERGE_ADJ_GAP_SEC
+    )
+    low_conf = float(args.low_conf) if args.low_conf is not None else SENT_LOW_CONF
     if args.words_json:  # 单文件模式
         if not args.text:
             raise ValueError("单文件模式需要同时提供 --text")
@@ -584,12 +603,13 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             None,
             out_dir,
             args.min_sent_chars,
-            args.max_dup_gap_sec,
+            line_max_dup_gap_sec,
+            sentence_max_dup_gap_sec,
             args.max_window_sec,
             args.sentence_strict,
             args.review_only,
-            args.merge_adj_gap_sec,
-            args.low_conf_threshold,
+            merge_adj_gap_sec,
+            low_conf,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
@@ -605,12 +625,13 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             text_patterns,
             args.workers,
             args.min_sent_chars,
-            args.max_dup_gap_sec,
+            line_max_dup_gap_sec,
+            sentence_max_dup_gap_sec,
             args.max_window_sec,
             args.sentence_strict,
             args.review_only,
-            args.merge_adj_gap_sec,
-            args.low_conf_threshold,
+            merge_adj_gap_sec,
+            low_conf,
         )
         items = result["items"]
         summary = result["summary"]
@@ -682,14 +703,14 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--channels", str(args.channels)])
     if args.min_sent_chars != MIN_SENT_CHARS:
         parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
-    if float(args.max_dup_gap_sec) != float(MAX_DUP_GAP_SEC):
+    if args.max_dup_gap_sec is not None:
         parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
     if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
         parts.extend(["--max-window-sec", str(args.max_window_sec)])
-    if float(args.merge_adj_gap_sec) != float(MERGE_ADJ_GAP_SEC):
+    if args.merge_adj_gap_sec is not None:
         parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
-    if float(args.low_conf_threshold) != float(LOW_CONF):
-        parts.extend(["--low-conf-threshold", str(args.low_conf_threshold)])
+    if args.low_conf is not None:
+        parts.extend(["--low-conf", str(args.low_conf)])
     if args.sentence_strict:
         parts.append("--sentence-strict")
     if args.review_only:
@@ -926,7 +947,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         max_dup_gap_sec=args.max_dup_gap_sec,
         max_window_sec=args.max_window_sec,
         merge_adj_gap_sec=args.merge_adj_gap_sec,
-        low_conf_threshold=args.low_conf_threshold,
+        low_conf=args.low_conf,
         sentence_strict=args.sentence_strict,
         review_only=args.review_only,
     )
@@ -998,14 +1019,14 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--workers", str(args.workers)])
     if args.min_sent_chars != MIN_SENT_CHARS:
         parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
-    if float(args.max_dup_gap_sec) != float(MAX_DUP_GAP_SEC):
+    if args.max_dup_gap_sec is not None:
         parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
     if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
         parts.extend(["--max-window-sec", str(args.max_window_sec)])
-    if float(args.merge_adj_gap_sec) != float(MERGE_ADJ_GAP_SEC):
+    if args.merge_adj_gap_sec is not None:
         parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
-    if float(args.low_conf_threshold) != float(LOW_CONF):
-        parts.extend(["--low-conf-threshold", str(args.low_conf_threshold)])
+    if args.low_conf is not None:
+        parts.extend(["--low-conf", str(args.low_conf)])
     if args.sentence_strict:
         parts.append("--sentence-strict")
     if args.review_only:
@@ -1078,8 +1099,11 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--max-dup-gap-sec",
         type=float,
-        default=MAX_DUP_GAP_SEC,
-        help=f"判定重录的最大近邻间隔，单位秒（默认 {MAX_DUP_GAP_SEC:g}）",
+        default=None,
+        help=(
+            "判定重录的最大近邻间隔，单位秒（行级默认"
+            f" {LINE_MAX_DUP_GAP_SEC:g}，句子模式默认 {SENT_MAX_DUP_GAP_SEC:g}）"
+        ),
     )
     retake.add_argument(
         "--max-window-sec",
@@ -1090,14 +1114,21 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--merge-adj-gap-sec",
         type=float,
-        default=MERGE_ADJ_GAP_SEC,
+        default=None,
         help=f"句子级命中合并间隔阈值（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
     )
     retake.add_argument(
-        "--low-conf-threshold",
+        "--low-conf",
         type=float,
-        default=LOW_CONF,
-        help=f"句子命中置信度阈值（默认 {LOW_CONF:.2f}）",
+        default=None,
+        help=f"句子命中置信度阈值（默认 {SENT_LOW_CONF:.2f}）",
+    )
+    retake.add_argument(
+        "--low-conf-threshold",
+        dest="low_conf",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     retake.add_argument("--sentence-strict", action="store_true", help="启用句子级审阅模式")
     retake.add_argument(
@@ -1159,8 +1190,11 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--max-dup-gap-sec",
         type=float,
-        default=MAX_DUP_GAP_SEC,
-        help=f"判定重录的最大近邻间隔，单位秒（默认 {MAX_DUP_GAP_SEC:g}）",
+        default=None,
+        help=(
+            "判定重录的最大近邻间隔，单位秒（行级默认"
+            f" {LINE_MAX_DUP_GAP_SEC:g}，句子模式默认 {SENT_MAX_DUP_GAP_SEC:g}）"
+        ),
     )
     pipeline.add_argument(
         "--max-window-sec",
@@ -1171,14 +1205,21 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--merge-adj-gap-sec",
         type=float,
-        default=MERGE_ADJ_GAP_SEC,
+        default=None,
         help=f"句子级命中合并间隔阈值（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
     )
     pipeline.add_argument(
-        "--low-conf-threshold",
+        "--low-conf",
         type=float,
-        default=LOW_CONF,
-        help=f"句子命中置信度阈值（默认 {LOW_CONF:.2f}）",
+        default=None,
+        help=f"句子命中置信度阈值（默认 {SENT_LOW_CONF:.2f}）",
+    )
+    pipeline.add_argument(
+        "--low-conf-threshold",
+        dest="low_conf",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     pipeline.add_argument("--sentence-strict", action="store_true", help="流水线中启用句子级审阅模式")
     pipeline.add_argument(

@@ -157,6 +157,44 @@ pip install opencc
     --max-window-sec 90
   ```
 
+## 句子级审阅模式（更安全的整句剪裁）
+
+第七轮新增的句子级审阅模式在默认“保留最后一遍”逻辑之外提供了更保守的整句对齐流程：
+
+- **极低误剪风险**：只有完整命中的句子才会进入 keep 段；其余句子不会被剪掉，而是生成 [REVIEW]/[LOW] 标记供 AU 人工复核。
+- **更友好的默认阈值**：25 秒重录间隔、1 秒合并窗口、0.78 低置信阈值，兼顾重复朗读和安全边界。
+- **高级切句规则**：不会在 `3.14`、`example.com`、`Dr.`、`《书名》`、中文引号/括号等场景下误切句，省略号（`……`、`...`）也会视为单次终止。
+
+两种常见用法如下：
+
+**1. 纯审阅（不剪音频）**
+
+```bash
+python scripts/onepass_cli.py retake-keep-last \
+  --words-json materials/001序言01.words.json \
+  --text out/norm/001序言01.norm.txt \
+  --out out \
+  --sentence-strict --review-only
+```
+
+- `*.sentence.edl.json` 只包含一段 `[0, T]` 的 keep；`clean.wav` 时长≈原始音频。
+- `*.sentence.audition_markers.csv` 同时列出命中句（L 开头）和审阅点（R 开头）。
+
+**2. 仅剪整句命中（更稳的自动剪辑）**
+
+```bash
+python scripts/onepass_cli.py retake-keep-last \
+  --words-json materials/001序言01.words.json \
+  --text out/norm/001序言01.norm.txt \
+  --out out \
+  --sentence-strict
+```
+
+- `*.sentence.keep.srt` / `*.sentence.keep.txt` 只保留整句命中；EDL 由多个 keep 段组成，不会出现“一刀切整篇”的情况。
+- 可按需通过 `--low-conf`、`--merge-adj-gap-sec`、`--max-dup-gap-sec` 微调阈值，也可沿用默认的保守配置。
+
+> `--sentence-strict` 关闭时仍使用旧的“行级保留最后一遍”逻辑，保持向后兼容。`--review-only` 仅在开启句子模式时生效。
+
 ## 统一命令行与整书批处理
 
 为方便自动化集成与整书批处理，本项目新增 `scripts/onepass_cli.py`，将前三轮的独立脚本封装为四个子命令，语义保持一致：
