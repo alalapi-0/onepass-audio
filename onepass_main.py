@@ -2,6 +2,7 @@
 from __future__ import annotations  # 启用未来注解特性，避免前置字符串引用报错
 
 import json  # 处理 JSON 配置与结果文件
+import os  # 管理环境变量用于子进程
 import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
@@ -564,8 +565,12 @@ def _run_env_check_menu() -> None:  # 环境自检流程
     print_info("将执行命令:")
     print_info(command_preview)
 
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+
     try:
-        result = subprocess.run(  # 调用环境自检脚本
+        proc = subprocess.Popen(  # 调用环境自检脚本
             [
                 sys.executable,
                 str(script_path),
@@ -573,13 +578,23 @@ def _run_env_check_menu() -> None:  # 环境自检流程
                 str(out_path),
                 "--auto-fix",
             ],
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
         )
     except Exception as exc:
         print_error(f"执行环境自检失败: {exc}")
         return
 
-    if result.returncode != 0:  # 非零退出码时提醒用户检查终端输出
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        print(line, end="")
+    proc.wait()
+
+    if proc.returncode != 0:  # 非零退出码时提醒用户检查终端输出
         print_warning("环境自检返回非零状态，请结合上方输出排查。")
 
     report_path = out_path / "env_report.json"  # 默认报告文件
