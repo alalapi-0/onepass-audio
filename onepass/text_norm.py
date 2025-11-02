@@ -14,6 +14,7 @@ __all__ = [
     "fullwidth_halfwidth_normalize",
     "apply_char_map",
     "normalize_spaces",
+    "merge_hard_wraps",
     "normalize_pipeline",
     "run_opencc_if_available",
     "scan_suspects",
@@ -70,6 +71,93 @@ _ASCII_TO_CJK_PUNCT = {
     "[": "【",
     "]": "】",
 }
+
+_SENTENCE_ENDINGS = set("。！？!?…」』”’）】》")
+_WORD_CHAR_PATTERN = re.compile(r"[\w\u4e00-\u9fff]")
+
+
+def _clip_example(text: str, limit: int = 40) -> str:
+    """截断字符串到指定长度并在需要时追加省略号。"""
+
+    if len(text) <= limit:  # 未超出限制时直接返回
+        return text
+    return text[: limit - 1] + "…"  # 超出限制时在末尾追加省略号
+
+
+def merge_hard_wraps(raw: str) -> str:
+    """
+    将“非句末”的换行合并为单个空格，以减少短碎句导致的误判重复。
+    - 句末符集合：'。！？!?…」』”’）】》'
+    - 规则：
+      1) 若行尾不以以上句末符结束，则与下一行合并，中间放一个空格；
+      2) 类似“配不\n配得上”这类明显被硬切的词，强制合并；
+      3) 连续空行折叠为一个空行。
+    返回合并后的文本。
+    """
+
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")  # 统一换行符并拆分
+    merged_lines: list[str] = []  # 存放处理后的行
+    merged_count = 0  # 记录换行被合并的次数
+    merged_examples: list[str] = []  # 收集合并前后的示例
+
+    index = 0
+    blank_pending = False  # 标记是否已经写入空行以折叠连续空行
+    while index < len(lines):  # 遍历所有行
+        current = lines[index].strip()  # 去除首尾空白便于判断
+        if not current:  # 处理空行逻辑
+            if not blank_pending:  # 仅保留一个空行
+                merged_lines.append("")
+                blank_pending = True
+            index += 1
+            continue
+
+        blank_pending = False  # 遇到非空行时重置空行标记
+        buffer = current  # 初始化当前缓冲行
+        index += 1
+
+        while index < len(lines):  # 检查后续行是否需要合并
+            next_line_raw = lines[index]
+            next_line = next_line_raw.strip()
+            if not next_line:  # 遇到空行表示段落结束
+                break
+
+            last_char = buffer[-1] if buffer else ""
+            first_char = next_line[0] if next_line else ""
+            looks_hard_split = bool(
+                last_char
+                and first_char
+                and _WORD_CHAR_PATTERN.fullmatch(last_char)
+                and _WORD_CHAR_PATTERN.fullmatch(first_char)
+            )  # 判断是否为被硬切的词
+
+            if last_char in _SENTENCE_ENDINGS and not looks_hard_split:
+                break  # 句末标点且非强制合并，停止继续合并
+
+            before = f"{buffer}↵{next_line}"  # 记录合并前示例
+            buffer = buffer.rstrip() + " " + next_line.lstrip()  # 将换行改为空格
+            merged_count += 1  # 合并次数加一
+            if len(merged_examples) < 3:  # 仅保留前三个示例
+                after = buffer
+                merged_examples.append(f"{_clip_example(before)} => {_clip_example(after)}")
+            index += 1  # 消耗下一行
+
+        merged_lines.append(buffer)  # 写入处理后的行
+
+        # 跳过触发合并后遇到的空行，避免重复写入
+        while index < len(lines) and not lines[index].strip():
+            if not blank_pending:
+                merged_lines.append("")  # 保留一个空行
+                blank_pending = True
+            index += 1
+
+        blank_pending = False  # 写入非空行后重置
+
+    result = "\n".join(merged_lines).strip("\n")  # 重新拼接文本并去除多余首尾空行
+    merge_hard_wraps.last_stats = {
+        "merged_count": merged_count,
+        "examples": merged_examples,
+    }  # type: ignore[attr-defined]
+    return result
 
 
 def load_char_map(path: Path) -> dict:

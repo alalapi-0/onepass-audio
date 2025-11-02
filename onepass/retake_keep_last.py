@@ -20,6 +20,12 @@ __all__ = [
     "export_edl_json",
 ]
 
+MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
+MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
+MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
+PAD_BEFORE = 0.00  # 预留向前补偿（当前轮保持为 0）
+PAD_AFTER = 0.00  # 预留向后补偿（当前轮保持为 0）
+
 
 @dataclass(slots=True)
 class KeepSpan:
@@ -127,7 +133,16 @@ def _word_range_to_time(word_range: tuple[int, int], words: list[Word]) -> tuple
     return start_time, end_time  # 返回时间范围
 
 
-def compute_retake_keep_last(words: list[Word], original_txt: Path) -> RetakeResult:
+def compute_retake_keep_last(
+    words: list[Word],
+    original_txt: Path,
+    *,
+    min_sent_chars: int = MIN_SENT_CHARS,
+    max_dup_gap_sec: float = MAX_DUP_GAP_SEC,
+    max_window_sec: float = MAX_WINDOW_SEC,
+    pad_before: float = PAD_BEFORE,
+    pad_after: float = PAD_AFTER,
+) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
     if not words:  # 无词序列时无法继续
@@ -148,6 +163,10 @@ def compute_retake_keep_last(words: list[Word], original_txt: Path) -> RetakeRes
     strict_matches = 0  # 记录严格匹配次数
     fallback_matches = 0  # 记录回退匹配次数
     unmatched = 0  # 记录未匹配行数
+    len_gate_skipped = 0  # 记录因长度过短而跳过去重的次数
+    neighbor_gap_skipped = 0  # 记录因近邻间隔过长而跳过去重的次数
+    audio_floor = words[0].start  # 记录全局起点，后续 padding 需要参考
+    audio_ceiling = words[-1].end  # 记录全局终点
 
     for index, line in enumerate(lines, start=1):  # 遍历每一行原文
         norm_line = normalize_for_align(line)  # 规范化当前行
@@ -174,20 +193,44 @@ def compute_retake_keep_last(words: list[Word], original_txt: Path) -> RetakeRes
         if not spans:  # 若没有任何命中
             unmatched += 1  # 记录未匹配
             continue
-        last_span = max(spans, key=lambda item: item[0])  # 选择时间最晚的区间
-        keeps.append(KeepSpan(line_no=index, text=line, start=last_span[0], end=last_span[1]))  # 记录保留结果
+        spans.sort(key=lambda item: item[0])  # 先按起点排序方便去重
+        sentence_length = len(units)  # 规范化后的长度
+        if sentence_length < max(0, min_sent_chars):  # 长度不足阈值时跳过去重
+            len_gate_skipped += max(0, len(spans) - 1)  # 累计被跳过的命中数量
+            filtered_spans = spans  # 全部保留
+        else:
+            filtered_spans, skipped_by_gap = _filter_spans_by_gap(spans, max_dup_gap_sec)
+            neighbor_gap_skipped += skipped_by_gap
+        for span_start, span_end in filtered_spans:  # 逐个保留有效区间
+            padded_start = max(audio_floor, span_start - max(0.0, pad_before))
+            padded_end = min(audio_ceiling, span_end + max(0.0, pad_after))
+            if padded_end <= padded_start:  # 排除无效区间
+                continue
+            keeps.append(
+                KeepSpan(
+                    line_no=index,
+                    text=line,
+                    start=padded_start,
+                    end=padded_end,
+                )
+            )
 
     keeps.sort(key=lambda item: item.start)  # 按起始时间排序
     edl_keep_segments = _merge_segments([(span.start, span.end) for span in keeps])  # 合并时间段
     drops = _invert_segments(edl_keep_segments, words[0].start, words[-1].end)  # 计算补集
+    drops, window_splits = _split_long_segments(drops, max_window_sec)
 
+    matched_line_numbers = {span.line_no for span in keeps}  # 统计匹配到的原文行
     stats = {  # 汇总统计信息
         "total_words": len(words),
         "total_lines": len(lines),
-        "matched_lines": len(keeps),
+        "matched_lines": len(matched_line_numbers),
         "strict_matches": strict_matches,
         "fallback_matches": fallback_matches,
         "unmatched_lines": unmatched,
+        "len_gate_skipped": len_gate_skipped,
+        "neighbor_gap_skipped": neighbor_gap_skipped,
+        "max_window_splits": window_splits,
     }
 
     return RetakeResult(keeps=keeps, edl_keep_segments=edl_keep_segments, drops=drops, stats=stats)  # 返回结果
@@ -221,6 +264,56 @@ def _invert_segments(segments: list[tuple[float, float]], start: float, end: flo
     if cursor < end:  # 结尾若仍有空缺
         drops.append((cursor, end))
     return drops  # 返回补集片段
+
+
+def _filter_spans_by_gap(
+    spans: list[tuple[float, float]], max_gap: float
+) -> tuple[list[tuple[float, float]], int]:
+    """按照近邻间隔过滤重复命中，返回保留区间与跳过次数。"""
+
+    if not spans or max_gap is None:
+        return spans, 0
+    kept: list[tuple[float, float]] = []
+    skipped = 0
+    for idx, current in enumerate(spans):  # 遍历所有命中
+        if idx == len(spans) - 1:
+            kept.append(current)
+            continue
+        next_span = spans[idx + 1]
+        gap = next_span[0] - current[0]
+        should_drop = False
+        if max_gap is not None:
+            if max_gap > 0 and gap <= max_gap:
+                should_drop = True
+            elif max_gap <= 0 and gap <= 0:
+                should_drop = True
+        if should_drop:
+            continue  # 间隔较短视为重录，丢弃当前命中
+        kept.append(current)
+        skipped += 1  # 记录因间隔较大而保留前一次命中
+    return kept, skipped
+
+
+def _split_long_segments(
+    segments: list[tuple[float, float]], max_duration: float
+) -> tuple[list[tuple[float, float]], int]:
+    """将超出时长限制的 drop 段拆分成更小的片段。"""
+
+    if max_duration <= 0:
+        return [seg for seg in segments if seg[1] > seg[0]], 0
+    result: list[tuple[float, float]] = []
+    splits = 0
+    for start, end in segments:
+        if end <= start:
+            continue
+        remaining_start = start
+        while (end - remaining_start) > max_duration:
+            chunk_end = remaining_start + max_duration
+            result.append((remaining_start, chunk_end))
+            splits += 1
+            remaining_start = chunk_end
+        result.append((remaining_start, end))
+    return result, splits
 
 
 def export_srt(keeps: list[KeepSpan], out_path: Path) -> Path:
