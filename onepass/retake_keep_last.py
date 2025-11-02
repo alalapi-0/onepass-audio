@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Iterable, Sequence
 import csv
 import json
+import math
+import subprocess
 
 from .asr_loader import Word
 from .sent_align import (
@@ -34,13 +36,19 @@ __all__ = [
     "export_sentence_txt",
     "export_sentence_markers",
     "export_sentence_edl_json",
+    "infer_pause_boundaries",
 ]
 
 MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
 MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
 MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
-PAD_BEFORE = 0.00  # 预留向前补偿（当前轮保持为 0）
-PAD_AFTER = 0.00  # 预留向后补偿（当前轮保持为 0）
+
+PAUSE_GAP_SEC = 0.45  # 词间间隔超过该值视为自然停顿
+PAUSE_SNAP_LIMIT = 0.20  # 段首尾可吸附到停顿边界的最大距离
+PAD_BEFORE = 0.08  # EDL 段首补偿
+PAD_AFTER = 0.12  # EDL 段尾补偿
+MIN_SEGMENT_SEC = 0.18  # 过短的片段需要合并或丢弃
+MERGE_GAP_SEC = 0.06  # 吸附+补偿后相邻片段小于该间隔自动合并
 
 
 @dataclass(slots=True)
@@ -54,6 +62,7 @@ class SentenceReviewResult:
     stats: dict
     audio_start: float
     audio_end: float
+    debug_rows: list[dict] | None = None
 
 
 @dataclass(slots=True)
@@ -74,6 +83,326 @@ class RetakeResult:
     edl_keep_segments: list[tuple[float, float]]
     drops: list[tuple[float, float]]
     stats: dict
+    debug_rows: list[dict] | None = None
+
+
+def infer_pause_boundaries(words: list[Word], gap: float = PAUSE_GAP_SEC) -> list[tuple[float, float]]:
+    """基于词级时间戳推断停顿区间。"""
+
+    if not words:  # 无词直接返回空列表
+        return []
+    gap = max(0.0, gap)  # 防御性处理负值
+    pauses: list[tuple[float, float]] = []
+    if gap <= 0.0:  # 阈值为 0 表示不识别停顿
+        return pauses
+    for prev, current in zip(words, words[1:]):  # 遍历相邻词
+        distance = current.start - prev.end  # 计算词间空隙
+        if distance >= gap:  # 达到阈值视为停顿区
+            left = prev.end
+            right = current.start
+            if right > left:  # 仅记录有效区间
+                pauses.append((left, right))
+    return pauses
+
+
+def _merge_ranges(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """合并重叠或相连的区间。"""
+
+    sorted_ranges = sorted((item for item in intervals if item[1] > item[0]), key=lambda it: it[0])
+    if not sorted_ranges:
+        return []
+    merged: list[tuple[float, float]] = [sorted_ranges[0]]
+    for start, end in sorted_ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _snap_value(value: float, candidates: Sequence[float], limit: float) -> float:
+    """将时间点吸附到最近的候选边界。"""
+
+    if not candidates:
+        return value
+    limit = max(0.0, limit)
+    best = min(candidates, key=lambda item: abs(item - value))
+    if abs(best - value) <= limit:
+        return best
+    return value
+
+
+def _resolve_audio_duration(words: Sequence[Word], audio_path: Path | None) -> float:
+    """优先通过 ffprobe 获取音频时长，失败时回退到词序列终点。"""
+
+    fallback = words[-1].end if words else 0.0  # 词序列末尾作为兜底
+    if audio_path is None:
+        return fallback
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:  # 未安装 ffprobe 时直接回退
+        return fallback
+    if result.returncode != 0:
+        return fallback
+    try:
+        value = float(result.stdout.strip())
+    except ValueError:
+        return fallback
+    if not math.isfinite(value) or value <= 0:
+        return fallback
+    return value
+
+
+def _refine_segments(
+    keep_items: Sequence[object],
+    *,
+    audio_duration: float,
+    pause_intervals: Sequence[tuple[float, float]],
+    pause_snap_limit: float,
+    pad_before: float,
+    pad_after: float,
+    merge_gap_sec: float,
+    min_segment_sec: float,
+    pause_align: bool,
+    debug_label: str | None,
+) -> tuple[set[int], list[tuple[float, float]], dict[str, object], list[dict]]:
+    """对保留片段应用停顿吸附、补偿、合并及碎片剔除。"""
+
+    # 预处理参数，确保均为非负
+    pad_before = max(0.0, pad_before)
+    pad_after = max(0.0, pad_after)
+    merge_gap_sec = max(0.0, merge_gap_sec)
+    min_segment_sec = max(0.0, min_segment_sec)
+    pause_candidates: list[float] = []
+    for start, end in pause_intervals:
+        pause_candidates.extend([start, end])
+    pause_candidates = sorted(set(pause_candidates))
+    pause_used = pause_align and bool(pause_candidates)
+    debug_rows: dict[int, dict] = {}
+    segments: list[dict] = []
+    pause_snaps = 0
+    too_short_dropped = 0
+    for index, item in enumerate(keep_items):
+        orig_start = getattr(item, "start", 0.0)
+        orig_end = getattr(item, "end", 0.0)
+        if orig_end <= orig_start:
+            row = {
+                "item": debug_label or "",
+                "index": index,
+                "orig_start": orig_start,
+                "orig_end": orig_end,
+                "snap_start": orig_start,
+                "snap_end": orig_end,
+                "pad_start": orig_start,
+                "pad_end": orig_end,
+                "final_start": None,
+                "final_end": None,
+                "snap_start_used": False,
+                "snap_end_used": False,
+                "merged_into": "",
+                "dropped": True,
+                "notes": "invalid_source",
+            }
+            debug_rows[index] = row
+            continue
+        snapped_start = orig_start
+        snapped_end = orig_end
+        snap_start_used = False
+        snap_end_used = False
+        if pause_used:
+            snapped = _snap_value(snapped_start, pause_candidates, pause_snap_limit)
+            if snapped != snapped_start and snapped < orig_end:
+                snapped_start = snapped
+                snap_start_used = True
+                pause_snaps += 1
+            snapped = _snap_value(snapped_end, pause_candidates, pause_snap_limit)
+            if snapped != snapped_end and snapped > snapped_start:
+                snapped_end = snapped
+                snap_end_used = True
+                pause_snaps += 1
+        padded_start = max(0.0, snapped_start - pad_before)
+        padded_end = min(audio_duration, snapped_end + pad_after)
+        if padded_end - padded_start <= 1e-6:
+            row = {
+                "item": debug_label or "",
+                "index": index,
+                "orig_start": orig_start,
+                "orig_end": orig_end,
+                "snap_start": snapped_start,
+                "snap_end": snapped_end,
+                "pad_start": padded_start,
+                "pad_end": padded_end,
+                "final_start": None,
+                "final_end": None,
+                "snap_start_used": snap_start_used,
+                "snap_end_used": snap_end_used,
+                "merged_into": "",
+                "dropped": True,
+                "notes": "clamped_to_zero",
+            }
+            debug_rows[index] = row
+            too_short_dropped += 1
+            continue
+        row = {
+            "item": debug_label or "",
+            "index": index,
+            "orig_start": orig_start,
+            "orig_end": orig_end,
+            "snap_start": snapped_start,
+            "snap_end": snapped_end,
+            "pad_start": padded_start,
+            "pad_end": padded_end,
+            "final_start": None,
+            "final_end": None,
+            "snap_start_used": snap_start_used,
+            "snap_end_used": snap_end_used,
+            "merged_into": "",
+            "dropped": False,
+            "notes": "",
+        }
+        debug_rows[index] = row
+        segments.append(
+            {
+                "start": padded_start,
+                "end": padded_end,
+                "indices": [index],
+            }
+        )
+    segments.sort(key=lambda item: item["start"])
+    auto_merged = 0
+    merged_segments: list[dict] = []
+    for segment in segments:
+        if not merged_segments:
+            merged_segments.append(segment)
+            continue
+        prev = merged_segments[-1]
+        gap = segment["start"] - prev["end"]
+        if gap <= merge_gap_sec:
+            prev["end"] = max(prev["end"], segment["end"])
+            prev_indices = prev["indices"]
+            for idx in segment["indices"]:
+                if idx not in prev_indices:
+                    prev_indices.append(idx)
+                debug_rows[idx]["merged_into"] = prev_indices[0]
+                note = debug_rows[idx]["notes"]
+                debug_rows[idx]["notes"] = ";".join(filter(None, [note, "merge_gap"]))
+            auto_merged += 1
+        else:
+            merged_segments.append(segment)
+
+    refined_segments = merged_segments
+    i = 0
+    while i < len(refined_segments):
+        segment = refined_segments[i]
+        duration = segment["end"] - segment["start"]
+        if duration >= min_segment_sec or len(refined_segments) == 1:
+            i += 1
+            continue
+        if i > 0:
+            prev = refined_segments[i - 1]
+            prev["end"] = max(prev["end"], segment["end"])
+            for idx in segment["indices"]:
+                if idx not in prev["indices"]:
+                    prev["indices"].append(idx)
+                debug_rows[idx]["merged_into"] = prev["indices"][0]
+                note = debug_rows[idx]["notes"]
+                debug_rows[idx]["notes"] = ";".join(filter(None, [note, "merge_short_prev"]))
+            auto_merged += 1
+            refined_segments.pop(i)
+            continue
+        if i + 1 < len(refined_segments):
+            nxt = refined_segments[i + 1]
+            nxt["start"] = min(nxt["start"], segment["start"])
+            nxt_indices = nxt["indices"]
+            for idx in segment["indices"]:
+                if idx not in nxt_indices:
+                    nxt_indices.insert(0, idx)
+                debug_rows[idx]["merged_into"] = nxt_indices[0]
+                note = debug_rows[idx]["notes"]
+                debug_rows[idx]["notes"] = ";".join(filter(None, [note, "merge_short_next"]))
+            auto_merged += 1
+            refined_segments.pop(i)
+            continue
+        for idx in segment["indices"]:
+            debug_rows[idx]["dropped"] = True
+            note = debug_rows[idx]["notes"]
+            debug_rows[idx]["notes"] = ";".join(filter(None, [note, "dropped_short"]))
+        too_short_dropped += len(segment["indices"])
+        refined_segments.pop(i)
+    active_indices: set[int] = set()
+    final_segments: list[tuple[float, float]] = []
+    for segment in refined_segments:
+        start = max(0.0, min(audio_duration, segment["start"]))
+        end = max(0.0, min(audio_duration, segment["end"]))
+        if end - start <= 1e-6:
+            for idx in segment["indices"]:
+                debug_rows[idx]["dropped"] = True
+                note = debug_rows[idx]["notes"]
+                debug_rows[idx]["notes"] = ";".join(filter(None, [note, "dropped_after_merge"]))
+            too_short_dropped += len(segment["indices"])
+            continue
+        final_segments.append((start, end))
+        unique_indices = []
+        seen: set[int] = set()
+        for idx in segment["indices"]:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            unique_indices.append(idx)
+        segment["indices"] = unique_indices
+        for idx in unique_indices:
+            active_indices.add(idx)
+            debug_rows[idx]["final_start"] = start
+            debug_rows[idx]["final_end"] = end
+            item_obj = keep_items[idx]
+            if hasattr(item_obj, "start") and hasattr(item_obj, "end"):
+                setattr(item_obj, "start", start)
+                setattr(item_obj, "end", end)
+    debug_list = []
+    for idx in range(len(keep_items)):
+        row = debug_rows.get(
+            idx,
+            {
+                "item": debug_label or "",
+                "index": idx,
+                "orig_start": None,
+                "orig_end": None,
+                "snap_start": None,
+                "snap_end": None,
+                "pad_start": None,
+                "pad_end": None,
+                "final_start": None,
+                "final_end": None,
+                "snap_start_used": False,
+                "snap_end_used": False,
+                "merged_into": "",
+                "dropped": True,
+                "notes": "missing",
+            },
+        )
+        debug_list.append(row)
+    stats = {
+        "pause_used": bool(pause_used),
+        "pause_snaps": int(pause_snaps),
+        "auto_merged": int(auto_merged),
+        "too_short_dropped": int(too_short_dropped),
+        "pad_ms": {
+            "before": int(round(pad_before * 1000)),
+            "after": int(round(pad_after * 1000)),
+        },
+    }
+    return active_indices, final_segments, stats, debug_list
 
 
 def _normalize_words(words: list[Word]) -> tuple[list[str], str, list[tuple[int, int]]]:
@@ -171,6 +500,14 @@ def compute_retake_keep_last(
     max_window_sec: float = MAX_WINDOW_SEC,
     pad_before: float = PAD_BEFORE,
     pad_after: float = PAD_AFTER,
+    pause_align: bool = True,
+    pause_gap_sec: float = PAUSE_GAP_SEC,
+    pause_snap_limit: float = PAUSE_SNAP_LIMIT,
+    min_segment_sec: float = MIN_SEGMENT_SEC,
+    merge_gap_sec: float = MERGE_GAP_SEC,
+    silence_ranges: Sequence[tuple[float, float]] | None = None,
+    audio_path: Path | None = None,
+    debug_label: str | None = None,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -194,9 +531,6 @@ def compute_retake_keep_last(
     unmatched = 0  # 记录未匹配行数
     len_gate_skipped = 0  # 记录因长度过短而跳过去重的次数
     neighbor_gap_skipped = 0  # 记录因近邻间隔过长而跳过去重的次数
-    audio_floor = words[0].start  # 记录全局起点，后续 padding 需要参考
-    audio_ceiling = words[-1].end  # 记录全局终点
-
     for index, line in enumerate(lines, start=1):  # 遍历每一行原文
         norm_line = normalize_for_align(line)  # 规范化当前行
         units = _line_to_units(norm_line)  # 转换为匹配字符序列
@@ -231,22 +565,48 @@ def compute_retake_keep_last(
             filtered_spans, skipped_by_gap = _filter_spans_by_gap(spans, max_dup_gap_sec)
             neighbor_gap_skipped += skipped_by_gap
         for span_start, span_end in filtered_spans:  # 逐个保留有效区间
-            padded_start = max(audio_floor, span_start - max(0.0, pad_before))
-            padded_end = min(audio_ceiling, span_end + max(0.0, pad_after))
-            if padded_end <= padded_start:  # 排除无效区间
-                continue
             keeps.append(
                 KeepSpan(
                     line_no=index,
                     text=line,
-                    start=padded_start,
-                    end=padded_end,
+                    start=span_start,
+                    end=span_end,
                 )
             )
 
-    keeps.sort(key=lambda item: item.start)  # 按起始时间排序
-    edl_keep_segments = _merge_segments([(span.start, span.end) for span in keeps])  # 合并时间段
-    drops = _invert_segments(edl_keep_segments, words[0].start, words[-1].end)  # 计算补集
+    audio_duration = _resolve_audio_duration(words, audio_path)
+    pause_intervals: list[tuple[float, float]] = []
+    silence_count = 0
+    if pause_align:
+        pause_intervals = infer_pause_boundaries(words, pause_gap_sec)
+        if silence_ranges:
+            clamped_silence = [
+                (
+                    max(0.0, min(audio_duration, start)),
+                    max(0.0, min(audio_duration, end)),
+                )
+                for start, end in silence_ranges
+                if end > start
+            ]
+            silence_count = len(clamped_silence)
+            pause_intervals.extend(clamped_silence)
+        pause_intervals = _merge_ranges(pause_intervals)
+    active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
+        keeps,
+        audio_duration=audio_duration,
+        pause_intervals=pause_intervals,
+        pause_snap_limit=pause_snap_limit,
+        pad_before=pad_before,
+        pad_after=pad_after,
+        merge_gap_sec=merge_gap_sec,
+        min_segment_sec=min_segment_sec,
+        pause_align=pause_align,
+        debug_label=debug_label,
+    )
+    keeps = [keeps[idx] for idx in range(len(keeps)) if idx in active_indices]
+    keeps.sort(key=lambda item: item.start)
+    edl_keep_segments = final_segments
+    drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)  # 计算补集
     drops, window_splits = _split_long_segments(drops, max_window_sec)
 
     matched_line_numbers = {span.line_no for span in keeps}  # 统计匹配到的原文行
@@ -260,9 +620,24 @@ def compute_retake_keep_last(
         "len_gate_skipped": len_gate_skipped,
         "neighbor_gap_skipped": neighbor_gap_skipped,
         "max_window_splits": window_splits,
+        "audio_duration": audio_duration,
+        "keep_duration": sum(max(0.0, end - start) for start, end in edl_keep_segments),
+        "silence_regions": silence_count,
     }
+    stats.update(refine_stats)
+    keep_duration = stats["keep_duration"]
+    if audio_duration > 0:
+        stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
+    else:
+        stats["cut_ratio"] = 0.0
 
-    return RetakeResult(keeps=keeps, edl_keep_segments=edl_keep_segments, drops=drops, stats=stats)  # 返回结果
+    return RetakeResult(
+        keeps=keeps,
+        edl_keep_segments=edl_keep_segments,
+        drops=drops,
+        stats=stats,
+        debug_rows=debug_rows,
+    )
 
 
 def compute_sentence_review(
@@ -274,6 +649,16 @@ def compute_sentence_review(
     max_dup_gap_sec: float = SENT_MAX_DUP_GAP_SEC,
     merge_gap_sec: float = MERGE_ADJ_GAP_SEC,
     low_conf: float = SENT_LOW_CONF,
+    pad_before: float = PAD_BEFORE,
+    pad_after: float = PAD_AFTER,
+    pause_align: bool = True,
+    pause_gap_sec: float = PAUSE_GAP_SEC,
+    pause_snap_limit: float = PAUSE_SNAP_LIMIT,
+    min_segment_sec: float = MIN_SEGMENT_SEC,
+    segment_merge_gap_sec: float = MERGE_GAP_SEC,
+    silence_ranges: Sequence[tuple[float, float]] | None = None,
+    audio_path: Path | None = None,
+    debug_label: str | None = None,
 ) -> SentenceReviewResult:
     """执行句子级审阅模式的匹配与统计。"""
 
@@ -295,9 +680,48 @@ def compute_sentence_review(
         merge_gap_sec=merge_gap_sec,
         low_conf=low_conf,
     )
-    keep_segments = [(span.start, span.end) for span in align_result.keep_spans]
-    audio_start = words[0].start
-    audio_end = words[-1].end
+    keep_spans = list(align_result.keep_spans)
+    audio_duration = _resolve_audio_duration(words, audio_path)
+    pause_intervals: list[tuple[float, float]] = []
+    silence_count = 0
+    if pause_align:
+        pause_intervals = infer_pause_boundaries(words, pause_gap_sec)
+        if silence_ranges:
+            clamped_silence = [
+                (
+                    max(0.0, min(audio_duration, start)),
+                    max(0.0, min(audio_duration, end)),
+                )
+                for start, end in silence_ranges
+                if end > start
+            ]
+            silence_count = len(clamped_silence)
+            pause_intervals.extend(clamped_silence)
+        pause_intervals = _merge_ranges(pause_intervals)
+    active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
+        keep_spans,
+        audio_duration=audio_duration,
+        pause_intervals=pause_intervals,
+        pause_snap_limit=pause_snap_limit,
+        pad_before=pad_before,
+        pad_after=pad_after,
+        merge_gap_sec=segment_merge_gap_sec,
+        min_segment_sec=min_segment_sec,
+        pause_align=pause_align,
+        debug_label=debug_label,
+    )
+    keep_spans = [keep_spans[idx] for idx in range(len(keep_spans)) if idx in active_indices]
+    keep_segments = final_segments
+    span_by_sent: dict[int, tuple[float, float]] = {}
+    for span in keep_spans:
+        for sent_idx in span.sent_indices:
+            span_by_sent[sent_idx] = (span.start, span.end)
+    for hit in align_result.hits:
+        bounds = span_by_sent.get(hit.sent_idx)
+        if bounds:
+            hit.start_time, hit.end_time = bounds
+    audio_start = 0.0
+    audio_end = audio_duration
     stats = dict(align_result.stats)
     stats.update(
         {
@@ -305,17 +729,26 @@ def compute_sentence_review(
             "audio_start": audio_start,
             "audio_end": audio_end,
             "keep_segments": len(keep_segments),
+            "audio_duration": audio_duration,
+            "keep_duration": sum(max(0.0, end - start) for start, end in keep_segments),
+            "silence_regions": silence_count,
         }
     )
+    stats.update(refine_stats)
+    if audio_duration > 0:
+        stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - stats["keep_duration"]) / audio_duration))
+    else:
+        stats["cut_ratio"] = 0.0
     hits_sorted = sorted(align_result.hits, key=lambda item: (item.start_time, item.end_time))
     return SentenceReviewResult(
         hits=hits_sorted,
-        keep_spans=align_result.keep_spans,
+        keep_spans=keep_spans,
         review_points=align_result.review_points,
         edl_keep_segments=keep_segments,
         stats=stats,
         audio_start=audio_start,
         audio_end=audio_end,
+        debug_rows=debug_rows,
     )
 
 
