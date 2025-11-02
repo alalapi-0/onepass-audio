@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse  # 解析命令行参数
+import ctypes  # 检测管理员权限
 import json  # 写入 JSON 报告
 import os  # 访问环境变量与权限
 import platform  # 获取平台信息
@@ -60,12 +61,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _run_command(command: List[str], verbose: bool) -> tuple[int, str]:
+def _run_command(command: List[str], verbose: bool, extra_env: Optional[Dict[str, str]] = None) -> tuple[int, str]:
     """运行外部命令并返回退出码与输出。"""
 
     # 当 verbose 开启时，先打印命令以便复现
     if verbose:
         print(f"执行命令: {' '.join(command)}")
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    if extra_env:
+        env.update(extra_env)
+
     try:
         # 捕获标准输出与错误输出，统一返回文本
         completed = subprocess.run(
@@ -73,6 +80,9 @@ def _run_command(command: List[str], verbose: bool) -> tuple[int, str]:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
         )
     except OSError as exc:
         # 命令启动失败时返回错误信息
@@ -85,7 +95,7 @@ def _run_command(command: List[str], verbose: bool) -> tuple[int, str]:
     return completed.returncode, output.strip()
 
 
-def _check_python() -> tuple[Dict[str, Any], List[CheckItem], List[str]]:
+def _check_python(project_root: Path) -> tuple[Dict[str, Any], List[CheckItem], List[str], Dict[str, Any]]:
     """检查 Python 版本与虚拟环境状态。"""
 
     # 读取当前解释器版本信息
@@ -95,6 +105,34 @@ def _check_python() -> tuple[Dict[str, Any], List[CheckItem], List[str]]:
     meets_requirement = version_info >= (3, 10)
     # 判断当前是否处于虚拟环境中
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    venv_root = project_root / ".venv"
+    venv_hints: List[str] = []
+    venv_detail = "已启用 venv" if in_venv else "当前使用系统解释器"
+    venv_advice = ""
+    notes: List[str] = []
+    if in_venv:
+        notes_text = ""
+    else:
+        notes_text = "当前使用系统解释器。"
+        if venv_root.exists():
+            activate_cmd = r".\.venv\Scripts\activate"
+            venv_hints.append(activate_cmd)
+            venv_advice = f"建议执行：{activate_cmd}"
+            notes_text = (
+                f"当前使用系统解释器。可在项目根执行：{activate_cmd}"
+            )
+        else:
+            create_cmd = "python -m venv .venv"
+            activate_cmd = r".\.venv\Scripts\activate"
+            venv_hints.extend([create_cmd, activate_cmd])
+            venv_advice = (
+                "建议创建并激活虚拟环境："
+                f"{create_cmd}；{activate_cmd}"
+            )
+            notes_text = (
+                "当前使用系统解释器。可执行以下命令创建并激活虚拟环境："
+                f"{create_cmd}；{activate_cmd}"
+            )
     # 构造版本检查摘要
     version_item = CheckItem(
         "Python 版本",
@@ -106,21 +144,24 @@ def _check_python() -> tuple[Dict[str, Any], List[CheckItem], List[str]]:
     venv_item = CheckItem(
         "虚拟环境",
         "ok" if in_venv else "warn",
-        "已启用 venv" if in_venv else "当前使用系统解释器",
-        "" if in_venv else "建议使用 python -m venv 隔离依赖。",
+        venv_detail,
+        venv_advice,
     )
-    # 缺少虚拟环境时追加提醒
-    notes: List[str] = []
-    if not in_venv:
-        notes.append("未检测到虚拟环境，后续安装依赖可能影响系统 Python。")
+    if notes_text:
+        notes.append(notes_text)
     # 构建 JSON 片段
     payload = {
         "version": version_str,
         "ok": meets_requirement,
         "in_venv": in_venv,
     }
-    # 返回 JSON 数据、摘要项列表与备注
-    return payload, [version_item, venv_item], notes
+    venv_payload = {
+        "active": in_venv,
+        "hint": venv_hints,
+        "venv_path": str(venv_root),
+    }
+    # 返回 JSON 数据、摘要项列表、备注与虚拟环境提示
+    return payload, [version_item, venv_item], notes, venv_payload
 
 
 def _check_tool(tool: str, verbose: bool, required: bool) -> tuple[Dict[str, Any], CheckItem, Optional[str]]:
@@ -157,6 +198,46 @@ def _check_tool(tool: str, verbose: bool, required: bool) -> tuple[Dict[str, Any
         advice = f"运行 {tool} -version 失败: {output}".strip()
         note = advice if status != "ok" else None
     return version_info, CheckItem(tool, status, detail, advice), note
+
+
+def check_opencc(verbose: bool) -> tuple[Dict[str, Any], CheckItem, List[str]]:
+    """检测 OpenCC 是否可用。"""
+
+    info: Dict[str, Any] = {"available": False, "impl": None}
+    notes: List[str] = []
+    install_hint = "python -m pip install opencc-python-reimplemented"
+
+    try:
+        from opencc import OpenCC  # type: ignore
+
+        OpenCC("t2s")
+    except Exception as exc:
+        if verbose:
+            print(f"OpenCC python 实现不可用: {exc}")
+    else:
+        info.update({"available": True, "impl": "python", "module": "opencc"})
+        detail = "已找到 OpenCC (python) —— opencc-python-reimplemented 可用"
+        item = CheckItem("OpenCC", "ok", detail, "")
+        return info, item, notes
+
+    exe = shutil.which("opencc")
+    if exe:
+        info.update({"path": exe})
+        code, output = _run_command([exe, "-v"], verbose)
+        if code == 0:
+            version_line = output.splitlines()[0] if output else ""
+            info.update({"available": True, "impl": "cli", "version": version_line})
+            detail = f"已找到 OpenCC 可执行文件: {exe}"
+            item = CheckItem("OpenCC", "ok", detail, "")
+            return info, item, notes
+        notes.append(f"opencc -v 返回码 {code}: {output}")
+
+    info["hint"] = install_hint
+    detail = "未检测到 OpenCC，将跳过简繁转换。"
+    advice = f"可安装: {install_hint}"
+    notes.append(advice)
+    item = CheckItem("OpenCC", "warn", detail, advice)
+    return info, item, notes
 
 
 def _test_writable(path: Path) -> bool:
@@ -282,40 +363,71 @@ def _check_windows_path_hints(out_dir: Path, raw_out: str, verbose: bool) -> tup
             )
         )
 
-    # 通过注册表查询 LongPathsEnabled 状态
+    return rows, notes
+
+
+def is_admin() -> bool:
+    """判断当前进程是否拥有管理员权限。"""
+
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def check_long_paths(verbose: bool) -> tuple[Dict[str, Any], CheckItem, List[str]]:
+    """检测 Windows 长路径策略。"""
+
+    notes: List[str] = []
+    cmd_hint = (
+        r'reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" '
+        r"/v LongPathsEnabled /t REG_DWORD /d 1 /f"
+    )
+
+    if sys.platform != "win32":
+        info = {
+            "enabled": True,
+            "platform": sys.platform,
+            "can_auto_fix": False,
+            "hint": cmd_hint,
+        }
+        item = CheckItem("长路径支持", "ok", "非 Windows 平台，无需配置", "")
+        return info, item, notes
+
+    info: Dict[str, Any] = {
+        "enabled": False,
+        "platform": sys.platform,
+        "can_auto_fix": is_admin(),
+        "hint": cmd_hint,
+    }
+
     try:
         import winreg  # type: ignore
 
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\FileSystem",
-        ) as key:
-            value, _ = winreg.QueryValueEx(key, "LongPathsEnabled")
-            if value != 1:
-                rows.append(
-                    CheckItem(
-                        "长路径支持",
-                        "warn",
-                        "未启用 LongPathsEnabled。",
-                        "可参考微软文档启用长路径策略，避免处理超长路径时失败。",
-                    )
-                )
-                notes.append("Windows 未启用长路径策略，处理超长路径时可能失败。")
-            else:
-                rows.append(CheckItem("长路径支持", "ok", "已启用 LongPathsEnabled", ""))
+        key_path = r"SYSTEM\CurrentControlSet\Control\FileSystem"
+        value_name = "LongPathsEnabled"
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            value, _ = winreg.QueryValueEx(key, value_name)
+            info["enabled"] = bool(value == 1)
     except Exception as exc:  # pragma: no cover - Windows 专属分支
+        info["error"] = str(exc)
         if verbose:
-            print(f"无法读取 LongPathsEnabled: {exc}")
-        rows.append(
-            CheckItem(
-                "长路径支持",
-                "warn",
-                "无法检测 LongPathsEnabled 状态。",
-                "请在本地组策略或注册表中确认已启用长路径。",
-            )
-        )
+            print(f"读取 LongPathsEnabled 失败: {exc}")
+        detail = "无法检测 LongPathsEnabled 状态。"
+        advice = f"可在管理员 PowerShell 执行：{cmd_hint}"
+        notes.append(advice)
+        item = CheckItem("长路径支持", "warn", detail, advice)
+        return info, item, notes
 
-    return rows, notes
+    if info["enabled"]:
+        item = CheckItem("长路径支持", "ok", "已启用 LongPathsEnabled", "")
+        return info, item, notes
+
+    detail = "未启用 LongPathsEnabled。"
+    advice = f"建议在管理员 PowerShell 执行：{cmd_hint}"
+    notes.append(advice)
+    item = CheckItem("长路径支持", "warn", detail, advice)
+    return info, item, notes
 
 
 def _ensure_virtualenv(path: Path, verbose: bool) -> tuple[bool, str]:
@@ -332,49 +444,47 @@ def _ensure_virtualenv(path: Path, verbose: bool) -> tuple[bool, str]:
 
 
 def _install_opencc(verbose: bool) -> tuple[bool, str]:
-    """尝试使用 pip 安装 opencc。"""
+    """尝试使用 pip 安装 opencc-python-reimplemented。"""
 
-    candidates = ["opencc", "opencc-python-reimplemented"]
-    errors: List[str] = []
+    upgrade_code, upgrade_output = _run_command(
+        [sys.executable, "-m", "pip", "install", "--upgrade", "pip"],
+        verbose,
+    )
+    upgrade_msg = "已尝试升级 pip" if upgrade_code == 0 else f"升级 pip 失败 ({upgrade_code}): {upgrade_output}"
 
-    for package in candidates:
-        code, output = _run_command(
-            [sys.executable, "-m", "pip", "install", package],
-            verbose,
-        )
-        if code == 0 and shutil.which("opencc"):
-            return True, f"已通过 pip 安装 {package}，opencc 命令已可用。"
-        errors.append(f"{package}({code}): {output}")
+    install_code, install_output = _run_command(
+        [sys.executable, "-m", "pip", "install", "opencc-python-reimplemented"],
+        verbose,
+    )
+    if install_code == 0:
+        message = "已安装 opencc-python-reimplemented"
+        if upgrade_code != 0:
+            message = f"{message}（{upgrade_msg}）"
+        return True, message
 
-    if shutil.which("opencc"):
-        return True, "opencc 命令已存在，可能已在 PATH 中。"
-
-    joined = "；".join(errors)
-    return False, f"pip 安装 opencc 失败: {joined}"
+    failure = f"安装 opencc-python-reimplemented 失败 ({install_code}): {install_output}"
+    if upgrade_code != 0:
+        failure = f"{upgrade_msg}；{failure}"
+    return False, failure
 
 
 def _enable_long_paths(verbose: bool) -> tuple[bool, str]:
     """尝试启用 Windows LongPathsEnabled 策略。"""
 
-    if platform.system().lower() != "windows":
+    if sys.platform != "win32":
         return False, "当前平台非 Windows，跳过长路径设置。"
 
-    command = [
-        "reg",
-        "add",
-        r"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem",
-        "/v",
-        "LongPathsEnabled",
-        "/t",
-        "REG_DWORD",
-        "/d",
-        "1",
-        "/f",
-    ]
-    code, output = _run_command(command, verbose)
-    if code == 0:
-        return True, "已设置 LongPathsEnabled=1，重启后生效。"
-    return False, f"设置 LongPathsEnabled 失败 ({code}): {output}"
+    try:
+        import winreg  # type: ignore
+
+        key_path = r"SYSTEM\CurrentControlSet\Control\FileSystem"
+        with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            winreg.SetValueEx(key, "LongPathsEnabled", 0, winreg.REG_DWORD, 1)
+        return True, "已开启 LongPathsEnabled，可能需要重启系统或重新打开终端后生效"
+    except Exception as exc:  # pragma: no cover - Windows 专属分支
+        if verbose:
+            print(f"写入 LongPathsEnabled 失败: {exc}")
+        return False, str(exc)
 
 
 def _auto_fix(
@@ -382,6 +492,8 @@ def _auto_fix(
     *,
     verbose: bool,
     venv_path: Path,
+    opencc_info: Dict[str, Any],
+    long_paths_info: Dict[str, Any],
 ) -> tuple[List[Dict[str, str]], List[str]]:
     """根据检测结果尝试自动修复已知问题。"""
 
@@ -413,22 +525,68 @@ def _auto_fix(
             status = "success" if success else "failed"
             logs.append({"target": name, "status": status, "message": message})
             if success:
+                opencc_info.update(
+                    {
+                        "available": True,
+                        "impl": "python",
+                        "module": "opencc",
+                        "package": "opencc-python-reimplemented",
+                    }
+                )
                 item.status = "ok"
-                item.detail = "opencc 命令已可用"
+                item.detail = "已找到 OpenCC (python) —— opencc-python-reimplemented 可用"
                 item.advice = ""
-                notes.append("opencc 已安装，可重新运行自检确认状态。")
+                notes.append("opencc-python-reimplemented 已安装，可重新运行自检确认状态。")
+            else:
+                opencc_info.setdefault("hint", "python -m pip install opencc-python-reimplemented")
             handled.add(key)
             continue
 
         if name == "长路径支持":
+            if sys.platform != "win32":
+                logs.append(
+                    {
+                        "target": name,
+                        "status": "skipped",
+                        "message": "当前平台非 Windows，跳过长路径设置。",
+                    }
+                )
+                handled.add(key)
+                continue
+
+            if not is_admin():
+                hint = long_paths_info.get("hint")
+                message = "当前进程非管理员，未尝试修改注册表。"
+                if hint:
+                    message = f"{message} 可在管理员 PowerShell 执行：{hint}"
+                logs.append(
+                    {
+                        "target": name,
+                        "status": "skipped",
+                        "message": message,
+                    }
+                )
+                handled.add(key)
+                continue
+
             success, message = _enable_long_paths(verbose)
             status = "success" if success else "failed"
             logs.append({"target": name, "status": status, "message": message})
+            hint = long_paths_info.get("hint")
             if success:
+                long_paths_info["enabled"] = True
                 item.status = "ok"
-                item.detail = "已尝试启用 LongPathsEnabled"
+                item.detail = "已开启 LongPathsEnabled，可能需要重启系统或重新打开终端后生效"
                 item.advice = ""
-                notes.append("已写入长路径策略设置，Windows 可能需要重启生效。")
+                notes.append("已尝试启用长路径策略，可能需要重启系统或重新打开终端后生效。")
+            else:
+                item.status = "warn"
+                item.detail = f"尝试开启失败：{message}"
+                if hint:
+                    item.advice = f"可在管理员 PowerShell 执行：{hint}"
+                else:
+                    item.advice = "请在管理员 PowerShell 中手动配置 LongPathsEnabled。"
+                notes.append(f"尝试自动开启长路径失败：{message}")
             handled.add(key)
             continue
 
@@ -487,20 +645,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     notes: List[str] = []
 
     # Python 检查
-    python_info, python_items, python_notes = _check_python()
+    python_info, python_items, python_notes, venv_payload = _check_python(project_root)
     report["python"] = python_info
+    report["venv"] = venv_payload
     summary_items.extend(python_items)
     notes.extend(python_notes)
 
     # 工具检查
     tools_payload: Dict[str, Any] = {}
-    for tool, required in (("ffmpeg", True), ("ffprobe", True), ("opencc", False)):
+    for tool, required in (("ffmpeg", True), ("ffprobe", True)):
         info, item, note = _check_tool(tool, args.verbose, required)
         tools_payload[tool] = info
         summary_items.append(item)
         if note:
             notes.append(note)
     report["tools"] = tools_payload
+
+    opencc_info, opencc_item, opencc_notes = check_opencc(args.verbose)
+    report["opencc"] = opencc_info
+    summary_items.append(opencc_item)
+    notes.extend(opencc_notes)
 
     # 路径检查
     paths_info, path_items, path_notes = _check_paths(out_dir)
@@ -514,6 +678,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         summary_items.extend(win_items)
         notes.extend(win_notes)
 
+    long_paths_info, long_paths_item, long_paths_notes = check_long_paths(args.verbose)
+    report["long_paths"] = long_paths_info
+    summary_items.append(long_paths_item)
+    notes.extend(long_paths_notes)
+
     auto_fix_logs: List[Dict[str, str]] = []
     if args.auto_fix:
         print("检测到 warn/fail 时将尝试自动修复...")
@@ -521,6 +690,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             summary_items,
             verbose=args.verbose,
             venv_path=venv_path,
+            opencc_info=opencc_info,
+            long_paths_info=long_paths_info,
         )
         if auto_fix_logs:
             print("自动修复结果:")
