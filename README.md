@@ -195,6 +195,42 @@ python scripts/onepass_cli.py retake-keep-last \
 
 > `--sentence-strict` 关闭时仍使用旧的“行级保留最后一遍”逻辑，保持向后兼容。`--review-only` 仅在开启句子模式时生效。
 
+## 停顿感知对齐与静音探测
+
+第七轮新增的停顿感知流程会在导出前统一对所有 keep 段执行“吸附 → 余量 → 自动合并 → 碎片剔除”四步调整：
+
+- **停顿吸附**：默认以 `0.45s` 的词间间隔识别自然停顿，段首尾可在 `0.20s` 范围内吸附到最近的停顿边界。
+- **静音并集**：若系统可用 `ffmpeg`，会通过 `silencedetect` 获取静音区间，与词间停顿合并后统一作为吸附候选。若未安装 `ffmpeg`，则自动退回到“仅使用词间 gap”的逻辑，输出仍保持一致。
+- **段首尾余量**：默认在段首、段尾分别留出 `0.08s` 与 `0.12s` 的缓冲，避免剪到吐字。
+- **碎片保护**：补偿后相邻片段间隔小于 `0.06s` 会自动合并，最终片段若仍短于 `0.18s` 则尝试与前后段并入或直接丢弃。
+
+调试时可配合 `--debug-csv path` 观察每段吸附与合并前后的时间节点。示例命令如下：
+
+```bash
+# 行级模式 + 停顿吸附 + 保护
+python scripts/onepass_cli.py retake-keep-last --materials materials --out out \
+  --pause-gap-sec 0.45 --pad-before 0.08 --pad-after 0.12 --overcut-mode ask
+
+# 句子级（更稳）+ 停顿吸附 + 单段审阅（不剪）
+python scripts/onepass_cli.py retake-keep-last --words-json ... --text ... --out out \
+  --sentence-strict --review-only
+```
+
+运行结束后可在日志中看到 `pause_used`、`pause_snaps`、`auto_merged`、`too_short_dropped` 等统计字段，便于快速评估参数效果。
+
+## 过裁剪保护
+
+为了避免阈值过激导致大量有效语句被剪掉，CLI 在吸附/合并完成后会根据 `keep` 总时长计算剪切比例 `cut_ratio`：
+
+- `--overcut-threshold`（默认 `0.60`）用于判定是否触发保护。
+- `--overcut-mode ask|auto|abort` 控制处理策略：
+  - **ask**：在交互模式下给出 `auto / continue / abort` 三选一；若标准输入不可交互则自动回退到 `auto`。
+  - **auto**：自动放宽参数（`min_sent_chars + 4`、`max_dup_gap_sec = 15`、`pause_gap_sec = 0.55`）并重新计算。
+  - **abort**：直接中止任务并返回非零退出码。
+- 执行结果会记录在 `stats.overcut_guard_action`，同时写入批处理报告，方便后续复盘。
+
+若实际素材的剪切比例本就较高，可结合 `--min-sent-chars`、`--max-dup-gap-sec` 或直接切换到 `--sentence-strict` 进一步降低风险。
+
 ## 统一命令行与整书批处理
 
 为方便自动化集成与整书批处理，本项目新增 `scripts/onepass_cli.py`，将前三轮的独立脚本封装为四个子命令，语义保持一致：

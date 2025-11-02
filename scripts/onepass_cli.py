@@ -36,6 +36,12 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
     MAX_WINDOW_SEC,
     MIN_SENT_CHARS,
+    MERGE_GAP_SEC,
+    MIN_SEGMENT_SEC,
+    PAD_AFTER,
+    PAD_BEFORE,
+    PAUSE_GAP_SEC,
+    PAUSE_SNAP_LIMIT,
     compute_retake_keep_last,
     compute_sentence_review,
     export_audition_markers,
@@ -47,6 +53,7 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     export_sentence_srt,
     export_sentence_txt,
 )
+from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.text_norm import (  # 规范化工具
     load_char_map,
     normalize_pipeline,
@@ -93,6 +100,46 @@ def _append_normalize_report(rows: list[dict]) -> None:
             writer.writeheader()
         for row in rows:  # 写入每一行
             writer.writerow(row)
+
+
+def _append_debug_rows(csv_path: Path, rows: Sequence[dict], mode: str) -> None:
+    """将段调整的调试信息追加到 CSV 文件。"""
+
+    if not rows:
+        return
+    csv_path = csv_path.expanduser().resolve()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "item",
+        "mode",
+        "index",
+        "orig_start",
+        "orig_end",
+        "snap_start",
+        "snap_end",
+        "pad_start",
+        "pad_end",
+        "final_start",
+        "final_end",
+        "snap_start_used",
+        "snap_end_used",
+        "merged_into",
+        "dropped",
+        "notes",
+    ]
+    file_exists = csv_path.exists()
+    with csv_path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            payload = dict(row)
+            payload.setdefault("item", "")
+            payload["mode"] = mode
+            for key in fieldnames:
+                if key not in payload:
+                    payload[key] = ""
+            writer.writerow(payload)
 
 
 def _ensure_out_dir(out_dir: Path) -> Path:
@@ -384,21 +431,146 @@ def _process_retake_item(
     review_only: bool,
     merge_adj_gap_sec: float,
     low_conf: float,
+    *,
+    pause_align: bool,
+    pause_gap_sec: float,
+    pause_snap_limit: float,
+    pad_before: float,
+    pad_after: float,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+    silence_probe_enabled: bool,
+    noise_db: int,
+    silence_min_d: float,
+    overcut_guard: bool,
+    overcut_mode: str,
+    overcut_threshold: float,
+    debug_csv: Path | None,
 ) -> Tuple[str, dict]:
     """处理单个词级 JSON + 文本的组合。"""
 
     stem = stem_from_words_json(words_path)  # 解析输出前缀
     try:
         doc = load_words(words_path)  # 读取词级 JSON
-        if sentence_strict:
-            result = compute_sentence_review(
-                list(doc),
+        words = list(doc)
+        audio_path: Path | None = None
+        if source_audio:
+            candidate = Path(source_audio)
+            if not candidate.is_absolute():
+                candidate = (words_path.parent / candidate).resolve()
+            audio_path = candidate
+        silence_ranges: list[tuple[float, float]] | None = None
+        if pause_align and silence_probe_enabled and audio_path is not None:
+            silence_ranges = probe_silence_ffmpeg(audio_path, noise_db=noise_db, min_d=silence_min_d)
+        effective_silence = silence_ranges if pause_align else None
+
+        current_min_sent = min_sent_chars
+        current_line_gap = line_max_dup_gap_sec
+        current_sentence_gap = sentence_max_dup_gap_sec
+        current_pause_gap = pause_gap_sec
+
+        def _run_compute(
+            min_sent: int,
+            line_gap: float,
+            sent_gap: float,
+            pause_gap: float,
+        ):
+            if sentence_strict:
+                return compute_sentence_review(
+                    words,
+                    text_path,
+                    min_sent_chars=min_sent,
+                    max_dup_gap_sec=sent_gap,
+                    merge_gap_sec=merge_adj_gap_sec,
+                    low_conf=low_conf,
+                    pad_before=pad_before,
+                    pad_after=pad_after,
+                    pause_align=pause_align,
+                    pause_gap_sec=pause_gap,
+                    pause_snap_limit=pause_snap_limit,
+                    min_segment_sec=min_segment_sec,
+                    segment_merge_gap_sec=merge_gap_sec,
+                    silence_ranges=effective_silence,
+                    audio_path=audio_path,
+                    debug_label=stem,
+                )
+            return compute_retake_keep_last(
+                words,
                 text_path,
-                min_sent_chars=min_sent_chars,
-                max_dup_gap_sec=sentence_max_dup_gap_sec,
-                merge_gap_sec=merge_adj_gap_sec,
-                low_conf=low_conf,
+                min_sent_chars=min_sent,
+                max_dup_gap_sec=line_gap,
+                max_window_sec=max_window_sec,
+                pad_before=pad_before,
+                pad_after=pad_after,
+                pause_align=pause_align,
+                pause_gap_sec=pause_gap,
+                pause_snap_limit=pause_snap_limit,
+                min_segment_sec=min_segment_sec,
+                merge_gap_sec=merge_gap_sec,
+                silence_ranges=effective_silence,
+                audio_path=audio_path,
+                debug_label=stem,
             )
+
+        result = _run_compute(
+            current_min_sent,
+            current_line_gap,
+            current_sentence_gap,
+            current_pause_gap,
+        )
+        stats = dict(result.stats)
+        cut_ratio = float(stats.get("cut_ratio", 0.0))
+        action = "none"
+        if overcut_guard and stats.get("audio_duration", 0.0) > 0 and cut_ratio > overcut_threshold:
+            if overcut_mode == "auto":
+                action = "auto"
+            elif overcut_mode == "abort":
+                action = "abort"
+            else:
+                if not sys.stdin.isatty():
+                    LOGGER.warning(
+                        "剪切比例 %.2f 超过阈值 %.2f，非交互环境自动选择 auto。",
+                        cut_ratio,
+                        overcut_threshold,
+                    )
+                    action = "auto"
+                else:
+                    prompt = (
+                        f"剪切比例 {cut_ratio:.2%} 超过阈值 {overcut_threshold:.2%}，"
+                        "选择 auto/continue/abort: "
+                    )
+                    while True:
+                        choice = input(prompt).strip().lower() or "auto"
+                        if choice in {"auto", "continue", "abort"}:
+                            action = choice
+                            break
+                        print("请输入 auto、continue 或 abort。")
+            if action == "auto":
+                LOGGER.warning(
+                    "触发过裁剪保护，自动调整参数后重算 (min_sent+4, max_dup_gap=15, pause_gap=0.55)。"
+                )
+                current_min_sent = min_sent_chars + 4
+                current_line_gap = 15.0
+                current_sentence_gap = 15.0
+                current_pause_gap = 0.55
+                result = _run_compute(
+                    current_min_sent,
+                    current_line_gap,
+                    current_sentence_gap,
+                    current_pause_gap,
+                )
+                stats = dict(result.stats)
+                cut_ratio = float(stats.get("cut_ratio", 0.0))
+            elif action == "abort":
+                raise RuntimeError(
+                    f"剪切比例 {cut_ratio:.2%} 超过阈值 {overcut_threshold:.2%}，已根据设置中止。"
+                )
+        stats["overcut_guard_action"] = action
+        stats["review_only"] = bool(review_only)
+        stats["sentence_strict"] = bool(sentence_strict)
+        stats["pause_gap_final"] = current_pause_gap
+
+        if sentence_strict:
             outputs = _export_retake_outputs(
                 result,
                 stem,
@@ -409,17 +581,7 @@ def _process_retake_item(
                 sentence_mode=True,
                 review_only=review_only,
             )
-            stats = dict(result.stats)
-            stats["review_only"] = bool(review_only)
-            stats["sentence_strict"] = True
         else:
-            result = compute_retake_keep_last(
-                list(doc),
-                text_path,
-                min_sent_chars=min_sent_chars,
-                max_dup_gap_sec=line_max_dup_gap_sec,
-                max_window_sec=max_window_sec,
-            )  # 执行核心算法
             outputs = _export_retake_outputs(
                 result,
                 stem,
@@ -429,10 +591,21 @@ def _process_retake_item(
                 channels,
                 sentence_mode=False,
                 review_only=False,
-            )  # 导出产物
-            stats = dict(result.stats)  # 复制统计信息
-            stats["sentence_strict"] = False
-            stats["review_only"] = False
+            )
+
+        LOGGER.info(
+            "停顿吸附=%s 吸附次数=%s 自动合并=%s 丢弃碎片=%s 剪切比例=%.3f",
+            stats.get("pause_used"),
+            stats.get("pause_snaps", 0),
+            stats.get("auto_merged", 0),
+            stats.get("too_short_dropped", 0),
+            cut_ratio,
+        )
+
+        if debug_csv is not None and result.debug_rows:
+            mode = "sentence" if sentence_strict else "line"
+            _append_debug_rows(debug_csv, result.debug_rows, mode)
+
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
         item = {
             "stem": stem,
@@ -471,6 +644,20 @@ def _run_retake_batch(
     review_only: bool,
     merge_adj_gap_sec: float,
     low_conf: float,
+    pause_align: bool,
+    pause_gap_sec: float,
+    pause_snap_limit: float,
+    pad_before: float,
+    pad_after: float,
+    min_segment_sec: float,
+    merge_gap_sec: float,
+    silence_probe_enabled: bool,
+    noise_db: int,
+    silence_min_d: float,
+    overcut_guard: bool,
+    overcut_mode: str,
+    overcut_threshold: float,
+    debug_csv: Path | None,
 ) -> dict:
     """执行目录批处理的配对与导出。"""
 
@@ -520,6 +707,20 @@ def _run_retake_batch(
                         review_only,
                         merge_adj_gap_sec,
                         low_conf,
+                        pause_align=pause_align,
+                        pause_gap_sec=pause_gap_sec,
+                        pause_snap_limit=pause_snap_limit,
+                        pad_before=pad_before,
+                        pad_after=pad_after,
+                        min_segment_sec=min_segment_sec,
+                        merge_gap_sec=merge_gap_sec,
+                        silence_probe_enabled=silence_probe_enabled,
+                        noise_db=noise_db,
+                        silence_min_d=silence_min_d,
+                        overcut_guard=overcut_guard,
+                        overcut_mode=overcut_mode,
+                        overcut_threshold=overcut_threshold,
+                        debug_csv=debug_csv,
                     )
                 )  # 提交任务
             for future in as_completed(futures):  # 收集结果
@@ -561,6 +762,20 @@ def _run_retake_batch(
                     review_only,
                     merge_adj_gap_sec,
                     low_conf,
+                    pause_align=pause_align,
+                    pause_gap_sec=pause_gap_sec,
+                    pause_snap_limit=pause_snap_limit,
+                    pad_before=pad_before,
+                    pad_after=pad_after,
+                    min_segment_sec=min_segment_sec,
+                    merge_gap_sec=merge_gap_sec,
+                    silence_probe_enabled=silence_probe_enabled,
+                    noise_db=noise_db,
+                    silence_min_d=silence_min_d,
+                    overcut_guard=overcut_guard,
+                    overcut_mode=overcut_mode,
+                    overcut_threshold=overcut_threshold,
+                    debug_csv=debug_csv,
                 )  # 直接处理
                 items.append(item)
                 if item["status"] != "ok":  # 更新失败计数
@@ -590,6 +805,23 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         float(args.merge_adj_gap_sec) if args.merge_adj_gap_sec is not None else MERGE_ADJ_GAP_SEC
     )
     low_conf = float(args.low_conf) if args.low_conf is not None else SENT_LOW_CONF
+    pause_align = not args.no_pause_align
+    pause_gap_sec = float(args.pause_gap_sec)
+    pause_snap_limit = float(args.pause_snap_limit)
+    pad_before = float(args.pad_before)
+    pad_after = float(args.pad_after)
+    min_segment_sec = float(args.min_segment_sec)
+    merge_gap_sec = float(args.merge_gap_sec)
+    silence_probe_enabled = not args.no_silence_probe
+    noise_db = int(args.noise_db)
+    silence_min_d = float(args.silence_min_d)
+    overcut_guard = not args.no_overcut_guard
+    overcut_mode = args.overcut_mode
+    overcut_threshold = float(args.overcut_threshold)
+    debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
+    if debug_csv and args.workers and args.workers > 1:
+        LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
+        debug_csv = None
     if args.words_json:  # 单文件模式
         if not args.text:
             raise ValueError("单文件模式需要同时提供 --text")
@@ -610,6 +842,20 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.review_only,
             merge_adj_gap_sec,
             low_conf,
+            pause_align=pause_align,
+            pause_gap_sec=pause_gap_sec,
+            pause_snap_limit=pause_snap_limit,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            min_segment_sec=min_segment_sec,
+            merge_gap_sec=merge_gap_sec,
+            silence_probe_enabled=silence_probe_enabled,
+            noise_db=noise_db,
+            silence_min_d=silence_min_d,
+            overcut_guard=overcut_guard,
+            overcut_mode=overcut_mode,
+            overcut_threshold=overcut_threshold,
+            debug_csv=debug_csv,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
@@ -632,6 +878,20 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.review_only,
             merge_adj_gap_sec,
             low_conf,
+            pause_align,
+            pause_gap_sec,
+            pause_snap_limit,
+            pad_before,
+            pad_after,
+            min_segment_sec,
+            merge_gap_sec,
+            silence_probe_enabled,
+            noise_db,
+            silence_min_d,
+            overcut_guard,
+            overcut_mode,
+            overcut_threshold,
+            debug_csv,
         )
         items = result["items"]
         summary = result["summary"]
@@ -654,6 +914,10 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "strict_hit_sentences",
         "fuzzy_hit_sentences",
         "keep_span_count",
+        "pause_snaps",
+        "auto_merged",
+        "too_short_dropped",
+        "silence_regions",
     ]  # 汇总字段
     aggregated = {
         key: sum(int(item.get("stats", {}).get(key, 0)) for item in items if item.get("status") == "ok")
@@ -711,6 +975,34 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
     if args.low_conf is not None:
         parts.extend(["--low-conf", str(args.low_conf)])
+    if args.no_pause_align:
+        parts.append("--no-pause-align")
+    if float(args.pause_gap_sec) != PAUSE_GAP_SEC:
+        parts.extend(["--pause-gap-sec", str(args.pause_gap_sec)])
+    if float(args.pause_snap_limit) != PAUSE_SNAP_LIMIT:
+        parts.extend(["--pause-snap-limit", str(args.pause_snap_limit)])
+    if float(args.pad_before) != PAD_BEFORE:
+        parts.extend(["--pad-before", str(args.pad_before)])
+    if float(args.pad_after) != PAD_AFTER:
+        parts.extend(["--pad-after", str(args.pad_after)])
+    if float(args.min_segment_sec) != MIN_SEGMENT_SEC:
+        parts.extend(["--min-segment-sec", str(args.min_segment_sec)])
+    if float(args.merge_gap_sec) != MERGE_GAP_SEC:
+        parts.extend(["--merge-gap-sec", str(args.merge_gap_sec)])
+    if args.no_silence_probe:
+        parts.append("--no-silence-probe")
+    if int(args.noise_db) != -35:
+        parts.extend(["--noise-db", str(args.noise_db)])
+    if float(args.silence_min_d) != 0.28:
+        parts.extend(["--silence-min-d", str(args.silence_min_d)])
+    if args.no_overcut_guard:
+        parts.append("--no-overcut-guard")
+    if args.overcut_mode != "ask":
+        parts.extend(["--overcut-mode", args.overcut_mode])
+    if float(args.overcut_threshold) != 0.60:
+        parts.extend(["--overcut-threshold", str(args.overcut_threshold)])
+    if args.debug_csv:
+        parts.extend(["--debug-csv", str(Path(args.debug_csv))])
     if args.sentence_strict:
         parts.append("--sentence-strict")
     if args.review_only:
@@ -1130,6 +1422,70 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=argparse.SUPPRESS,
     )
+    retake.add_argument("--no-pause-align", action="store_true", help="关闭停顿吸附调优")
+    retake.add_argument(
+        "--pause-gap-sec",
+        type=float,
+        default=PAUSE_GAP_SEC,
+        help=f"判定停顿的词间间隔阈值，秒（默认 {PAUSE_GAP_SEC:.2f}）",
+    )
+    retake.add_argument(
+        "--pause-snap-limit",
+        type=float,
+        default=PAUSE_SNAP_LIMIT,
+        help=f"段首尾向停顿吸附时允许的最大偏移，秒（默认 {PAUSE_SNAP_LIMIT:.2f}）",
+    )
+    retake.add_argument(
+        "--pad-before",
+        type=float,
+        default=PAD_BEFORE,
+        help=f"段首额外留白，秒（默认 {PAD_BEFORE:.2f}）",
+    )
+    retake.add_argument(
+        "--pad-after",
+        type=float,
+        default=PAD_AFTER,
+        help=f"段尾额外留白，秒（默认 {PAD_AFTER:.2f}）",
+    )
+    retake.add_argument(
+        "--min-segment-sec",
+        type=float,
+        default=MIN_SEGMENT_SEC,
+        help=f"最短保留段长度，低于则尝试合并，秒（默认 {MIN_SEGMENT_SEC:.2f}）",
+    )
+    retake.add_argument(
+        "--merge-gap-sec",
+        type=float,
+        default=MERGE_GAP_SEC,
+        help=f"补偿后相邻片段自动合并的最大间隙，秒（默认 {MERGE_GAP_SEC:.2f}）",
+    )
+    retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
+    retake.add_argument(
+        "--noise-db",
+        type=int,
+        default=-35,
+        help="静音检测噪声阈值，单位 dB（默认 -35）",
+    )
+    retake.add_argument(
+        "--silence-min-d",
+        type=float,
+        default=0.28,
+        help="静音检测的最小时长，秒（默认 0.28）",
+    )
+    retake.add_argument("--no-overcut-guard", action="store_true", help="关闭过裁剪保护")
+    retake.add_argument(
+        "--overcut-mode",
+        choices=["ask", "auto", "abort"],
+        default="ask",
+        help="过裁剪保护触发时的策略（默认 ask）",
+    )
+    retake.add_argument(
+        "--overcut-threshold",
+        type=float,
+        default=0.60,
+        help="过裁剪保护的剪切比例阈值（默认 0.60）",
+    )
+    retake.add_argument("--debug-csv", help="将段吸附/合并调试信息写入指定 CSV")
     retake.add_argument("--sentence-strict", action="store_true", help="启用句子级审阅模式")
     retake.add_argument(
         "--review-only",
