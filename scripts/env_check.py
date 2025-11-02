@@ -44,6 +44,18 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--json", help="自定义 JSON 报告文件名 (默认 env_report.json)")
     # 控制是否打印额外调试信息
     parser.add_argument("--verbose", action="store_true", help="打印详细检查过程")
+    # 是否在检测到问题后自动尝试修复
+    parser.add_argument(
+        "--auto-fix",
+        action="store_true",
+        help="检测到 warn/fail 时自动执行预设修复动作",
+    )
+    # 自动创建虚拟环境时使用的路径
+    parser.add_argument(
+        "--venv-path",
+        default=".venv",
+        help="自动修复虚拟环境问题时使用的 venv 目录 (默认 .venv)",
+    )
     # 返回解析结果
     return parser.parse_args(argv)
 
@@ -306,6 +318,123 @@ def _check_windows_path_hints(out_dir: Path, raw_out: str, verbose: bool) -> tup
     return rows, notes
 
 
+def _ensure_virtualenv(path: Path, verbose: bool) -> tuple[bool, str]:
+    """尝试创建虚拟环境。"""
+
+    if path.exists():
+        return False, f"虚拟环境已存在: {path}"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    code, output = _run_command([sys.executable, "-m", "venv", str(path)], verbose)
+    if code == 0:
+        return True, f"已创建虚拟环境: {path}"
+    return False, f"创建虚拟环境失败 ({code}): {output}"
+
+
+def _install_opencc(verbose: bool) -> tuple[bool, str]:
+    """尝试使用 pip 安装 opencc。"""
+
+    candidates = ["opencc", "opencc-python-reimplemented"]
+    errors: List[str] = []
+
+    for package in candidates:
+        code, output = _run_command(
+            [sys.executable, "-m", "pip", "install", package],
+            verbose,
+        )
+        if code == 0 and shutil.which("opencc"):
+            return True, f"已通过 pip 安装 {package}，opencc 命令已可用。"
+        errors.append(f"{package}({code}): {output}")
+
+    if shutil.which("opencc"):
+        return True, "opencc 命令已存在，可能已在 PATH 中。"
+
+    joined = "；".join(errors)
+    return False, f"pip 安装 opencc 失败: {joined}"
+
+
+def _enable_long_paths(verbose: bool) -> tuple[bool, str]:
+    """尝试启用 Windows LongPathsEnabled 策略。"""
+
+    if platform.system().lower() != "windows":
+        return False, "当前平台非 Windows，跳过长路径设置。"
+
+    command = [
+        "reg",
+        "add",
+        r"HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem",
+        "/v",
+        "LongPathsEnabled",
+        "/t",
+        "REG_DWORD",
+        "/d",
+        "1",
+        "/f",
+    ]
+    code, output = _run_command(command, verbose)
+    if code == 0:
+        return True, "已设置 LongPathsEnabled=1，重启后生效。"
+    return False, f"设置 LongPathsEnabled 失败 ({code}): {output}"
+
+
+def _auto_fix(
+    items: List[CheckItem],
+    *,
+    verbose: bool,
+    venv_path: Path,
+) -> tuple[List[Dict[str, str]], List[str]]:
+    """根据检测结果尝试自动修复已知问题。"""
+
+    logs: List[Dict[str, str]] = []
+    notes: List[str] = []
+
+    handled = set()
+
+    for item in items:
+        if item.status not in {"warn", "fail"}:
+            continue
+
+        name = item.name
+        key = name.lower()
+        if key in handled:
+            continue
+
+        if name == "虚拟环境":
+            success, message = _ensure_virtualenv(venv_path, verbose)
+            status = "success" if success else "skipped"
+            logs.append({"target": name, "status": status, "message": message})
+            if success:
+                notes.append("已尝试创建虚拟环境，请在下次运行前手动激活。")
+            handled.add(key)
+            continue
+
+        if key == "opencc":
+            success, message = _install_opencc(verbose)
+            status = "success" if success else "failed"
+            logs.append({"target": name, "status": status, "message": message})
+            if success:
+                item.status = "ok"
+                item.detail = "opencc 命令已可用"
+                item.advice = ""
+                notes.append("opencc 已安装，可重新运行自检确认状态。")
+            handled.add(key)
+            continue
+
+        if name == "长路径支持":
+            success, message = _enable_long_paths(verbose)
+            status = "success" if success else "failed"
+            logs.append({"target": name, "status": status, "message": message})
+            if success:
+                item.status = "ok"
+                item.detail = "已尝试启用 LongPathsEnabled"
+                item.advice = ""
+                notes.append("已写入长路径策略设置，Windows 可能需要重启生效。")
+            handled.add(key)
+            continue
+
+    return logs, notes
+
+
 def _print_summary_table(items: List[CheckItem]) -> None:
     """以表格形式打印检查摘要。"""
 
@@ -335,6 +464,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     # 解析命令行参数
     args = _parse_args(argv)
     out_dir = Path(args.out).expanduser().resolve()
+    project_root = Path(__file__).resolve().parents[1]
+    venv_path = Path(args.venv_path).expanduser()
+    if not venv_path.is_absolute():
+        venv_path = (project_root / venv_path).resolve()
 
     # 初始化整体结果字典
     report: Dict[str, Any] = {
@@ -381,6 +514,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         summary_items.extend(win_items)
         notes.extend(win_notes)
 
+    auto_fix_logs: List[Dict[str, str]] = []
+    if args.auto_fix:
+        print("检测到 warn/fail 时将尝试自动修复...")
+        auto_fix_logs, fix_notes = _auto_fix(
+            summary_items,
+            verbose=args.verbose,
+            venv_path=venv_path,
+        )
+        if auto_fix_logs:
+            print("自动修复结果:")
+            for log in auto_fix_logs:
+                print(
+                    f" - [{log['status']}] {log['target']}: {log['message']}"
+                )
+        else:
+            print("没有可自动修复的项目。")
+        notes.extend(fix_notes)
+    else:
+        print("未启用自动修复，如需自动处理常见问题请增加 --auto-fix 参数。")
+
     # 计算整体状态
     has_fail = any(item.status == "fail" for item in summary_items)
     has_warn = any(item.status == "warn" for item in summary_items)
@@ -398,6 +551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         }
         for item in summary_items
     ]
+    report["auto_fix"] = auto_fix_logs
 
     # 打印摘要表格
     _print_summary_table(summary_items)

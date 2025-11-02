@@ -558,13 +558,21 @@ def _run_env_check_menu() -> None:  # 环境自检流程
         display_script = script_path.relative_to(ROOT_DIR)  # 优先展示相对路径
     except ValueError:
         display_script = script_path
-    command_preview = shlex.join([sys.executable, str(display_script), "--out", out_raw])  # 构建展示命令
+    command_preview = shlex.join(
+        [sys.executable, str(display_script), "--out", out_raw, "--auto-fix"]
+    )  # 构建展示命令
     print_info("将执行命令:")
     print_info(command_preview)
 
     try:
         result = subprocess.run(  # 调用环境自检脚本
-            [sys.executable, str(script_path), "--out", str(out_path)],
+            [
+                sys.executable,
+                str(script_path),
+                "--out",
+                str(out_path),
+                "--auto-fix",
+            ],
             check=False,
         )
     except Exception as exc:
