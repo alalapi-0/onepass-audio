@@ -37,6 +37,12 @@ import unicodedata
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from onepass.text_norm import merge_hard_wraps
+
 # ========== 可选依赖：OpenCC ==========
 _OPENCC = None
 def _get_opencc(mode: str):
@@ -260,6 +266,8 @@ def write_reports(report_rows: List[Dict], out_dir: Path):
         "file",
         "bytes_in",
         "bytes_out",
+        "merged_wraps",
+        "merged_examples",
         "nfkc_applied",
         "whitespace_normalized",
         "char_map_replaced",
@@ -306,6 +314,8 @@ def main():
                     help="对输入做 unicodedata.normalize('NFKC')（默认关闭）")
     ap.add_argument("--dry-run", action="store_true", default=False,
                     help="只生成报表，不写出 .norm.txt")
+    ap.add_argument("--no-merge-wraps", dest="merge_wraps", action="store_false", default=True,
+                    help="跳过硬换行合并，仅在原文内容需要严格保持行结构时使用")
     args = ap.parse_args()
 
     in_path = Path(args.inp)
@@ -328,13 +338,24 @@ def main():
             print(f"[WARN] 读取失败：{fp} -> {e}", file=sys.stderr)
             continue
 
-        norm, stats = process_text(raw, args, cmap_cfg)
+        merged_text = raw
+        merged_count = 0
+        merged_examples: list[str] = []
+        if args.merge_wraps:
+            merged_text = merge_hard_wraps(raw)
+            info = getattr(merge_hard_wraps, "last_stats", {})
+            merged_count = int(info.get("merged_count", 0))
+            merged_examples = list(info.get("examples", []))
+
+        norm, stats = process_text(merged_text, args, cmap_cfg)
         suspects = scan_suspects(norm)
 
         row = {
             "file": str(fp),
             "bytes_in": len(raw.encode("utf-8", errors="ignore")),
             "bytes_out": len(norm.encode("utf-8", errors="ignore")),
+            "merged_wraps": merged_count,
+            "merged_examples": ", ".join(merged_examples),
             **stats,
             "suspects_compat_count": len(suspects["compat_chars"]),
             "suspects_fullwidth_count": len(suspects["fullwidth_punct"]),

@@ -982,11 +982,10 @@ def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
 
     print_header("主菜单")  # 显示主菜单标题
-    print_info("[1] 批量处理素材，生成字幕/EDL/标记")
+    print_info("[1] 批量处理素材（可选规范化与自动渲染）")
     print_info("[K] 单文件：词级 JSON + 原文 → SRT/TXT/EDL/Markers")
     print_info("[R] 按 EDL 渲染干净音频")
     print_info("[P] 预处理：原文规范化（输出 .norm.txt 与 normalize_report.csv）")
-    print_info("[A] 一键流水线：规范化 → 保留最后一遍 → 渲染音频")
     print_info("[E] 环境自检与日志位置")
     print_info("[Q] 退出程序")
 
@@ -1001,9 +1000,6 @@ def main() -> None:  # CLI 主入口
     if choice_lower == "p":  # 调用原文规范化流程
         _run_normalize_original_menu()
         return
-    if choice_lower == "a":  # 一键流水线
-        _run_all_in_one_menu()
-        return
     if choice_lower == "e":
         _run_env_check_menu()
         return
@@ -1012,6 +1008,38 @@ def main() -> None:  # CLI 主入口
         return
 
     materials_dir = _prompt_materials_directory()  # 询问素材目录
+
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    do_norm_first = prompt_yes_no("是否先对原文做规范化?", default=True)
+    if do_norm_first:
+        if not cli_script.exists():
+            print_warning("未找到 scripts/onepass_cli.py，暂无法调用统一 CLI 进行规范化。")
+        else:
+            norm_out_dir = DEFAULT_NORMALIZED_DIR
+            norm_out_dir.mkdir(parents=True, exist_ok=True)
+            char_map = ROOT_DIR / "config" / "default_char_map.json"
+            prep_cmd = [
+                sys.executable,
+                str(cli_script),
+                "prep-norm",
+                "--in",
+                str(materials_dir),
+                "--out",
+                str(norm_out_dir),
+            ]
+            if char_map.exists():
+                prep_cmd.extend(["--char-map", str(char_map)])
+            print_info("规范化阶段等价 CLI:")
+            print_info(shlex.join(prep_cmd))
+            try:
+                result = subprocess.run(prep_cmd, check=False, cwd=str(ROOT_DIR))
+            except FileNotFoundError as exc:
+                print_error(f"无法调用 Python 解释器执行规范化 CLI: {exc}")
+            else:
+                if result.returncode != 0:
+                    print_warning("规范化 CLI 返回非零状态，请参考终端输出。")
+                else:
+                    print_success(f"规范化完成，输出目录: {norm_out_dir}")
 
     print_header("素材匹配")  # 提示开始匹配素材
     chapters = _discover_chapters(materials_dir)  # 根据素材目录构建章节列表
@@ -1030,7 +1058,42 @@ def main() -> None:  # CLI 主入口
 
     outdir = _ensure_output_directory()  # 询问输出目录
 
-    render_audio = with_audio > 0 and prompt_yes_no("检测到音频文件，是否按 EDL 自动导出干净音频?", default=True)  # 判断是否导出音频
+    if cli_script.exists():  # 展示等价 CLI 便于复现
+        retake_cmd = [
+            sys.executable,
+            str(cli_script),
+            "retake-keep-last",
+            "--materials",
+            str(materials_dir),
+            "--out",
+            str(outdir),
+            "--glob-words",
+            "*.words.json",
+            "--glob-text",
+            "*.norm.txt",
+            "--glob-text",
+            "*.txt",
+        ]
+        print_info("保留最后一遍等价 CLI:")
+        print_info(shlex.join(retake_cmd))
+
+    auto_render = False  # 默认不自动渲染
+    if with_audio > 0:  # 仅在存在音频时才询问
+        auto_render = prompt_yes_no("是否在生成 EDL 后立即渲染干净音频?", default=True)
+        if auto_render and cli_script.exists():
+            render_cmd = [
+                sys.executable,
+                str(cli_script),
+                "render-audio",
+                "--materials",
+                str(outdir),
+                "--audio-root",
+                str(materials_dir),
+                "--out",
+                str(outdir),
+            ]
+            print_info("音频渲染等价 CLI:")
+            print_info(shlex.join(render_cmd))
 
     print_header("批量处理")  # 提示进入批量处理阶段
     summaries: List[ChapterSummary] = []  # 收集每章摘要
@@ -1041,7 +1104,7 @@ def main() -> None:  # CLI 主入口
             chapter,  # 当前章节资源
             outdir,  # 输出目录
             score_threshold=DEFAULT_SCORE_THRESHOLD,  # 对齐得分阈值
-            render_audio=render_audio,  # 是否导出音频
+            render_audio=auto_render,  # 是否导出音频
         )
         if summary:  # 若处理成功
             summaries.append(summary)  # 收集结果

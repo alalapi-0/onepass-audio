@@ -146,6 +146,16 @@ pip install opencc
 - **ffmpeg/ffprobe 未找到**：确认已安装 [FFmpeg](https://ffmpeg.org/)，并将其加入 `PATH`。
 - **字幕为空或缺句**：检查 JSON 是否存在 `words` 字段及时间戳是否递增，可调整 `--score-threshold` 重新执行。
 - **批处理配对失败**：确保文件前缀完全一致（区分大小写），或在 CLI 中修改 `--glob-words`、`--glob-text` 模式。
+- **为什么 clean.wav 被剪掉很多？**：先运行 `prep-norm`（默认包含硬换行合并）生成 `.norm.txt`，再使用 `retake-keep-last` 并适当调整 `--min-sent-chars`、`--max-dup-gap-sec`、`--max-window-sec` 阈值，例如：
+
+  ```bash
+  python scripts/onepass_cli.py retake-keep-last \
+    --materials materials/book1 \
+    --out out/book1 \
+    --min-sent-chars 12 \
+    --max-dup-gap-sec 30 \
+    --max-window-sec 90
+  ```
 
 ## 统一命令行与整书批处理
 
@@ -202,6 +212,12 @@ python scripts/onepass_cli.py all-in-one \
   --workers 4
 ```
 
+#### 重录去重阈值说明
+
+- `--min-sent-chars`：句长下限，默认 12。规范化后字符数不足此值的句子不会触发“只保留最后一遍”，避免“我们/因此”等短词被误判为重复段落。
+- `--max-dup-gap-sec`：相邻命中间隔阈值（秒），默认 30。仅当两次出现的起始时间差不超过该值时，才会丢弃较早的一次命中。
+- `--max-window-sec`：单个 drop 段的最长持续时间（秒），默认 90。超出时会自动拆分，避免 EDL 中出现数十分钟的超长剪切。
+
 ### 配对规则与命名约定
 
 - 批处理模式下以词级 JSON 的文件名前缀（去掉 `.words.json`）为基准，优先寻找 `<stem>.norm.txt`，若缺失则回退 `<stem>.txt`。
@@ -215,7 +231,7 @@ python scripts/onepass_cli.py all-in-one \
 
 ### 与交互入口的关系
 
-主菜单 `[P]`、`[K]`、`[R]` 以及新增的 `[A]` 选项均会回显等价的统一 CLI 命令，便于将交互式操作迁移到自动化流水线。更细致的文本规范化、保留最后一遍与渲染音频说明，可继续参考下方对应章节。
+主菜单 `[1]` 会在批量流程前询问是否先规范化原文、是否紧接着渲染干净音频，并回显等价的 CLI 命令；`[P]`、`[K]`、`[R]` 也会展示对应命令，便于将交互式操作迁移到自动化流水线。更细致的文本规范化、保留最后一遍与渲染音频说明，可继续参考下方对应章节。
 
 ## 原文规范化（可配置）
 

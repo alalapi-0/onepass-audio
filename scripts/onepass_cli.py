@@ -33,6 +33,9 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     resolve_source_audio,
 )
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
+    MAX_DUP_GAP_SEC,
+    MAX_WINDOW_SEC,
+    MIN_SENT_CHARS,
     compute_retake_keep_last,
     export_audition_markers,
     export_edl_json,
@@ -328,13 +331,22 @@ def _process_retake_item(
     channels: Optional[int],
     materials_base: Optional[Path],
     out_base: Path,
+    min_sent_chars: int,
+    max_dup_gap_sec: float,
+    max_window_sec: float,
 ) -> Tuple[str, dict]:
     """处理单个词级 JSON + 文本的组合。"""
 
     stem = stem_from_words_json(words_path)  # 解析输出前缀
     try:
         doc = load_words(words_path)  # 读取词级 JSON
-        result = compute_retake_keep_last(list(doc), text_path)  # 执行核心算法
+        result = compute_retake_keep_last(
+            list(doc),
+            text_path,
+            min_sent_chars=min_sent_chars,
+            max_dup_gap_sec=max_dup_gap_sec,
+            max_window_sec=max_window_sec,
+        )  # 执行核心算法
         outputs = _export_retake_outputs(result, stem, out_dir, source_audio, samplerate, channels)  # 导出产物
         stats = dict(result.stats)  # 复制统计信息
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
@@ -367,6 +379,9 @@ def _run_retake_batch(
     glob_words: str,
     text_patterns: list[str],
     workers: Optional[int],
+    min_sent_chars: int,
+    max_dup_gap_sec: float,
+    max_window_sec: float,
 ) -> dict:
     """执行目录批处理的配对与导出。"""
 
@@ -408,6 +423,9 @@ def _run_retake_batch(
                         None,
                         materials_dir,
                         out_dir,
+                        min_sent_chars,
+                        max_dup_gap_sec,
+                        max_window_sec,
                     )
                 )  # 提交任务
             for future in as_completed(futures):  # 收集结果
@@ -441,6 +459,9 @@ def _run_retake_batch(
                     None,
                     materials_dir,
                     out_dir,
+                    min_sent_chars,
+                    max_dup_gap_sec,
+                    max_window_sec,
                 )  # 直接处理
                 items.append(item)
                 if item["status"] != "ok":  # 更新失败计数
@@ -471,6 +492,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.channels,
             None,
             out_dir,
+            args.min_sent_chars,
+            args.max_dup_gap_sec,
+            args.max_window_sec,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
@@ -479,12 +503,31 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         raise ValueError("单文件模式必须提供 --words-json")
     else:  # 目录批处理
         text_patterns = list(args.glob_text)
-        result = _run_retake_batch(Path(args.materials), out_dir, args.glob_words, text_patterns, args.workers)
+        result = _run_retake_batch(
+            Path(args.materials),
+            out_dir,
+            args.glob_words,
+            text_patterns,
+            args.workers,
+            args.min_sent_chars,
+            args.max_dup_gap_sec,
+            args.max_window_sec,
+        )
         items = result["items"]
         summary = result["summary"]
         failed = summary.get("failed", 0)
     payload = {"items": items, "summary": summary}
-    stat_keys = ["total_words", "total_lines", "matched_lines", "strict_matches", "fallback_matches", "unmatched_lines"]  # 汇总字段
+    stat_keys = [
+        "total_words",
+        "total_lines",
+        "matched_lines",
+        "strict_matches",
+        "fallback_matches",
+        "unmatched_lines",
+        "len_gate_skipped",
+        "neighbor_gap_skipped",
+        "max_window_splits",
+    ]  # 汇总字段
     aggregated = {
         key: sum(int(item.get("stats", {}).get(key, 0)) for item in items if item.get("status") == "ok")
         for key in stat_keys
@@ -529,6 +572,12 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--samplerate", str(args.samplerate)])
     if args.channels:
         parts.extend(["--channels", str(args.channels)])
+    if args.min_sent_chars != MIN_SENT_CHARS:
+        parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
+    if float(args.max_dup_gap_sec) != float(MAX_DUP_GAP_SEC):
+        parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
+    if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
+        parts.extend(["--max-window-sec", str(args.max_window_sec)])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -757,6 +806,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         source_audio=None,
         samplerate=args.samplerate,
         channels=args.channels,
+        min_sent_chars=args.min_sent_chars,
+        max_dup_gap_sec=args.max_dup_gap_sec,
+        max_window_sec=args.max_window_sec,
     )
     retake_result = run_retake_keep_last(retake_namespace, report_path=report_path, write_report=False)
     report["retake_keep_last"] = retake_result
@@ -822,6 +874,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--channels", str(args.channels)])
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
+    if args.min_sent_chars != MIN_SENT_CHARS:
+        parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
+    if float(args.max_dup_gap_sec) != float(MAX_DUP_GAP_SEC):
+        parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
+    if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
+        parts.extend(["--max-window-sec", str(args.max_window_sec)])
     LOGGER.info(
         "开始流水线任务: 素材=%s 音频=%s 输出=%s 渲染=%s",
         args.materials,
@@ -881,6 +939,24 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument("--source-audio", help="单文件模式：EDL 中记录的源音频相对路径")
     retake.add_argument("--samplerate", type=int, help="可选：EDL 建议采样率")
     retake.add_argument("--channels", type=int, help="可选：EDL 建议声道数")
+    retake.add_argument(
+        "--min-sent-chars",
+        type=int,
+        default=MIN_SENT_CHARS,
+        help=f"重复去重的句长下限（默认 {MIN_SENT_CHARS}）",
+    )
+    retake.add_argument(
+        "--max-dup-gap-sec",
+        type=float,
+        default=MAX_DUP_GAP_SEC,
+        help=f"判定重录的最大近邻间隔，单位秒（默认 {MAX_DUP_GAP_SEC:g}）",
+    )
+    retake.add_argument(
+        "--max-window-sec",
+        type=float,
+        default=MAX_WINDOW_SEC,
+        help=f"单个 drop 窗口的最长持续时间，单位秒（默认 {MAX_WINDOW_SEC:g}）",
+    )
     retake.set_defaults(func=handle_retake_keep_last)
 
     render = subparsers.add_parser("render-audio", help="按 EDL 渲染干净音频")
@@ -916,6 +992,24 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--samplerate", type=int, help="渲染采样率")
     pipeline.add_argument("--channels", type=int, help="渲染声道数")
     pipeline.add_argument("--workers", type=int, help="批处理并发度 (Windows 需入口保护)")
+    pipeline.add_argument(
+        "--min-sent-chars",
+        type=int,
+        default=MIN_SENT_CHARS,
+        help=f"重复去重的句长下限（默认 {MIN_SENT_CHARS}）",
+    )
+    pipeline.add_argument(
+        "--max-dup-gap-sec",
+        type=float,
+        default=MAX_DUP_GAP_SEC,
+        help=f"判定重录的最大近邻间隔，单位秒（默认 {MAX_DUP_GAP_SEC:g}）",
+    )
+    pipeline.add_argument(
+        "--max-window-sec",
+        type=float,
+        default=MAX_WINDOW_SEC,
+        help=f"单个 drop 窗口的最长持续时间，单位秒（默认 {MAX_WINDOW_SEC:g}）",
+    )
     pipeline.set_defaults(func=handle_all_in_one)
 
     return parser
