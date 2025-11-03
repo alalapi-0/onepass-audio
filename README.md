@@ -697,6 +697,20 @@ python onepass_main.py
 - 点击「重开本关」可重置当前关卡
 - 逻辑与 Web 版复用同一套核心 API（CJS 版）
 
+## 可视化控制台使用说明
+
+1. **启动方式**
+   - 在交互菜单中选择 `[W] 启动可视化控制台（本地网页）`，程序会自动寻找 8088–8090 的空闲端口并运行 `scripts/web_panel_server.py`，随后打开浏览器访问控制面板。
+   - 也可手动执行 `python scripts/web_panel_server.py --port 8088`，再访问 `http://127.0.0.1:8088/web/index.html`。
+2. **页面概览**
+   - 左侧按 stem 聚合 `out/` 目录下的音频与标记文件，右侧展示波形、区域列表与播放控制，支持跳过“删除”区段试听。
+   - 区域支持 Alt 拖拽创建、拖动/拉伸边界、批量切换状态、快捷键（Space/D/←→/Delete/Ctrl+S）等操作。
+   - 截图占位：`<在此插入可视化控制台页面截图>`。
+3. **导出文件与注意事项**
+   - 导出的人工决策会写入 `out/<stem>.manual.edl.json` 与 `out/<stem>.manual.audition_markers.csv`；CSV 采用 UTF-8 BOM 编码，行结尾为 CRLF，适配 Audition 导入。
+   - 面板仅允许读取/写入 `out/` 子目录，若解析失败会在页面弹出提示并在控制台输出详细日志。
+   - 若端口被占用，主菜单会自动向上递增端口；关闭服务可在终端按 `Ctrl+C`。
+
 ## 不提交二进制/媒体的约定
 
 `data/audio/`、`data/asr-json/`、`data/original_txt/`、`out/` 目录全部不入库，原因是涉及版权、容量与隐私数据，需在本地或受控环境中管理。
