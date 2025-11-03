@@ -6,6 +6,7 @@ import os  # 管理环境变量用于子进程
 import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
+import webbrowser  # 自动打开浏览器显示可视化面板
 from dataclasses import asdict, dataclass  # 引入数据类工具与转换字典的方法
 from pathlib import Path  # 使用 Path 进行跨平台路径操作
 from typing import Dict, Iterable, List, Optional, Tuple  # 导入常用类型注解
@@ -978,6 +979,57 @@ def _run_singlefile_menu():
 
 
 
+
+def _launch_web_panel() -> None:
+    """启动本地可视化控制台的 Flask 服务。"""
+
+    print_header("可视化控制台")
+    script = ROOT_DIR / "scripts" / "web_panel_server.py"
+    if not script.exists():
+        print_error("未找到 scripts/web_panel_server.py，请先更新仓库。")
+        return
+
+    env = os.environ.copy()
+    env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
+
+    for port in range(8088, 8091):
+        cmd = [sys.executable, str(script), "--port", str(port)]
+        print_info(f"尝试启动服务: {shlex.join(cmd)}")
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env)
+        except OSError as exc:
+            print_error(f"无法启动服务器: {exc}")
+            return
+
+        try:
+            return_code = proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            url = f"http://127.0.0.1:{port}/web/index.html"
+            print_success(f"可视化控制台已运行: {url}")
+            try:
+                webbrowser.open(url)
+            except Exception as exc:  # pragma: no cover - 浏览器未配置
+                print_warning(f"自动打开浏览器失败: {exc}")
+            print_info("按 Ctrl+C 结束服务器运行。")
+            try:
+                proc.wait()
+            except KeyboardInterrupt:
+                print_info("正在关闭服务器...")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            return
+        else:
+            if return_code == 0:
+                print_warning(f"端口 {port} 已被占用或服务器立即退出。尝试下一个端口。")
+            else:
+                print_warning(f"端口 {port} 启动失败 (exit={return_code})，尝试下一个端口。")
+            continue
+
+    print_error("端口 8088-8090 均无法启动服务，请检查端口占用。")
+
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
 
@@ -987,6 +1039,7 @@ def main() -> None:  # CLI 主入口
     print_info("[R] 按 EDL 渲染干净音频")
     print_info("[P] 预处理：原文规范化（输出 .norm.txt 与 normalize_report.csv）")
     print_info("[E] 环境自检与日志位置")
+    print_info("[W] 启动可视化控制台（本地网页）")
     print_info("[Q] 退出程序")
 
     choice = _clean_input_path(prompt_text("请选择操作", default="1"))  # 读取选择
@@ -1002,6 +1055,9 @@ def main() -> None:  # CLI 主入口
         return
     if choice_lower == "e":
         _run_env_check_menu()
+        return
+    if choice_lower == "w":
+        _launch_web_panel()
         return
     if choice_lower == "q":  # 用户选择退出
         print_info("已退出。")

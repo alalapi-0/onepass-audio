@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OnePass Audio 可视化控制台</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="toast-container"></div>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <header class="sidebar__header">
+          <h1>OnePass 控制台</h1>
+          <p class="sidebar__desc">选择音频与标记，快速审听与导出。</p>
+          <button id="refresh-button" type="button" class="sidebar__refresh">重新扫描 out/</button>
+        </header>
+        <div class="sidebar__list" id="file-groups"></div>
+      </aside>
+      <main class="main">
+        <section class="selection-bar">
+          <div class="selection-bar__item">
+            <span class="label">当前音频</span>
+            <span id="current-audio" class="selection-bar__value">未选择</span>
+          </div>
+          <div class="selection-bar__item">
+            <span class="label">当前标记</span>
+            <span id="current-marker" class="selection-bar__value">未选择</span>
+          </div>
+          <div class="selection-bar__item">
+            <span class="label">Stem</span>
+            <span id="current-stem" class="selection-bar__value">-</span>
+          </div>
+        </section>
+        <section class="controls">
+          <div class="controls__group">
+            <button id="play-toggle" type="button">播放 / 暂停 (Space)</button>
+            <button id="seek-back" type="button">⏪ -5s</button>
+            <button id="seek-forward" type="button">⏩ +5s</button>
+            <button id="skip-toggle" type="button" class="active">跳过删除段</button>
+          </div>
+          <div class="controls__group">
+            <label for="zoom-range">缩放</label>
+            <input id="zoom-range" type="range" min="20" max="400" step="10" value="120" />
+          </div>
+          <div class="controls__group controls__group--bulk">
+            <button data-bulk="delete" type="button">全部设为删除</button>
+            <button data-bulk="keep" type="button">全部设为保留</button>
+            <button data-bulk="undecided" type="button">全部设为未决</button>
+          </div>
+        </section>
+        <section class="waveform-section">
+          <div id="waveform" class="waveform"></div>
+        </section>
+        <section class="region-toolbar">
+          <div class="region-toolbar__left">
+            <span>Alt+拖拽创建区域，Delete 删除，D 切换状态，←/→ 选择邻近区域。</span>
+          </div>
+          <div class="region-toolbar__right">
+            <button id="export-edl" type="button">导出 EDL (Ctrl+S)</button>
+            <button id="export-markers" type="button">导出 Audition CSV</button>
+          </div>
+        </section>
+        <section class="region-list-section">
+          <table class="region-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>状态</th>
+                <th>开始</th>
+                <th>结束</th>
+                <th>时长</th>
+                <th>描述</th>
+              </tr>
+            </thead>
+            <tbody id="region-tbody"></tbody>
+          </table>
+        </section>
+      </main>
+    </div>
+
+    <script src="vendor/wavesurfer.min.js"></script>
+    <script src="vendor/regions.min.js"></script>
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

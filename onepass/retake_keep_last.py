@@ -858,14 +858,26 @@ def export_txt(keeps: list[KeepSpan], out_path: Path) -> Path:
 def export_audition_markers(keeps: list[KeepSpan], out_path: Path) -> Path:
     """导出 Adobe Audition 标记 CSV。"""
 
+    from .markers import ensure_csv_header, seconds_to_hmsms  # 局部导入避免循环
+
+    header = ["Name", "Start", "Duration", "Type", "Description"]
     out_path.parent.mkdir(parents=True, exist_ok=True)  # 确保目录存在
-    with out_path.open("w", encoding="utf-8", newline="") as csvfile:  # 打开 CSV 文件
+    with out_path.open("w", encoding="utf-8-sig", newline="") as csvfile:  # 打开 CSV 文件
         writer = csv.writer(csvfile)  # 创建写入器
-        writer.writerow(["Name", "Start", "Duration", "Type", "Description"])  # 写入表头
+        writer.writerow(header)  # 写入表头
         for span in keeps:  # 遍历所有保留段
             duration = max(0.0, span.end - span.start)  # 计算持续时间，确保非负
             description = span.text[:24]  # 截取描述预览
-            writer.writerow([f"L{span.line_no}", f"{span.start:.3f}", f"{duration:.3f}", "cue", description])  # 写入一行
+            writer.writerow(
+                [
+                    f"L{span.line_no}",
+                    seconds_to_hmsms(span.start),
+                    seconds_to_hmsms(duration),
+                    "cue",
+                    description,
+                ]
+            )  # 写入一行
+    ensure_csv_header(header)
     return out_path  # 返回输出路径
 
 
@@ -926,33 +938,42 @@ def export_sentence_markers(
 ) -> Path:
     """导出句子级命中与审阅点的 Audition 标记。"""
 
+    from .markers import ensure_csv_header, seconds_to_hmsms
+
+    header = ["Name", "Start", "Duration", "Type", "Description"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8", newline="") as csvfile:
+    with out_path.open("w", encoding="utf-8-sig", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["Name", "Start", "Duration", "Type", "Description"])
+        writer.writerow(header)
         for hit in sorted(hits, key=lambda item: (item.start_time, item.end_time)):
             duration = max(0.0, hit.end_time - hit.start_time)
             writer.writerow(
                 [
                     f"L{hit.sent_idx}",
-                    f"{hit.start_time:.3f}",
-                    f"{duration:.3f}",
+                    seconds_to_hmsms(hit.start_time),
+                    seconds_to_hmsms(duration),
                     "cue",
-                    hit.sent_text[:24],
+                    hit.sent_text[:48],
                 ]
             )
         for point in review_points:
             description_prefix = "[LOW]" if point.kind == "low_conf" else "[REVIEW]"
-            description = f"{description_prefix} {point.sent_text[:24]}".strip()
+            description = f"{description_prefix} {point.sent_text[:48]}".strip()
+            start_time = point.at_time if point.at_time is not None else point.start_time or 0.0
+            duration = max(
+                0.0,
+                (point.end_time or start_time or 0.0) - (point.start_time or start_time or 0.0),
+            )
             writer.writerow(
                 [
                     f"R{point.sent_idx}",
-                    f"{max(0.0, point.at_time):.3f}",
-                    "0.000",
+                    seconds_to_hmsms(start_time or 0.0),
+                    seconds_to_hmsms(duration),
                     "cue",
                     description,
                 ]
             )
+    ensure_csv_header(header)
     return out_path
 
 
