@@ -14,6 +14,11 @@ const STATE_LABELS = {
 }
 const CSV_HEADER = ["Name", "Start", "Duration", "Type", "Description"]
 
+const QUERY_API_BASE = sanitizeBase(new URLSearchParams(window.location.search).get("api") || "")
+let API_BASE = QUERY_API_BASE
+let resolvingApiPromise = null
+const START_SERVICE_COMMAND = "python scripts/web_panel_server.py"
+
 const state = {
   fileGroups: [],
   selectedAudio: null,
@@ -27,6 +32,9 @@ const state = {
   skipDeletes: true,
   selectedRegionId: null,
   skipGuardRegionId: null,
+  apiAvailable: false,
+  serviceToastShown: false,
+  lastKnownApiBase: API_BASE || null,
 }
 
 const dom = {
@@ -43,20 +51,295 @@ const dom = {
   exportEdl: document.getElementById("export-edl"),
   exportMarkers: document.getElementById("export-markers"),
   refreshButton: document.getElementById("refresh-button"),
+  apiStatusBadge: document.getElementById("api-status-badge"),
+  parseError: document.getElementById("parse-error"),
 }
+
+updateApiBadge("pending")
 
 if (!WaveSurferLib || !RegionsPlugin) {
   showToast("缺少 WaveSurfer 依赖，请确认 vendor/ 目录存在。", "error")
 }
 
-async function fetchFileGroups() {
+function sanitizeBase(base) {
+  if (!base || base === "null") return ""
+  return base.replace(/\/+$, "")
+}
+
+function getCandidateBases() {
+  const origin = window.location.origin && window.location.origin.startsWith("http") ? window.location.origin : ""
+  const bases = [QUERY_API_BASE, API_BASE, origin, "http://127.0.0.1:8088"]
+  const unique = []
+  for (const item of bases) {
+    const clean = sanitizeBase(item)
+    if (clean && !unique.includes(clean)) {
+      unique.push(clean)
+    }
+  }
+  return unique
+}
+
+async function pingBase(base) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 1000)
   try {
-    const response = await fetch("/api/list", { cache: "no-store" })
-    const payload = await response.json()
+    const response = await fetch(`${base}/api/ping`, { cache: "no-store", signal: controller.signal })
+    if (!response.ok) {
+      return false
+    }
+    const text = await response.text()
+    try {
+      const payload = JSON.parse(text)
+      return Boolean(payload?.ok)
+    } catch (error) {
+      console.warn("Ping JSON 解析失败", error)
+      return false
+    }
+  } catch (error) {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function updateApiBadge(status, base) {
+  if (!dom.apiStatusBadge) return
+  const badge = dom.apiStatusBadge
+  badge.classList.remove("status-badge--online", "status-badge--offline", "status-badge--pending")
+  if (status === "online") {
+    badge.classList.add("status-badge--online")
+    const effective = base || API_BASE || state.lastKnownApiBase || ""
+    badge.innerHTML = `API: ${effective}<span class="status-badge__check">✓</span>`
+    state.apiAvailable = true
+  } else if (status === "offline") {
+    badge.classList.add("status-badge--offline")
+    badge.textContent = "API 未运行（仅本地静态页面）"
+    state.apiAvailable = false
+  } else {
+    badge.classList.add("status-badge--pending")
+    badge.textContent = "API 状态检测中…"
+  }
+}
+
+function markApiOffline() {
+  updateApiBadge("offline")
+}
+
+function showNoServiceToast() {
+  const message =
+    "未检测到本地服务。请在项目根运行：python scripts/web_panel_server.py（或在主菜单按 W）。" +
+    "页面将继续运行，但无法读取 out/ 列表。"
+  showToast(message, "warning")
+}
+
+function showStartServiceToast() {
+  showToast(`请先启动服务：${START_SERVICE_COMMAND}`, "info", {
+    copyText: START_SERVICE_COMMAND,
+    copyLabel: "复制命令",
+  })
+}
+
+function showServiceUnavailableMessage() {
+  if (dom.fileGroups) {
+    dom.fileGroups.innerHTML = "<p class=\"sidebar__empty\">未连接到本地服务，无法读取 out/ 列表。</p>"
+  }
+}
+
+async function resolveApiBase() {
+  if (API_BASE && state.apiAvailable) {
+    return API_BASE
+  }
+  if (resolvingApiPromise) {
+    return resolvingApiPromise
+  }
+  const candidates = getCandidateBases()
+  resolvingApiPromise = (async () => {
+    for (const base of candidates) {
+      if (!base) continue
+      const ok = await pingBase(base)
+      if (ok) {
+        API_BASE = base
+        state.lastKnownApiBase = base
+        state.serviceToastShown = false
+        updateApiBadge("online", base)
+        return base
+      }
+    }
+    markApiOffline()
+    throw new Error("no-api")
+  })()
+  try {
+    return await resolvingApiPromise
+  } finally {
+    resolvingApiPromise = null
+  }
+}
+
+async function ensureApiReady(options = {}) {
+  const { showToast = false } = options
+  try {
+    return await resolveApiBase()
+  } catch (error) {
+    markApiOffline()
+    if (!state.serviceToastShown) {
+      showNoServiceToast()
+      state.serviceToastShown = true
+    }
+    if (showToast) {
+      showStartServiceToast()
+    }
+    throw error
+  }
+}
+
+function normalizeGroup(group) {
+  if (!group) return null
+  const stem = group.stem || ""
+  const audio = Array.isArray(group.audio)
+    ? group.audio.map((item) => normalizeFileInfo(item, "audio")).filter(Boolean)
+    : []
+  const markers = Array.isArray(group.markers)
+    ? group.markers.map((item) => normalizeFileInfo(item, "marker")).filter(Boolean)
+    : []
+  audio.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+  markers.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+  return { stem, audio, markers }
+}
+
+function normalizeFileInfo(entry, type) {
+  if (!entry) return null
+  const result = { path: "", name: "", displayPath: "" }
+  if (typeof entry === "string") {
+    const trimmed = entry.replace(/^\.\/+/, "")
+    const relative = trimmed.replace(/^out\//, "")
+    result.path = relative
+    result.name = trimmed.split("/").pop() || relative
+    result.displayPath = relative ? `out/${relative}` : result.name
+  } else if (typeof entry === "object") {
+    const rawPath = typeof entry.path === "string" ? entry.path : ""
+    const trimmed = rawPath.replace(/^\.\/+/, "")
+    const relative = trimmed.replace(/^out\//, "")
+    result.path = relative || rawPath
+    result.name = entry.name || trimmed.split("/").pop() || result.path
+    const explicitDisplay = entry.display_path || entry.displayPath
+    result.displayPath = explicitDisplay || (relative ? `out/${relative}` : result.name)
+    if (entry.kind) {
+      result.kind = entry.kind
+    }
+  } else {
+    return null
+  }
+  if (type === "marker" && !result.kind) {
+    result.kind = inferMarkerKind(result.name)
+  }
+  return result
+}
+
+function buildApiUrl(path) {
+  if (!path) return path
+  if (/^https?:/i.test(path)) {
+    return path
+  }
+  const base = sanitizeBase(API_BASE || state.lastKnownApiBase || "")
+  if (path.startsWith("/")) {
+    return base ? `${base}${path}` : path
+  }
+  return base ? `${base}/${path}` : path
+}
+
+async function fetchJSON(path, opts = {}) {
+  const hasProtocol = /^https?:/i.test(path)
+  let base = sanitizeBase(API_BASE || state.lastKnownApiBase || "")
+  if (!hasProtocol && !base) {
+    base = sanitizeBase(await resolveApiBase())
+  }
+  const url = hasProtocol ? path : `${base}${path}`
+  const headers = { Accept: "application/json", ...(opts.headers || {}) }
+  const fetchOptions = { ...opts, headers }
+  let response
+  try {
+    response = await fetch(url, fetchOptions)
+  } catch (error) {
+    markApiOffline()
+    throw error
+  }
+  const text = await response.text()
+  const ct = response.headers.get("content-type") || ""
+  if (!ct.includes("application/json")) {
+    const snippet = text.slice(0, 120).replace(/\s+/g, " ").trim()
+    const baseLabel = base || url
+    throw new Error(`Non-JSON response (status ${response.status}) from ${baseLabel}: ${snippet}`)
+  }
+  try {
+    const parsed = JSON.parse(text)
+    if (!hasProtocol && base) {
+      updateApiBadge("online", base)
+      state.lastKnownApiBase = base
+    }
+    return parsed
+  } catch (error) {
+    const snippet = text.slice(0, 120).replace(/\s+/g, " ").trim()
+    const baseLabel = base || url
+    throw new Error(`Invalid JSON from ${baseLabel}: ${error.message}. Snippet: ${snippet}`)
+  }
+}
+
+async function fetchText(path, opts = {}) {
+  const hasProtocol = /^https?:/i.test(path)
+  let base = sanitizeBase(API_BASE || state.lastKnownApiBase || "")
+  if (!hasProtocol && !base) {
+    base = sanitizeBase(await resolveApiBase())
+  }
+  const url = hasProtocol ? path : `${base}${path}`
+  let response
+  try {
+    response = await fetch(url, opts)
+  } catch (error) {
+    markApiOffline()
+    throw error
+  }
+  const text = await response.text()
+  if (!response.ok) {
+    const ct = response.headers.get("content-type") || ""
+    if (ct.includes("application/json")) {
+      let message = `请求失败 (${response.status})`
+      try {
+        const payload = JSON.parse(text)
+        if (payload && typeof payload.error === "string" && payload.error) {
+          message = payload.error
+        }
+      } catch (parseError) {
+        // ignore parse error and fallback to default message
+      }
+      throw new Error(message)
+    }
+    const snippet = text.slice(0, 120).replace(/\s+/g, " ").trim()
+    throw new Error(`请求失败 (${response.status}): ${snippet}`)
+  }
+  if (!hasProtocol && base) {
+    updateApiBadge("online", base)
+    state.lastKnownApiBase = base
+  }
+  return text
+}
+
+async function fetchFileGroups(options = {}) {
+  const { manual = false } = options
+  try {
+    await ensureApiReady({ showToast: manual })
+  } catch (error) {
+    if (!manual && !state.fileGroups.length) {
+      showServiceUnavailableMessage()
+    }
+    return
+  }
+  try {
+    const payload = await fetchJSON("/api/list", { cache: "no-store" })
     if (!payload.ok) {
       throw new Error(payload.error || "未知错误")
     }
-    state.fileGroups = payload.items || []
+    const groups = payload.groups || payload.items || []
+    state.fileGroups = groups.map((group) => normalizeGroup(group)).filter(Boolean)
     renderFileGroups()
   } catch (error) {
     console.error("加载文件列表失败", error)
@@ -247,30 +530,41 @@ async function loadMarker(marker) {
     resetRegions()
     return
   }
+  clearParseError()
+  if (!marker || !marker.path) {
+    resetRegions()
+    return
+  }
   try {
-    const response = await fetch(`/api/file?path=${encodeURIComponent(marker.path)}`)
-    const payload = await response.json()
-    if (!payload.ok) {
-      throw new Error(payload.error || "读取失败")
-    }
-    const text = payload.content || ""
+    const text = await fetchText(`/api/file?path=${encodeURIComponent(marker.path)}`, { cache: "no-store" })
     const kind = marker.kind || inferMarkerKind(marker.name)
     let specs = []
-    if (kind === "audition_csv" || kind === "markers_csv") {
-      specs = parseAuditionCsv(text)
-    } else if (kind === "edl_json") {
-      specs = parseEdlJson(text)
-    } else if (kind === "srt") {
-      specs = parseSrt(text)
-    } else {
-      specs = parseAuditionCsv(text)
+    try {
+      if (kind === "audition_csv" || kind === "markers_csv") {
+        specs = parseAuditionCsv(text)
+      } else if (kind === "edl_json") {
+        specs = parseEdlJson(text)
+      } else if (kind === "srt") {
+        specs = parseSrt(text)
+      } else {
+        specs = parseAuditionCsv(text)
+      }
+    } catch (parseError) {
+      reportParseFailure(marker, parseError, text)
+      resetRegions()
+      return
+    }
+    marker.kind = kind
+    if (state.selectedMarker) {
+      state.selectedMarker.kind = kind
     }
     applyRegions(specs)
+    clearParseError()
     showToast(`已加载标记，共 ${specs.length} 段`, "success")
   } catch (error) {
-    console.error("解析标记失败", error)
+    console.error("读取标记失败", error)
     resetRegions()
-    showToast(`解析标记失败: ${error.message}`, "error")
+    showToast(`读取标记失败: ${error.message}`, "error")
   }
 }
 
@@ -284,7 +578,13 @@ function inferMarkerKind(name) {
 }
 
 function buildOutUrl(path) {
-  return `/out/${path.split("/").map(encodeURIComponent).join("/")}`
+  const cleaned = (path || "").replace(/^\.\/+/g, "").replace(/^out\//, "")
+  const encoded = cleaned
+    .split("/")
+    .filter((segment) => segment.length > 0)
+    .map(encodeURIComponent)
+    .join("/")
+  return buildApiUrl(`/out/${encoded}`)
 }
 
 function setupRegionEvents(plugin) {
@@ -551,17 +851,16 @@ async function exportEdl(silent = false) {
   }
   const actions = collectEdlActions()
   try {
-    const response = await fetch("/api/save_edl", {
+    const payload = await fetchJSON("/api/save_edl", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stem: state.currentStem, actions }),
     })
-    const payload = await response.json()
     if (!payload.ok) {
       throw new Error(payload.error || "保存失败")
     }
     if (!silent) {
-      showToastWithLink(`已导出 EDL`, payload.path, "success")
+      showSavedFileToast(payload.path, "EDL")
     }
     return true
   } catch (error) {
@@ -577,17 +876,16 @@ async function exportMarkers(silent = false) {
   }
   const rows = collectMarkersRows()
   try {
-    const response = await fetch("/api/save_markers_csv", {
+    const payload = await fetchJSON("/api/save_markers_csv", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stem: state.currentStem, rows }),
     })
-    const payload = await response.json()
     if (!payload.ok) {
       throw new Error(payload.error || "保存失败")
     }
     if (!silent) {
-      showToastWithLink(`已导出 Audition CSV`, payload.path, "success")
+      showSavedFileToast(payload.path, "Audition CSV")
     }
     return true
   } catch (error) {
@@ -640,32 +938,111 @@ function roundSeconds(value) {
   return Math.round(Number(value || 0) * 1000) / 1000
 }
 
-function showToast(message, type = "info") {
-  showToastWithLink(message, null, type)
-}
-
-function showToastWithLink(message, link, type = "info") {
+function showToast(message, type = "info", options = {}) {
   const container = document.getElementById("toast-container")
+  if (!container) return
   const toast = document.createElement("div")
   toast.className = "toast"
-  if (type === "success") toast.classList.add("toast--success")
-  if (type === "error") toast.classList.add("toast--error")
-  toast.textContent = message
-  if (link) {
+  const typeClass = {
+    success: "toast--success",
+    error: "toast--error",
+    info: "toast--info",
+    warning: "toast--warning",
+  }[type]
+  if (typeClass) {
+    toast.classList.add(typeClass)
+  }
+  const messageSpan = document.createElement("span")
+  messageSpan.className = "toast__message"
+  messageSpan.textContent = message
+  toast.appendChild(messageSpan)
+  if (options.link && options.link.href) {
     const anchor = document.createElement("a")
-    anchor.href = `/${link}`
-    anchor.target = "_blank"
-    anchor.rel = "noopener"
+    anchor.href = options.link.href
     anchor.className = "toast__link"
-    anchor.textContent = "打开"
+    if (options.link.newTab !== false) {
+      anchor.target = "_blank"
+      anchor.rel = "noopener"
+    }
+    anchor.textContent = options.link.text || options.link.href
     toast.appendChild(anchor)
+  }
+  if (options.copyText) {
+    const actions = document.createElement("div")
+    actions.className = "toast__actions"
+    const button = document.createElement("button")
+    button.type = "button"
+    button.className = "toast__copy"
+    const defaultLabel = options.copyLabel || "复制"
+    button.textContent = defaultLabel
+    button.addEventListener("click", async () => {
+      try {
+        await copyTextToClipboard(options.copyText)
+        button.textContent = "已复制"
+      } catch (error) {
+        console.error("复制失败", error)
+        button.textContent = "复制失败"
+      }
+      setTimeout(() => {
+        button.textContent = defaultLabel
+      }, 1500)
+    })
+    actions.appendChild(button)
+    toast.appendChild(actions)
   }
   container.appendChild(toast)
   setTimeout(() => {
     toast.style.opacity = "0"
     toast.style.transform = "translateY(-10px)"
     setTimeout(() => toast.remove(), 300)
-  }, 4000)
+  }, options.duration || 4000)
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const textarea = document.createElement("textarea")
+  textarea.value = text
+  textarea.style.position = "fixed"
+  textarea.style.top = "-1000px"
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  document.execCommand("copy")
+  document.body.removeChild(textarea)
+}
+
+function showSavedFileToast(path, label) {
+  const normalized = (path || "").replace(/^\.\/+/, "")
+  const prefixed = normalized.startsWith("out/") || !normalized ? normalized : `out/${normalized}`
+  const relative = prefixed.replace(/^out\//, "")
+  const href = buildApiUrl(`/api/file?path=${encodeURIComponent(relative)}`)
+  const text = prefixed || path || "out/"
+  const message = label ? `已保存 ${label} → ` : "已保存 → "
+  showToast(message, "success", { link: { href, text } })
+}
+
+function showParseError(message) {
+  if (!dom.parseError) return
+  dom.parseError.textContent = message
+  dom.parseError.classList.remove("hidden")
+}
+
+function clearParseError() {
+  if (!dom.parseError) return
+  dom.parseError.textContent = ""
+  dom.parseError.classList.add("hidden")
+}
+
+function reportParseFailure(marker, error, text) {
+  const name = marker?.name || "标记"
+  console.error(`解析 ${name} 失败`, error)
+  if (typeof text === "string" && text.length) {
+    console.error("原始文本片段:", text.slice(0, 200))
+  }
+  showParseError(`解析 ${name} 失败：${error.message}`)
 }
 
 function parseAuditionCsv(text) {
@@ -827,7 +1204,7 @@ function attachEventListeners() {
   dom.zoomRange.addEventListener("input", handleZoomChange)
   dom.exportEdl.addEventListener("click", () => exportEdl(false))
   dom.exportMarkers.addEventListener("click", () => exportMarkers(false))
-  dom.refreshButton.addEventListener("click", fetchFileGroups)
+  dom.refreshButton.addEventListener("click", () => fetchFileGroups({ manual: true }))
   document.querySelectorAll("[data-bulk]").forEach((button) => {
     button.addEventListener("click", () => applyStateToAll(button.dataset.bulk))
   })
@@ -838,6 +1215,7 @@ function attachEventListeners() {
 function init() {
   attachEventListeners()
   updateSelectionInfo()
+  clearParseError()
   fetchFileGroups()
 }
 

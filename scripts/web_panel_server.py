@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
+from werkzeug.serving import make_server
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 WEB_ROOT = ROOT_DIR / "web"
@@ -37,54 +39,37 @@ def _safe_resolve(base: Path, relative_path: str) -> Path:
 def _iter_out_files() -> Iterable[Path]:
     if not OUT_ROOT.exists():
         return []
-    results: list[Path] = []
-    for entry in OUT_ROOT.iterdir():
-        if entry.is_file():
-            results.append(entry)
-        elif entry.is_dir():
-            for sub in entry.iterdir():
-                if sub.is_file():
-                    results.append(sub)
-        # 仅递归一层
-    return [path.relative_to(OUT_ROOT) for path in results]
+    return [path.relative_to(OUT_ROOT) for path in OUT_ROOT.rglob("*") if path.is_file()]
 
 
 def _derive_stem(name: str) -> str:
     return name.split(".")[0] if "." in name else name
 
 
-def _classify_marker(filename: str) -> str:
-    lower = filename.lower()
-    if lower.endswith(".audition_markers.csv"):
-        return "audition_csv"
-    if lower.endswith(".markers.csv"):
-        return "markers_csv"
-    if lower.endswith(".edl.json"):
-        return "edl_json"
-    if lower.endswith(".srt"):
-        return "srt"
-    return "unknown"
-
-
 def _build_list_payload() -> dict[str, Any]:
-    items: dict[str, dict[str, Any]] = {}
+    groups: dict[str, dict[str, Any]] = {}
     for relative in _iter_out_files():
         rel_str = relative.as_posix()
         name = relative.name
+        lower = name.lower()
         stem = _derive_stem(name)
-        entry = items.setdefault(stem, {"stem": stem, "audio": [], "markers": []})
-        if any(name.lower().endswith(ext) for ext in AUDIO_EXTENSIONS):
-            entry["audio"].append({"path": rel_str, "name": name})
-        elif any(name.lower().endswith(ext) for ext in MARKER_EXTENSIONS):
-            entry["markers"].append(
-                {
-                    "path": rel_str,
-                    "name": name,
-                    "kind": _classify_marker(name),
-                }
-            )
-    ordered = sorted(items.values(), key=lambda item: item["stem"])
-    return {"ok": True, "items": ordered}
+        entry = groups.setdefault(stem, {"stem": stem, "audio": [], "markers": []})
+        if any(lower.endswith(ext) for ext in AUDIO_EXTENSIONS):
+            entry["audio"].append(f"out/{rel_str}")
+        elif any(lower.endswith(ext) for ext in MARKER_EXTENSIONS):
+            entry["markers"].append(f"out/{rel_str}")
+    ordered: list[dict[str, Any]] = []
+    for stem in sorted(groups.keys()):
+        group = groups[stem]
+        group["audio"] = sorted(group["audio"])
+        group["markers"] = sorted(group["markers"])
+        ordered.append(group)
+    return {"ok": True, "groups": ordered}
+
+
+@app.route("/api/ping")
+def api_ping() -> Any:
+    return jsonify({"ok": True})
 
 
 @app.route("/api/list")
@@ -93,7 +78,9 @@ def api_list() -> Any:
         payload = _build_list_payload()
     except Exception as exc:  # pragma: no cover - 容错
         return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify(payload)
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/file")
@@ -104,18 +91,25 @@ def api_file() -> Any:
     try:
         target = _safe_resolve(OUT_ROOT, rel)
     except ValueError:
-        return jsonify({"ok": False, "error": "禁止访问 out/ 目录之外的文件"}), 403
+        return jsonify({"ok": False, "error": "path out of scope"}), 403
     if not target.exists() or not target.is_file():
-        return jsonify({"ok": False, "error": "文件不存在"}), 404
+        return jsonify({"ok": False, "error": "file not found"}), 404
     try:
         content = target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return jsonify({"ok": False, "error": "文件不是 UTF-8 文本"}), 415
-    return jsonify({"ok": True, "path": rel, "content": content})
+    response = Response(content, mimetype="text/plain; charset=utf-8")
+    response.headers["Cache-Control"] = "no-store"
+    print(f"[READ] {request.remote_addr or '-'} -> {target.relative_to(ROOT_DIR)}", flush=True)
+    return response
 
 
 def _validate_stem(stem: str) -> bool:
-    return stem and "/" not in stem and "\\" not in stem
+    if not stem or "/" in stem or "\\" in stem:
+        return False
+    if ".." in stem:
+        return False
+    return True
 
 
 @app.route("/api/save_edl", methods=["POST"])
@@ -141,7 +135,10 @@ def api_save_edl() -> Any:
     out_path = OUT_ROOT / f"{stem}.manual.edl.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps({"actions": filtered}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return jsonify({"ok": True, "path": out_path.relative_to(ROOT_DIR).as_posix()})
+    print(f"[SAVE] {request.remote_addr or '-'} -> {out_path.relative_to(ROOT_DIR)}", flush=True)
+    response = jsonify({"ok": True, "path": out_path.relative_to(ROOT_DIR).as_posix()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/api/save_markers_csv", methods=["POST"])
@@ -161,11 +158,12 @@ def api_save_markers_csv() -> Any:
     out_path = OUT_ROOT / f"{stem}.manual.audition_markers.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8-sig", newline="") as f:
-        import csv
-
-        writer = csv.writer(f)
+        writer = csv.writer(f, lineterminator="\r\n")
         writer.writerows(normalized)
-    return jsonify({"ok": True, "path": out_path.relative_to(ROOT_DIR).as_posix()})
+    print(f"[SAVE] {request.remote_addr or '-'} -> {out_path.relative_to(ROOT_DIR)}", flush=True)
+    response = jsonify({"ok": True, "path": out_path.relative_to(ROOT_DIR).as_posix()})
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/web/")
@@ -196,10 +194,28 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    port = args.port
+    server = None
+    while port <= 8090:
+        try:
+            server = make_server("127.0.0.1", port, app)
+            break
+        except OSError as exc:  # pragma: no cover - 端口被占用
+            if getattr(exc, "errno", None) in {48, 98}:
+                print(f"Port {port} in use, trying {port + 1}", flush=True)
+                port += 1
+                continue
+            raise
+    if server is None:
+        raise SystemExit("无法启动服务: 端口 8088-8090 均被占用")
+    print(f"Serving web panel on http://127.0.0.1:{port}", flush=True)
     try:
-        app.run(host="127.0.0.1", port=args.port, debug=False)
-    except OSError as exc:  # pragma: no cover - 端口被占用
-        raise SystemExit(f"无法启动服务: {exc}")
+        server.serve_forever()
+    except KeyboardInterrupt:  # pragma: no cover - 手动停止
+        print("Shutting down web panel...", flush=True)
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

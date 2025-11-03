@@ -3,9 +3,11 @@ from __future__ import annotations  # 启用未来注解特性，避免前置字
 
 import json  # 处理 JSON 配置与结果文件
 import os  # 管理环境变量用于子进程
+import re  # 正则提取服务端口
 import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
+import threading  # 监听子进程输出
 import webbrowser  # 自动打开浏览器显示可视化面板
 from dataclasses import asdict, dataclass  # 引入数据类工具与转换字典的方法
 from pathlib import Path  # 使用 Path 进行跨平台路径操作
@@ -992,43 +994,80 @@ def _launch_web_panel() -> None:
     env = os.environ.copy()
     env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
 
-    for port in range(8088, 8091):
-        cmd = [sys.executable, str(script), "--port", str(port)]
-        print_info(f"尝试启动服务: {shlex.join(cmd)}")
+    cmd = [sys.executable, str(script), "--port", "8088"]
+    print_info(f"启动命令: {shlex.join(cmd)}")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(ROOT_DIR),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        print_error(f"无法启动服务器: {exc}")
+        return
+
+    assert proc.stdout is not None
+    port_event = threading.Event()
+    detected = {"port": None}
+
+    def _reader() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="")
+            match = re.search(r"http://127\\.0\\.0\\.1:(\\d+)", line)
+            if match and detected["port"] is None:
+                detected["port"] = int(match.group(1))
+                port_event.set()
+        proc.stdout.close()
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    try:
+        while not port_event.wait(timeout=0.1):
+            if proc.poll() is not None:
+                return_code = proc.returncode
+                print_error(
+                    f"可视化控制台启动失败 (exit={return_code})，请检查上方输出。"
+                )
+                return
+
+        port = detected["port"] or 8088
+        base_url = f"http://127.0.0.1:{port}"
+        panel_url = f"{base_url}/web/index.html?api={base_url}"
+        print_success(f"可视化控制台已运行: {panel_url}")
         try:
-            proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env)
-        except OSError as exc:
-            print_error(f"无法启动服务器: {exc}")
-            return
+            webbrowser.open(panel_url)
+        except Exception as exc:  # pragma: no cover - 浏览器未配置
+            print_warning(f"自动打开浏览器失败: {exc}")
+        print_info(f"如浏览器未自动打开，请手动访问 {panel_url}")
+        print_info("按 Ctrl+C 停止服务器。")
 
         try:
-            return_code = proc.wait(timeout=1.5)
-        except subprocess.TimeoutExpired:
-            url = f"http://127.0.0.1:{port}/web/index.html"
-            print_success(f"可视化控制台已运行: {url}")
+            proc.wait()
+        except KeyboardInterrupt:
+            print_info("正在关闭服务器...")
+            proc.terminate()
             try:
-                webbrowser.open(url)
-            except Exception as exc:  # pragma: no cover - 浏览器未配置
-                print_warning(f"自动打开浏览器失败: {exc}")
-            print_info("按 Ctrl+C 结束服务器运行。")
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
             try:
-                proc.wait()
-            except KeyboardInterrupt:
-                print_info("正在关闭服务器...")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-            return
-        else:
-            if return_code == 0:
-                print_warning(f"端口 {port} 已被占用或服务器立即退出。尝试下一个端口。")
-            else:
-                print_warning(f"端口 {port} 启动失败 (exit={return_code})，尝试下一个端口。")
-            continue
-
-    print_error("端口 8088-8090 均无法启动服务，请检查端口占用。")
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            reader_thread.join(timeout=1)
+        except Exception:  # pragma: no cover - 容错
+            pass
 
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
