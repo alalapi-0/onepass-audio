@@ -1,7 +1,9 @@
-const WaveSurferLib = window.WaveSurfer
-const RegionsPlugin = WaveSurferLib?.Regions
+// OnePass Audio Web 控制台主脚本：负责读取 out/ 产物、渲染波形并导出手工标记。
 
-const REGION_STATES = ["delete", "keep", "undecided"]
+const WaveSurferLib = window.WaveSurfer  // 引入全局 WaveSurfer 库
+const RegionsPlugin = WaveSurferLib?.Regions  // 读取区域插件，允许在波形上标注片段
+
+const REGION_STATES = ["delete", "keep", "undecided"]  // 可用的区域状态顺序
 const REGION_COLORS = {
   delete: "rgba(239,68,68,0.35)",
   keep: "rgba(34,197,94,0.35)",
@@ -12,59 +14,63 @@ const STATE_LABELS = {
   keep: "保留",
   undecided: "未决",
 }
-const CSV_HEADER = ["Name", "Start", "Duration", "Type", "Description"]
+const CSV_HEADER = ["Name", "Start", "Duration", "Type", "Description"]  // Audition CSV 表头
 
-const QUERY_API_BASE = sanitizeBase(new URLSearchParams(window.location.search).get("api") || "")
-let API_BASE = QUERY_API_BASE
-let resolvingApiPromise = null
-const START_SERVICE_COMMAND = "python scripts/web_panel_server.py"
+const QUERY_API_BASE = sanitizeBase(new URLSearchParams(window.location.search).get("api") || "")  // URL 中传入的 API 基址
+let API_BASE = QUERY_API_BASE  // 当前使用的 API 地址
+let resolvingApiPromise = null  // 处理并发探测时的 Promise 锁
+const START_SERVICE_COMMAND = "python scripts/web_panel_server.py"  // 指引用户启动服务的命令
 
 const state = {
-  fileGroups: [],
-  selectedAudio: null,
-  selectedMarker: null,
-  currentStem: null,
-  waveSurfer: null,
-  regionsPlugin: null,
-  dragSelectionHandle: null,
-  altPressed: false,
-  allowProgrammaticRegion: false,
-  skipDeletes: true,
-  selectedRegionId: null,
-  skipGuardRegionId: null,
-  apiAvailable: false,
-  serviceToastShown: false,
-  lastKnownApiBase: API_BASE || null,
+  fileGroups: [],  // /api/list 返回的分组数据
+  selectedAudio: null,  // 当前选择的音频条目
+  selectedMarker: null,  // 当前选择的标记条目
+  currentStem: null,  // 当前推导的 stem
+  waveSurfer: null,  // WaveSurfer 实例
+  regionsPlugin: null,  // 区域插件实例
+  dragSelectionHandle: null,  // 记录正在拖动的区域句柄
+  altPressed: false,  // 是否按下 Alt，控制拖拽创建区域
+  allowProgrammaticRegion: false,  // 是否允许脚本主动创建区域（避免递归触发）
+  skipDeletes: true,  // 播放时是否跳过删除状态
+  selectedRegionId: null,  // 当前高亮区域的 ID
+  skipGuardRegionId: null,  // 播放时的防跳转区域 ID
+  apiAvailable: false,  // 当前 API 是否可用
+  serviceToastShown: false,  // 是否已经提示过“启动服务”
+  lastKnownApiBase: API_BASE || null,  // 最近一次成功的 API 地址
 }
 
 const dom = {
-  fileGroups: document.getElementById("file-groups"),
-  currentAudio: document.getElementById("current-audio"),
-  currentMarker: document.getElementById("current-marker"),
-  currentStem: document.getElementById("current-stem"),
-  playToggle: document.getElementById("play-toggle"),
-  seekBack: document.getElementById("seek-back"),
-  seekForward: document.getElementById("seek-forward"),
-  zoomRange: document.getElementById("zoom-range"),
-  skipToggle: document.getElementById("skip-toggle"),
-  regionTableBody: document.getElementById("region-tbody"),
-  exportEdl: document.getElementById("export-edl"),
-  exportMarkers: document.getElementById("export-markers"),
-  refreshButton: document.getElementById("refresh-button"),
-  apiStatusBadge: document.getElementById("api-status-badge"),
-  parseError: document.getElementById("parse-error"),
+  fileGroups: document.getElementById("file-groups"),  // 侧边栏列表容器
+  currentAudio: document.getElementById("current-audio"),  // 顶部栏音频显示
+  currentMarker: document.getElementById("current-marker"),  // 顶部栏标记显示
+  currentStem: document.getElementById("current-stem"),  // 顶部栏 stem 显示
+  playToggle: document.getElementById("play-toggle"),  // 播放/暂停按钮
+  seekBack: document.getElementById("seek-back"),  // 快退按钮
+  seekForward: document.getElementById("seek-forward"),  // 快进按钮
+  zoomRange: document.getElementById("zoom-range"),  // 缩放滑杆
+  skipToggle: document.getElementById("skip-toggle"),  // 跳过删除段按钮
+  regionTableBody: document.getElementById("region-tbody"),  // 区域表格主体
+  exportEdl: document.getElementById("export-edl"),  // 导出 EDL 按钮
+  exportMarkers: document.getElementById("export-markers"),  // 导出 Audition 标记按钮
+  refreshButton: document.getElementById("refresh-button"),  // 重新扫描按钮
+  apiStatusBadge: document.getElementById("api-status-badge"),  // 状态徽章
+  parseError: document.getElementById("parse-error"),  // 解析错误提示
 }
 
-updateApiBadge("pending")
+updateApiBadge("pending")  // 初始化徽章为“检测中”状态
 
 if (!WaveSurferLib || !RegionsPlugin) {
   showToast("缺少 WaveSurfer 依赖，请确认 vendor/ 目录存在。", "error")
 }
 
+// 清理 API 基址字符串，移除尾部斜杠或空值。
+
 function sanitizeBase(base) {
   if (!base || base === "null") return ""
   return base.replace(/\/+$, "")
 }
+
+// 根据查询参数、历史记录与默认端口生成可尝试的 API 地址列表。
 
 function getCandidateBases() {
   const origin = window.location.origin && window.location.origin.startsWith("http") ? window.location.origin : ""
@@ -78,6 +84,8 @@ function getCandidateBases() {
   }
   return unique
 }
+
+// 向指定地址发送 /api/ping 请求，用于探测服务是否在线。
 
 async function pingBase(base) {
   const controller = new AbortController()
@@ -102,6 +110,8 @@ async function pingBase(base) {
   }
 }
 
+// 更新右上角状态徽章，展示在线/离线/检测中的状态。
+
 function updateApiBadge(status, base) {
   if (!dom.apiStatusBadge) return
   const badge = dom.apiStatusBadge
@@ -121,9 +131,13 @@ function updateApiBadge(status, base) {
   }
 }
 
+// 在状态徽章上标记当前服务不可用。
+
 function markApiOffline() {
   updateApiBadge("offline")
 }
+
+// 弹出提示，告知尚未启动本地服务。
 
 function showNoServiceToast() {
   const message =
@@ -132,6 +146,8 @@ function showNoServiceToast() {
   showToast(message, "warning")
 }
 
+// 弹出提示并附带复制按钮，指引用户启动后端服务。
+
 function showStartServiceToast() {
   showToast(`请先启动服务：${START_SERVICE_COMMAND}`, "info", {
     copyText: START_SERVICE_COMMAND,
@@ -139,11 +155,15 @@ function showStartServiceToast() {
   })
 }
 
+// 在侧边栏显示占位文案，提醒列表不可用。
+
 function showServiceUnavailableMessage() {
   if (dom.fileGroups) {
     dom.fileGroups.innerHTML = "<p class=\"sidebar__empty\">未连接到本地服务，无法读取 out/ 列表。</p>"
   }
 }
+
+// 依次尝试候选地址，找到可用的 API 基址并缓存。
 
 async function resolveApiBase() {
   if (API_BASE && state.apiAvailable) {
@@ -175,6 +195,8 @@ async function resolveApiBase() {
   }
 }
 
+// 确保后端服务已就绪，必要时提示用户启动。
+
 async function ensureApiReady(options = {}) {
   const { showToast = false } = options
   try {
@@ -192,6 +214,8 @@ async function ensureApiReady(options = {}) {
   }
 }
 
+// 将后端返回的单个分组整理为统一结构，方便前端使用。
+
 function normalizeGroup(group) {
   if (!group) return null
   const stem = group.stem || ""
@@ -205,6 +229,8 @@ function normalizeGroup(group) {
   markers.sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
   return { stem, audio, markers }
 }
+
+// 将单个文件条目解析成统一的音频/标记对象。
 
 function normalizeFileInfo(entry, type) {
   if (!entry) return null
@@ -235,6 +261,8 @@ function normalizeFileInfo(entry, type) {
   return result
 }
 
+// 基于当前 API 基址拼接请求路径。
+
 function buildApiUrl(path) {
   if (!path) return path
   if (/^https?:/i.test(path)) {
@@ -246,6 +274,8 @@ function buildApiUrl(path) {
   }
   return base ? `${base}/${path}` : path
 }
+
+// 封装 fetch 调用，处理 JSON 响应与错误提示。
 
 async function fetchJSON(path, opts = {}) {
   const hasProtocol = /^https?:/i.test(path)
@@ -283,6 +313,8 @@ async function fetchJSON(path, opts = {}) {
     throw new Error(`Invalid JSON from ${baseLabel}: ${error.message}. Snippet: ${snippet}`)
   }
 }
+
+// 以纯文本形式请求资源，并处理网络错误。
 
 async function fetchText(path, opts = {}) {
   const hasProtocol = /^https?:/i.test(path)
@@ -323,6 +355,8 @@ async function fetchText(path, opts = {}) {
   return text
 }
 
+// 调用 /api/list 接口获取 out/ 目录的分组信息。
+
 async function fetchFileGroups(options = {}) {
   const { manual = false } = options
   try {
@@ -346,6 +380,8 @@ async function fetchFileGroups(options = {}) {
     showToast(`加载文件列表失败: ${error.message}`, "error")
   }
 }
+
+// 渲染左侧侧边栏，列出可选择的音频与标记文件。
 
 function renderFileGroups() {
   dom.fileGroups.innerHTML = ""
@@ -422,11 +458,15 @@ function renderFileGroups() {
   }
 }
 
+// 从文件路径推导 stem 名称，用于匹配音频与标记。
+
 function deriveStem(name) {
   if (!name) return ""
   const index = name.indexOf(".")
   return index === -1 ? name : name.slice(0, index)
 }
+
+// 在顶部栏刷新当前音频、标记与 stem 显示。
 
 function updateSelectionInfo() {
   dom.currentAudio.textContent = state.selectedAudio?.name || "未选择"
@@ -438,6 +478,8 @@ function updateSelectionInfo() {
   state.currentStem = stem || null
   dom.currentStem.textContent = state.currentStem || "-"
 }
+
+// 响应侧边栏点击事件，加载并播放目标音频。
 
 function selectAudio(audio) {
   if (state.selectedAudio && state.selectedAudio.path === audio.path) {
@@ -455,6 +497,8 @@ function selectAudio(audio) {
     }
   }
 }
+
+// 选择标记文件并根据类型解析区域数据。
 
 function selectMarker(marker) {
   if (state.selectedMarker && state.selectedMarker.path === marker.path) {
@@ -475,6 +519,8 @@ function selectMarker(marker) {
   }
 }
 
+// 清空当前波形区域与表格状态。
+
 function resetRegions() {
   state.selectedRegionId = null
   state.skipGuardRegionId = null
@@ -483,6 +529,8 @@ function resetRegions() {
   }
   dom.regionTableBody.innerHTML = ""
 }
+
+// 异步加载音频文件，初始化 WaveSurfer 实例。
 
 async function loadAudio(audio) {
   destroyWaveSurfer()
@@ -515,6 +563,8 @@ async function loadAudio(audio) {
   })
 }
 
+// 销毁现有的 WaveSurfer，释放事件与内存。
+
 function destroyWaveSurfer() {
   disableAltDrag()
   if (state.waveSurfer) {
@@ -524,6 +574,8 @@ function destroyWaveSurfer() {
   state.regionsPlugin = null
   resetRegions()
 }
+
+// 根据标记类型加载内容，渲染区域或生成提示。
 
 async function loadMarker(marker) {
   if (!state.regionsPlugin) {
@@ -568,6 +620,8 @@ async function loadMarker(marker) {
   }
 }
 
+// 根据文件后缀判断标记格式（CSV/EDL/SRT）。
+
 function inferMarkerKind(name) {
   const lower = name.toLowerCase()
   if (lower.endsWith(".edl.json")) return "edl_json"
@@ -576,6 +630,8 @@ function inferMarkerKind(name) {
   if (lower.endsWith(".markers.csv")) return "markers_csv"
   return "unknown"
 }
+
+// 为 out/ 下的资源生成可访问的完整 URL。
 
 function buildOutUrl(path) {
   const cleaned = (path || "").replace(/^\.\/+/g, "").replace(/^out\//, "")
@@ -586,6 +642,8 @@ function buildOutUrl(path) {
     .join("/")
   return buildApiUrl(`/out/${encoded}`)
 }
+
+// 为波形区域注册交互事件，支持拖动与选中。
 
 function setupRegionEvents(plugin) {
   plugin.on("region-created", (region) => {
@@ -620,6 +678,8 @@ function setupRegionEvents(plugin) {
   })
 }
 
+// 在创建或修改区域后，统一填充默认属性。
+
 function finalizeRegion(region) {
   const stateKey = region.data.state || "undecided"
   region.setOptions({ color: REGION_COLORS[stateKey] })
@@ -630,6 +690,8 @@ function finalizeRegion(region) {
   }
 }
 
+// 为区域生成悬停提示文本。
+
 function buildRegionTooltip(region) {
   const start = secondsToHms(region.start)
   const end = secondsToHms(region.end)
@@ -637,6 +699,8 @@ function buildRegionTooltip(region) {
   const description = region.data.description ? `\n${region.data.description}` : ""
   return `${STATE_LABELS[region.data.state]} ${start} → ${end} (${duration})${description}`
 }
+
+// 根据解析结果批量创建 WaveSurfer 区域。
 
 function applyRegions(specs) {
   resetRegions()
@@ -662,10 +726,14 @@ function applyRegions(specs) {
   refreshRegionTable()
 }
 
+// 按时间排序当前区域列表，方便渲染与导出。
+
 function getRegionsSorted() {
   if (!state.regionsPlugin) return []
   return [...state.regionsPlugin.getRegions()].sort((a, b) => a.start - b.start)
 }
+
+// 刷新下方表格，展示所有区域的时间与状态。
 
 function refreshRegionTable() {
   const regions = getRegionsSorted()
@@ -697,11 +765,15 @@ function refreshRegionTable() {
   })
 }
 
+// 创建带默认类名的表格单元格元素。
+
 function createCell(text) {
   const td = document.createElement("td")
   td.textContent = text
   return td
 }
+
+// 设置当前高亮的区域，并同步表格样式。
 
 function setSelectedRegion(region) {
   state.selectedRegionId = region?.id || null
@@ -713,6 +785,8 @@ function setSelectedRegion(region) {
   refreshRegionTable()
 }
 
+// 在删除/保留/未决之间循环切换区域状态。
+
 function cycleRegionState(region) {
   const currentIndex = REGION_STATES.indexOf(region.data.state)
   const nextIndex = (currentIndex + 1) % REGION_STATES.length
@@ -721,6 +795,8 @@ function cycleRegionState(region) {
   refreshRegionTable()
 }
 
+// 将某个状态批量应用到所有区域。
+
 function applyStateToAll(nextState) {
   for (const region of getRegionsSorted()) {
     region.data.state = nextState
@@ -728,6 +804,8 @@ function applyStateToAll(nextState) {
   }
   refreshRegionTable()
 }
+
+// 跟踪播放进度，使对应区域与表格行高亮。
 
 function handleTimeUpdate(time) {
   if (!state.skipDeletes || !state.waveSurfer) return
@@ -745,10 +823,14 @@ function handleTimeUpdate(time) {
   state.waveSurfer.setTime(deleteRegion.end + 0.01)
 }
 
+// 切换音频的播放与暂停。
+
 function togglePlayback() {
   if (!state.waveSurfer) return
   state.waveSurfer.playPause()
 }
+
+// 相对移动播放指针，实现快退/快进。
 
 function seekBy(seconds) {
   if (!state.waveSurfer) return
@@ -758,17 +840,23 @@ function seekBy(seconds) {
   state.waveSurfer.setTime(next)
 }
 
+// 控制是否在播放时跳过删除状态的片段。
+
 function toggleSkipDeletes() {
   state.skipDeletes = !state.skipDeletes
   dom.skipToggle.classList.toggle("active", state.skipDeletes)
   showToast(state.skipDeletes ? "播放时将跳过删除段" : "播放将包含删除段", "info")
 }
 
+// 根据滑杆数值调整波形缩放。
+
 function handleZoomChange() {
   if (!state.waveSurfer) return
   const value = Number(dom.zoomRange.value) || 120
   state.waveSurfer.zoom(value)
 }
+
+// 记录 Alt 键按下状态，允许拖动创建区域。
 
 function enableAltDrag() {
   if (!state.regionsPlugin || state.dragSelectionHandle) return
@@ -778,12 +866,16 @@ function enableAltDrag() {
   )
 }
 
+// Alt 键松开时还原拖动状态。
+
 function disableAltDrag() {
   if (state.dragSelectionHandle) {
     state.dragSelectionHandle()
     state.dragSelectionHandle = null
   }
 }
+
+// 响应键盘按下事件，支持快捷键控制。
 
 function handleKeyDown(event) {
   if (event.key === "Alt") {
@@ -830,6 +922,8 @@ function handleKeyDown(event) {
   }
 }
 
+// 响应键盘松开事件，重置状态并更新界面。
+
 function handleKeyUp(event) {
   if (event.key === "Alt") {
     state.altPressed = false
@@ -837,12 +931,16 @@ function handleKeyUp(event) {
   }
 }
 
+// 在无需弹窗的情况下直接保存当前编辑结果。
+
 async function quickSave() {
   const [edlOk, csvOk] = await Promise.all([exportEdl(true), exportMarkers(true)])
   if (edlOk && csvOk) {
     showToast("已保存 EDL 与 Audition CSV", "success")
   }
 }
+
+// 将区域转换为 EDL JSON 并通过 API 保存。
 
 async function exportEdl(silent = false) {
   if (!state.currentStem) {
@@ -869,6 +967,8 @@ async function exportEdl(silent = false) {
   }
 }
 
+// 将区域导出为 Audition CSV 并上传保存。
+
 async function exportMarkers(silent = false) {
   if (!state.currentStem) {
     if (!silent) showToast("尚未选择 stem，无法导出。", "error")
@@ -894,6 +994,8 @@ async function exportMarkers(silent = false) {
   }
 }
 
+// 从区域列表提取剪辑动作，供 EDL 使用。
+
 function collectEdlActions() {
   const actions = []
   for (const region of getRegionsSorted()) {
@@ -905,6 +1007,8 @@ function collectEdlActions() {
   }
   return actions
 }
+
+// 构建 Audition CSV 所需的表格数据。
 
 function collectMarkersRows() {
   const rows = [CSV_HEADER]
@@ -923,6 +1027,8 @@ function collectMarkersRows() {
   return rows
 }
 
+// 把秒数格式化为 HH:MM:SS.fff 字符串。
+
 function secondsToHms(value) {
   const millis = Math.max(0, Math.round(Number(value || 0) * 1000))
   const hours = Math.floor(millis / 3_600_000)
@@ -934,9 +1040,13 @@ function secondsToHms(value) {
     .padStart(2, "0")}.${ms.toString().padStart(3, "0")}`
 }
 
+// 对秒数做四舍五入，避免浮点误差。
+
 function roundSeconds(value) {
   return Math.round(Number(value || 0) * 1000) / 1000
 }
+
+// 在右上角显示临时提示，可选复制按钮。
 
 function showToast(message, type = "info", options = {}) {
   const container = document.getElementById("toast-container")
@@ -998,6 +1108,8 @@ function showToast(message, type = "info", options = {}) {
   }, options.duration || 4000)
 }
 
+// 复制文本到剪贴板，并在失败时告警。
+
 async function copyTextToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     await navigator.clipboard.writeText(text)
@@ -1014,6 +1126,8 @@ async function copyTextToClipboard(text) {
   document.body.removeChild(textarea)
 }
 
+// 保存成功后弹出可点击的提示。
+
 function showSavedFileToast(path, label) {
   const normalized = (path || "").replace(/^\.\/+/, "")
   const prefixed = normalized.startsWith("out/") || !normalized ? normalized : `out/${normalized}`
@@ -1024,17 +1138,23 @@ function showSavedFileToast(path, label) {
   showToast(message, "success", { link: { href, text } })
 }
 
+// 在顶部显示解析错误提示框。
+
 function showParseError(message) {
   if (!dom.parseError) return
   dom.parseError.textContent = message
   dom.parseError.classList.remove("hidden")
 }
 
+// 隐藏解析错误提示，恢复正常界面。
+
 function clearParseError() {
   if (!dom.parseError) return
   dom.parseError.textContent = ""
   dom.parseError.classList.add("hidden")
 }
+
+// 记录标记文件解析失败的详细原因。
 
 function reportParseFailure(marker, error, text) {
   const name = marker?.name || "标记"
@@ -1044,6 +1164,8 @@ function reportParseFailure(marker, error, text) {
   }
   showParseError(`解析 ${name} 失败：${error.message}`)
 }
+
+// 解析 Audition 标记 CSV，返回区域与错误信息。
 
 function parseAuditionCsv(text) {
   const lines = text.replace(/^\ufeff/, "").split(/\r?\n/)
@@ -1101,6 +1223,8 @@ function parseAuditionCsv(text) {
   return regions
 }
 
+// 解析单行 CSV，处理引号与分隔符。
+
 function parseCsvLine(line, delimiter) {
   const result = []
   let current = ""
@@ -1124,6 +1248,8 @@ function parseCsvLine(line, delimiter) {
   result.push(current.trim())
   return result
 }
+
+// 解析 EDL JSON 文件，转换为区域数组。
 
 function parseEdlJson(text) {
   const regions = []
@@ -1149,6 +1275,8 @@ function parseEdlJson(text) {
   }
   return regions
 }
+
+// 解析 SRT 字幕，提取时间轴与文本。
 
 function parseSrt(text) {
   const normalized = text.replace(/^\ufeff/, "").replace(/\r\n/g, "\n")
@@ -1177,6 +1305,8 @@ function parseSrt(text) {
   return regions
 }
 
+// 将多种时间表示转换为秒。
+
 function parseTime(value) {
   if (typeof value === "number") return value
   if (!value) return NaN
@@ -1196,6 +1326,8 @@ function parseTime(value) {
   return Number.isNaN(parsed) ? NaN : parsed
 }
 
+// 绑定按钮、滑杆与键盘的交互事件。
+
 function attachEventListeners() {
   dom.playToggle.addEventListener("click", togglePlayback)
   dom.seekBack.addEventListener("click", () => seekBy(-5))
@@ -1211,6 +1343,8 @@ function attachEventListeners() {
   window.addEventListener("keydown", handleKeyDown)
   window.addEventListener("keyup", handleKeyUp)
 }
+
+// 初始化应用，加载文件列表并准备界面。
 
 function init() {
   attachEventListeners()
