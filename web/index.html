@@ -4,15 +4,21 @@
     <meta charset="utf-8" />
     <meta http-equiv="X-UA-Compatible" content="IE=edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- 基础页面信息与样式引用 -->
     <title>OnePass Audio 可视化控制台</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
+    <!-- 全局提示容器与解析错误提示区域 -->
     <div id="toast-container"></div>
     <div id="parse-error" class="parse-error hidden" role="alert" aria-live="assertive"></div>
+
+    <!-- 顶部状态栏，展示后端 API 状态 -->
     <div class="status-bar">
       <span id="api-status-badge" class="status-badge status-badge--pending">API 状态检测中…</span>
     </div>
+
+    <!-- 主体布局：左侧为素材列表，右侧为波形与区域操作 -->
     <div class="app-shell">
       <aside class="sidebar">
         <header class="sidebar__header">
@@ -20,9 +26,11 @@
           <p class="sidebar__desc">选择音频与标记，快速审听与导出。</p>
           <button id="refresh-button" type="button" class="sidebar__refresh">重新扫描 out/</button>
         </header>
+        <!-- 侧边栏用于展示按 stem 聚合的音频与标记 -->
         <div class="sidebar__list" id="file-groups"></div>
       </aside>
       <main class="main">
+        <!-- 顶部三栏展示当前选择的音频、标记与 stem -->
         <section class="selection-bar">
           <div class="selection-bar__item">
             <span class="label">当前音频</span>
@@ -37,6 +45,8 @@
             <span id="current-stem" class="selection-bar__value">-</span>
           </div>
         </section>
+
+        <!-- 播放与批量操作控制区 -->
         <section class="controls">
           <div class="controls__group">
             <button id="play-toggle" type="button">播放 / 暂停 (Space)</button>
@@ -54,9 +64,13 @@
             <button data-bulk="undecided" type="button">全部设为未决</button>
           </div>
         </section>
+
+        <!-- 波形容器，WaveSurfer 会在此渲染音频曲线 -->
         <section class="waveform-section">
           <div id="waveform" class="waveform"></div>
         </section>
+
+        <!-- 区域工具栏，说明快捷键并提供导出按钮 -->
         <section class="region-toolbar">
           <div class="region-toolbar__left">
             <span>Alt+拖拽创建区域，Delete 删除，D 切换状态，←/→ 选择邻近区域。</span>
@@ -66,6 +80,8 @@
             <button id="export-markers" type="button">导出 Audition CSV</button>
           </div>
         </section>
+
+        <!-- 区域列表表格，实时展示当前片段的时间与状态 -->
         <section class="region-list-section">
           <table class="region-table">
             <thead>
@@ -84,6 +100,7 @@
       </main>
     </div>
 
+    <!-- 引入波形渲染依赖与主逻辑脚本 -->
     <script src="vendor/wavesurfer.min.js"></script>
     <script src="vendor/regions.min.js"></script>
     <script src="app.js" type="module"></script>

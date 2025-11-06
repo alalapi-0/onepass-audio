@@ -44,6 +44,14 @@
 
 本项目是一键生成去口癖、保留“同句最后一遍”的干净字幕，并可选按剪辑清单导出干净音频的工具集（MVP）。
 
+## 技术栈与核心组件
+
+- **编程语言与运行时**：基于 Python 3.10+，核心逻辑集中在 `onepass/` 包内；命令行脚本依托 `argparse`、`pathlib` 等标准库构建交互。 【F:onepass_main.py†L1-L115】【F:scripts/onepass_cli.py†L1-L115】
+- **文本处理**：通过自研的 `onepass.textnorm` 管线与 `rapidfuzz` 完成句子规范化与模糊匹配，对齐策略在 `onepass.align` 中实现。 【F:onepass/textnorm.py†L1-L200】【F:onepass/align.py†L1-L120】
+- **音视频工具链**：调用 `ffmpeg`/`ffprobe` 进行音频探测与拼接，相关封装位于 `onepass.edl_renderer`。 【F:onepass/edl_renderer.py†L1-L200】
+- **Web 可视化面板**：前端由 `web/index.html`、`web/style.css`、`web/app.js` 组成，依赖 WaveSurfer.js 完成音频波形渲染；后端采用 Flask + flask-cors 提供本地 API。 【F:web/index.html†L1-L120】【F:web/app.js†L1-L160】【F:scripts/web_panel_server.py†L1-L120】
+- **命令行自动化**：`scripts/onepass_cli.py` 串联批处理、文本规范化、保留最后一遍与音频渲染；`scripts/smoke_test.py`、`scripts/demo_run.*` 负责最小演示。 【F:scripts/onepass_cli.py†L1-L120】【F:scripts/demo_run.sh†L1-L5】
+
 ## 构建历程（Prompt 演进纪要）
 
 1. **第 1 轮：需求梳理与目录搭建** —— 通过最初的 Prompt 明确了“去口癖、保留最后一遍、生成 EDL”三大功能，并搭建了 `onepass/` 包与 `scripts/` 目录骨架。此阶段暴露出的难题是素材格式尚未统一，导致示例无法跑通，需要额外设计命名约定与目录结构。
@@ -61,6 +69,9 @@
 5. **第 5 轮：EDL 音频渲染落地** —— 新增 `onepass.edl_renderer` 库模块、`scripts/edl_render.py` 命令行脚本、`scripts/edl_set_source.py` 辅助工具与 `scripts/smoke_test.py` 最小示例，实现按剪辑清单一键导出干净音频，并完善“5 分钟跑通”文档。
    - 关键决策：借助 `ffprobe` 探测时长、`ffmpeg concat` 拼接保留片段，并允许 `--dry-run` 输出命令供人工验证。
    - 典型问题：遇到旧版 EDL 中 `actions`/`segments` 字段混用，需要在 Loader 层兼容并输出清晰错误信息。
+6. **第 6 轮：中文注释与整体综述** —— 针对仓库内所有代码补充中文注释，并在根目录 README 中整理环境准备、技术栈、运行步骤与 Prompt 演进纪要，确保零基础读者亦能迅速理解流程。
+   - 关键决策：统一 Web 前端、Flask 服务与脚本层的注释风格，明确“交互式菜单 ↔ CLI ↔ Web 面板”三条使用路径。
+   - 典型问题：在 JavaScript/CSS 中补注释需避免破坏现有打包结构，因此采用段落式注释说明状态管理、DOM 交互与样式分区。
 
 ## 程序用途与最终产出
 
@@ -131,6 +142,44 @@ pip install opencc
 5. **查看输出**：处理完成后在 `out/` 目录查看字幕、EDL、报告与可选音频，并按照日志提示核对未对齐样例。
 
 更多细节（目录结构、文本规范化流程等）可继续参考下方原有章节。
+
+## 项目运行流程详解（零基础版）
+
+### 交互式主程序 `onepass_main.py`
+
+1. **启动入口**：执行 `python onepass_main.py` 时，`main()` 会调用 `_print_banner()` 展示版本信息、读取默认路径，并通过 `_prompt_materials_directory()` / `_ensure_output_directory()` 引导用户选择素材与输出目录。 【F:onepass_main.py†L1-L120】【F:onepass_main.py†L404-L520】
+2. **素材扫描**：`_scan_materials()` 会按照 `*.words.json` → `*.norm.txt` → `*.txt` 的优先级配对章节资源，并利用 `_choose_audio_for_stem()` 基于 `AUDIO_PRIORITY` 字典挑选音频文件。 【F:onepass_main.py†L226-L403】
+3. **章节处理**：`_process_chapter()` 负责单章节流程：
+   - 调用 `load_words()` 解析词级 JSON 并生成 `Word` 序列；
+   - 通过 `prepare_sentences()` 清洗原稿文本，再交给 `align_sentences()` 计算模糊对齐窗口；
+   - 使用 `compute_retake_keep_last()` 生成保留最后一遍的片段，随后分别调用 `export_srt()`、`export_txt()`、`export_edl_json()` 与 `export_audition_markers()` 输出字幕/文本/EDL/标记；
+   - 若启用音频渲染，则利用 `normalize_segments()`、`render_audio()` 输出干净音频并记录剪辑秒数。 【F:onepass_main.py†L121-L403】【F:onepass/asr_loader.py†L1-L200】【F:onepass/pipeline.py†L1-L120】【F:onepass/align.py†L1-L160】【F:onepass/retake_keep_last.py†L1-L200】【F:onepass/edl_renderer.py†L1-L200】
+4. **结果汇总**：循环结束后，`main()` 会汇总 `ChapterSummary` 列表，逐条打印保留句数、重复窗口、未对齐句子与剪切时长，并提示输出位置。 【F:onepass_main.py†L404-L520】
+
+### 统一命令行 `scripts/onepass_cli.py`
+
+1. **命令解析**：脚本基于 `argparse` 注册 `prep-norm`、`retake-keep-last`、`render-audio`、`all-in-one`、`review-mode` 等子命令，统一入口为 `main()`。 【F:scripts/onepass_cli.py†L1-L160】【F:scripts/onepass_cli.py†L480-L720】
+2. **文本规范化 (`prep-norm`)**：`_process_single_text()` 会串行执行 `normalize_pipeline()`、`run_opencc_if_available()`、`scan_suspects()`，输出 `.norm.txt` 与 `normalize_report.csv`。 【F:scripts/onepass_cli.py†L160-L320】【F:onepass/text_norm.py†L1-L200】
+3. **保留最后一遍 (`retake-keep-last`)**：`_run_retake_keep_last()` 加载词级 JSON 与原稿，调用 `compute_retake_keep_last()` 生成去口癖片段，随后导出字幕、文本、EDL 与 Audition 标记，并根据参数生成调试 CSV。 【F:scripts/onepass_cli.py†L320-L520】【F:onepass/retake_keep_last.py†L1-L200】
+4. **音频渲染 (`render-audio`)**：`_run_render_audio()` 读取 EDL、通过 `resolve_source_audio()` 定位素材、调用 `render_audio()` 执行 `ffmpeg concat`，生成 `.clean.wav`。 【F:scripts/onepass_cli.py†L520-L720】【F:onepass/edl_renderer.py†L1-L200】
+5. **批处理 (`all-in-one`)**：`_run_all_in_one()` 依次执行规范化、保留最后一遍与（可选）音频渲染，自动写入 `batch_report.json`。命令执行完毕后会输出统计摘要与对应 CLI 示例，便于复现。 【F:scripts/onepass_cli.py†L720-L960】
+
+### Web 可视化面板
+
+1. **本地服务**：`scripts/web_panel_server.py` 提供 `/api/list`、`/api/file`、`/api/save_edl`、`/api/save_markers_csv` 等接口；内部通过 `_build_list_payload()` 列举 `out/` 目录成果，保存文件时校验路径防止越权。 【F:scripts/web_panel_server.py†L1-L200】【F:scripts/web_panel_server.py†L200-L360】
+2. **前端结构**：`web/index.html` 定义侧边栏、波形区与区域列表；`web/style.css` 设置亮/暗配色、布局、状态徽章样式。 【F:web/index.html†L1-L120】【F:web/style.css†L1-L160】
+3. **交互逻辑**：`web/app.js` 初始化 WaveSurfer 波形组件、维护区域状态机、调用本地 API 获取 `out/` 文件并支持导出手工标记。脚本在启动时自动检测服务状态，提供启动提示并允许离线浏览静态页面。 【F:web/app.js†L1-L160】【F:web/app.js†L160-L360】
+
+### 全流程串联（建议操作顺序）
+
+1. 使用 `python scripts/smoke_test.py` 验证依赖是否就绪并生成演示素材。
+2. 若有自有文本，先运行 `python scripts/normalize_original.py --in <素材目录> --out out/norm` 生成 `.norm.txt`。
+3. 运行 `python onepass_main.py`，选择“批量处理”自动输出字幕/文本/EDL/标记；如需音频同时勾选渲染。
+4. 若倾向命令行批处理，可改用 `python scripts/onepass_cli.py all-in-one --materials <素材目录> --out out/批次名`。
+5. 需要人工复核时，执行 `python scripts/web_panel_server.py --open` 启动本地服务，并在浏览器访问 `http://127.0.0.1:8088` 以拖动波形、导出手工标记。
+6. 最终在 `out/` 目录集中整理 `.srt/.txt/.edl.json/.audition_markers.csv/.clean.wav` 等成果，并结合 `out/logs/`、`out/normalize_report.csv` 查看统计信息。
+
+该流程覆盖了交互式菜单、命令行批处理与 Web 审听三条主线，便于根据团队分工灵活选择。
 
 ### 从零开始的进阶演示
 
