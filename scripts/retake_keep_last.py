@@ -95,7 +95,11 @@ def main(argv: list[str] | None = None) -> int:
     # 导出四类产物
     export_srt(result.keeps, srt_path)
     export_txt(result.keeps, txt_path)
-    export_audition_markers(result.keeps, markers_path)
+    export_audition_markers(
+        result.keeps,
+        markers_path,
+        note=result.fallback_marker_note if result.fallback_used else None,
+    )
     export_edl_json(
         result.edl_keep_segments,
         args.source_audio,

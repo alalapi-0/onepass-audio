@@ -330,12 +330,13 @@ def _process_single_text(
         if emit_align:
             align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
             if collapse_lines and align_payload:
-                if "\n" in align_payload or "\r" in align_payload:
-                    raise ValueError("对齐文本包含换行，请检查折行规则。")
+                if "\r" in align_payload:
+                    raise ValueError("对齐文本包含回车符，请检查折行规则。")
                 if "\t" in align_payload:
                     raise ValueError("对齐文本包含制表符，请检查规范化结果。")
-                if align_payload != align_payload.strip():
-                    raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
+                for part in align_payload.splitlines():
+                    if part != part.strip():
+                        raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
             try:
                 align_path.write_text(align_payload, encoding="utf-8")
@@ -536,7 +537,11 @@ def _export_retake_outputs(
         edl_path = out_dir / f"{stem}.keepLast.edl.json"
         export_srt(result.keeps, srt_path)
         export_txt(result.keeps, txt_path)
-        export_audition_markers(result.keeps, markers_path)
+        export_audition_markers(
+            result.keeps,
+            markers_path,
+            note=result.fallback_marker_note if result.fallback_used else None,
+        )
         export_edl_json(
             result.edl_keep_segments,
             source_audio,
@@ -775,6 +780,8 @@ def _process_retake_item(
             _append_debug_rows(debug_csv, result.debug_rows, mode)
 
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
+        if result.fallback_used:
+            stats["fallback_message"] = result.fallback_reason or "keep_full_audio"
         item = {
             "stem": stem,
             "words_json": safe_rel(materials_base or words_path.parent, words_path),
@@ -782,7 +789,11 @@ def _process_retake_item(
             "outputs": {key: safe_rel(out_base, value) for key, value in outputs.items()},
             "stats": stats,
             "status": "ok",
-            "message": "处理成功",
+            "message": (
+                f"fallback:{result.fallback_reason or 'keep_full_audio'}"
+                if result.fallback_used
+                else "处理成功"
+            ),
         }
     except Exception as exc:
         LOGGER.exception("保留最后一遍处理失败: %s", words_path)
