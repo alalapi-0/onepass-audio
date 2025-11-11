@@ -4,7 +4,12 @@ from __future__ import annotations  # 启用未来的注解特性，兼容 Pytho
 from dataclasses import dataclass  # 引入 dataclass 装饰器，用于定义数据容器类
 from typing import List  # 导入泛型 List 类型，用于类型注解
 
-from .textnorm import Sentence, normalize_sentence, split_sentences, tokenize_for_match  # 导入句子结构与拆分/规范化/分词工具
+from .textnorm import (
+    Sentence,
+    normalize_for_align,
+    split_sentences,
+    tokenize_for_match,
+)  # 导入句子结构与拆分/规范化/分词工具
 
 
 @dataclass  # 使用数据类定义轻量容器
@@ -30,15 +35,15 @@ def prepare_sentences(raw_text: str) -> PreparedSentences:  # 将原始文本转
         if not trimmed:  # 如果句子为空
             continue  # 跳过空句子，避免产生无效条目
 
-        normalised = normalize_sentence(trimmed)  # 对句子执行规范化，提升匹配准确度
-        if not normalised:  # 如果规范化后为空字符串
+        align_ready = normalize_for_align(trimmed)  # 生成去标点的对齐文本
+        if not align_ready:  # 如果规范化后为空字符串
             continue  # 跳过无效结果，保持索引一致
 
-        tokens = tokenize_for_match(normalised)  # 将规范化句子分词，为对齐准备 token 列表
+        tokens = tokenize_for_match(align_ready)  # 将规范化句子分词，为对齐准备 token 列表
         if not tokens:  # 如果无法切分出有效 token
             continue  # 跳过该句子，保证 alignment 中的句子可匹配
 
-        alignment.append(Sentence(text=normalised, tokens=tokens))  # 追加 Sentence 对象到对齐列表
+        alignment.append(Sentence(text=align_ready, tokens=tokens))  # 追加 Sentence 对象到对齐列表
         display.append(trimmed)  # 追加去除空白但未规范化的原句用于展示
 
     return PreparedSentences(alignment=alignment, display=display)  # 返回封装好的句子容器

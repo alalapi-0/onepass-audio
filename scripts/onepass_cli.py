@@ -57,6 +57,7 @@ from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.text_norm import (  # 规范化工具
     load_char_map,
     normalize_pipeline,
+    prepare_alignment_text,
     run_opencc_if_available,
     scan_suspects,
 )
@@ -155,7 +156,15 @@ def _ensure_out_dir(out_dir: Path) -> Path:
     return resolved
 
 
-def _process_single_text(path: Path, base_dir: Path, out_dir: Path, cmap: dict, opencc_mode: str, dry_run: bool) -> dict:
+def _process_single_text(
+    path: Path,
+    base_dir: Path,
+    out_dir: Path,
+    cmap: dict,
+    opencc_mode: str,
+    dry_run: bool,
+    emit_align: bool,
+) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
     LOGGER.debug("Normalize %s", path)  # 调试输出当前文件
@@ -228,6 +237,9 @@ def _process_single_text(path: Path, base_dir: Path, out_dir: Path, cmap: dict, 
     if not message_parts:
         message_parts.append("处理成功。")  # 默认成功提示
 
+    align_written = False
+    align_path: Path | None = None
+
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
         payload = converted_text if converted_text.endswith("\n") else converted_text + "\n"  # 确保换行
@@ -250,6 +262,15 @@ def _process_single_text(path: Path, base_dir: Path, out_dir: Path, cmap: dict, 
                 "message": f"写入失败: {exc}",
             }
 
+        if emit_align:
+            align_payload = prepare_alignment_text(payload)
+            align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
+            try:
+                align_path.write_text(align_payload, encoding="utf-8")
+                align_written = True
+            except OSError as exc:
+                LOGGER.warning("写入对齐文本失败: %s", exc)
+
     return {
         "file": str(path),
         "orig_len": len(raw_text),
@@ -262,6 +283,8 @@ def _process_single_text(path: Path, base_dir: Path, out_dir: Path, cmap: dict, 
         "opencc_applied": str(opencc_applied).lower(),
         "suspects_found": str(bool(suspects_found)).lower(),
         "suspects_examples": suspects_examples,
+        "align_written": str(align_written).lower(),
+        "align_path": str(align_path) if align_written and align_path else "",
         "status": "ok",
         "message": "；".join(message_parts),
     }
@@ -274,6 +297,7 @@ def run_prep_norm(
     opencc_mode: str,
     glob_pattern: str,
     dry_run: bool,
+    emit_align: bool,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -298,7 +322,15 @@ def run_prep_norm(
     failed = 0  # 统计失败数量
     start = time.perf_counter()  # 记录起始时间
     for path in files:  # 遍历每个文件
-        row = _process_single_text(path, base_dir, out_dir, cmap, opencc_mode, dry_run)  # 处理单个文件
+        row = _process_single_text(
+            path,
+            base_dir,
+            out_dir,
+            cmap,
+            opencc_mode,
+            dry_run,
+            emit_align,
+        )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
             failed += 1
@@ -336,12 +368,21 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             "--glob",
             args.glob,
         ]
+        + (["--emit-align"] if args.emit_align else [])
         + (["--dry-run"] if args.dry_run else []),
     )
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
     LOGGER.info("等价命令: %s", cmd)
     try:
-        result = run_prep_norm(Path(args.input), Path(args.output), Path(args.char_map), args.opencc, args.glob, args.dry_run)
+        result = run_prep_norm(
+            Path(args.input),
+            Path(args.output),
+            Path(args.char_map),
+            args.opencc,
+            args.glob,
+            args.dry_run,
+            args.emit_align,
+        )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
         print(f"处理失败: {exc}", file=sys.stderr)
@@ -1217,6 +1258,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             args.opencc,
             args.norm_glob,
             args.dry_run,
+            args.emit_align,
         )
         report["prep_norm"] = norm_result
         total_failed += norm_result["summary"].get("failed", 0)
@@ -1294,6 +1336,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     if args.do_norm:
         parts.extend(["--do-norm", "--opencc", args.opencc, "--norm-glob", args.norm_glob])
         parts.extend(["--char-map", str(Path(args.char_map))])
+        if args.emit_align:
+            parts.append("--emit-align")
         if args.dry_run:
             parts.append("--dry-run")
     parts.extend(["--glob-words", args.glob_words])
@@ -1362,6 +1406,11 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--char-map", dest="char_map", default=str(DEFAULT_CHAR_MAP), help="字符映射配置 JSON")
     prep.add_argument("--opencc", choices=["none", "t2s", "s2t"], default="none", help="opencc 模式")
     prep.add_argument("--glob", default="*.txt", help="目录模式匹配 (默认 *.txt)")
+    prep.add_argument(
+        "--emit-align",
+        action="store_true",
+        help="额外生成去标点的 .align.txt 供词级对齐与可视化使用",
+    )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
 
@@ -1520,6 +1569,11 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--opencc", default="none", choices=["none", "t2s", "s2t"], help="opencc 模式")
     pipeline.add_argument("--char-map", default=str(DEFAULT_CHAR_MAP), help="字符映射配置 JSON")
     pipeline.add_argument("--norm-glob", default="*.txt", help="规范化阶段的匹配模式")
+    pipeline.add_argument(
+        "--emit-align",
+        action="store_true",
+        help="规范化阶段同步产出无标点的 .align.txt",
+    )
     pipeline.add_argument("--glob-words", default="*.words.json", help="保留最后一遍：JSON 匹配模式")
     pipeline.add_argument(
         "--glob-text",
