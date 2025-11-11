@@ -45,6 +45,7 @@ __all__ = [
     "sentence_lines_from_text",
     "validate_sentence_lines",
     "normalize_chinese_text",
+    "collapse_and_resplit",
 ]
 
 _ZERO_WIDTH_AND_CONTROL = {
@@ -80,6 +81,68 @@ _OTHER_PUNCT.update({ord(ch) for ch in "·、—…【】（）〈〉《》「�
 _CJK_CHAR_CLASS = "\u4e00-\u9fff"
 _CJK_PUNCT_CHARS = "，。！？；：、“”‘’（）《》〈〉『』【】〔〕—…·"
 _FULLWIDTH_SPACE = "\u3000"
+
+_CJK_EXTENDED_RANGE = "\u3400-\u9FFF\uf900-\ufaff"
+_CJK_OPENER = "（〔［【《〈「『“‘"
+_CJK_CLOSER = "）〕］】》〉」』”’"
+
+_RE_CJK_SPACE = re.compile(rf"(?<=[{_CJK_EXTENDED_RANGE}])\s+(?=[{_CJK_EXTENDED_RANGE}])")
+_RE_CJK_OPEN_SPACE = re.compile(rf"(?<=[{_CJK_EXTENDED_RANGE}])\s+(?=[{_CJK_OPENER}])")
+_RE_CJK_CLOSE_SPACE = re.compile(rf"(?<=[{_CJK_CLOSER}])\s+(?=[{_CJK_EXTENDED_RANGE}])")
+
+_RE_ASCII_ELLIPSIS = re.compile(r"\.{3,}")
+_RE_CJK_ELLIPSIS = re.compile(r"…{2,}")
+_RE_DASH_VARIANTS = re.compile(r"[‒–—―﹘﹣━─‐‑]{1,}")
+_RE_MIDDLE_DOT_RUN = re.compile(r"[·•・]{2,}")
+_RE_SENTENCE_DOT = re.compile(r"\.(?=\s*(?:$|[A-Z]))")
+
+_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "“": "\"",
+        "”": "\"",
+        "„": "\"",
+        "‟": "\"",
+        "〝": "\"",
+        "〞": "\"",
+        "﹁": "\"",
+        "﹂": "\"",
+        "﹃": "\"",
+        "﹄": "\"",
+        "『": "\"",
+        "』": "\"",
+        "「": "\"",
+        "」": "\"",
+        "‘": "'",
+        "’": "'",
+        "‚": "'",
+        "‛": "'",
+        "‹": "<",
+        "›": ">",
+        "﹤": "<",
+        "﹥": ">",
+        "⋯": "…",
+        "︰": ":",
+        "﹒": ".",
+        "﹑": "、",
+        "﹔": "；",
+        "﹕": ":",
+        "﹖": "？",
+        "﹗": "！",
+        "﹘": "—",
+        "﹣": "—",
+        "﹔": "；",
+        "﹟": "#",
+        "﹠": "&",
+        "﹡": "*",
+        "﹦": "=",
+        "﹨": "\\",
+        "﹩": "$",
+        "•": "·",
+        "・": "·",
+        "･": "·",
+        "‧": "·",
+    }
+)
 
 _RE_MULTISPACE = re.compile(r"[ \t]+")
 _RE_CJK_GAPS = re.compile(rf"(?<=[{_CJK_CHAR_CLASS}])\s+(?=[{_CJK_CHAR_CLASS}])")
@@ -239,7 +302,8 @@ def normalize_chinese_text(text: str, *, collapse_lines: bool = True) -> str:
     normalized = _RE_MULTISPACE.sub(" ", normalized)
 
     if collapse_lines:
-        normalized = collapse_lines_preserve_spacing_rules(normalized)
+        normalized_lines = collapse_and_resplit(normalized)
+        normalized = "\n".join(normalized_lines)
     else:
         normalized = "\n".join(part.strip() for part in normalized.splitlines())
 
@@ -349,7 +413,7 @@ _SPACE_PATTERN = re.compile(r"[^\S\n]+")
 _SENTENCE_SPLIT_PATTERN = re.compile(r"([。！？!?；;…\.]+[”’」』》）】]?)(?=\s|$)")
 _LINE_BREAK_CLEAN_PATTERN = re.compile(r"[\n\t\u3000\xa0]+")
 _MULTI_SPACE_PATTERN = re.compile(r" {2,}")
-_ALLOWED_BOUNDARY_CHARS = set("。！？!?；;…．.」』”’》）】")
+_ALLOWED_BOUNDARY_CHARS = set("。！？!?；;：:…．.」』”’》）】\"")
 
 
 def normalize_spaces(s: str) -> str:
@@ -370,6 +434,84 @@ def normalize_spaces(s: str) -> str:
                 blank_pending = True
     result = "\n".join(normalized_lines).strip("\n")  # 去除首尾多余空行
     return result
+
+
+def _strip_cjk_spaces(text: str) -> str:
+    """移除 CJK 字符之间以及与括号、引号之间的多余空格。"""
+
+    stripped = _RE_CJK_SPACE.sub("", text)
+    stripped = _RE_CJK_OPEN_SPACE.sub("", stripped)
+    stripped = _RE_CJK_CLOSE_SPACE.sub("", stripped)
+    return stripped
+
+
+def collapse_and_resplit(text: str) -> list[str]:
+    """折叠空白并按句号/省略号重新断句，避免整篇文本合并为一行。"""
+
+    if not text:
+        return []
+
+    normalized = text.replace("\r", "")
+    normalized = normalized.replace("\t", " ")
+    normalized = _LINE_BREAK_CLEAN_PATTERN.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = normalized.translate(_PUNCT_TRANSLATION)
+    normalized = _RE_ASCII_ELLIPSIS.sub("…", normalized)
+    normalized = _RE_CJK_ELLIPSIS.sub("…", normalized)
+    normalized = _RE_DASH_VARIANTS.sub("—", normalized)
+    normalized = _RE_MIDDLE_DOT_RUN.sub("·", normalized)
+    normalized = normalized.strip()
+    if not normalized:
+        return []
+
+    normalized = unicodedata.normalize("NFKC", normalized)
+    normalized = _strip_cjk_spaces(normalized)
+
+    sentences: list[str] = []
+    length = len(normalized)
+    start = 0
+    idx = 0
+    right_trail = set(_CJK_CLOSER + '\"\'')
+    sentence_endings = set("。！？!?；;:…")
+
+    while idx < length:
+        ch = normalized[idx]
+        end_index: int | None = None
+        if ch == "…":
+            run = 1
+            while idx + run < length and normalized[idx + run] == "…":
+                run += 1
+            end_index = idx + run
+        elif ch in sentence_endings:
+            end_index = idx + 1
+        elif ch == ".":
+            match = _RE_SENTENCE_DOT.match(normalized, idx)
+            if match:
+                end_index = match.end()
+
+        if end_index is None:
+            idx += 1
+            continue
+
+        while end_index < length and normalized[end_index] in right_trail:
+            end_index += 1
+
+        chunk = normalized[start:end_index].strip()
+        if chunk:
+            cleaned = _strip_cjk_spaces(chunk)
+            sentences.append(cleaned)
+
+        start = end_index
+        while start < length and normalized[start].isspace():
+            start += 1
+        idx = max(start, end_index)
+
+    if start < length:
+        tail = normalized[start:].strip()
+        if tail:
+            sentences.append(_strip_cjk_spaces(tail))
+
+    return sentences
 
 
 def normalize_pipeline(
@@ -446,12 +588,9 @@ def sentence_lines_from_text(text: str, collapse_lines: bool = True) -> list[str
     if not normalized:
         return []
     if collapse_lines:
-        compact = collapse_lines_preserve_spacing_rules(normalized)
-        if not compact:
-            return []
-        sentences = _split_sentences(compact)
-        return sentences or [compact]
-    return normalized.split("\n")
+        sentences = collapse_and_resplit(normalized)
+        return sentences
+    return [line.rstrip("\r") for line in normalized.split("\n")]
 
 
 def validate_sentence_lines(lines: Sequence[str]) -> None:
@@ -562,17 +701,18 @@ def prepare_alignment_text(text: str, collapse_lines: bool = False) -> str:
 
     normalised_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
     align_lines: list[str] = []
-    for line in normalised_newlines.split("\n"):
+    if collapse_lines:
+        source_lines = collapse_and_resplit(normalised_newlines)
+    else:
+        source_lines = normalised_newlines.split("\n")
+
+    for line in source_lines:
         cleaned = normalize_for_align(line)
         if collapse_lines:
             if cleaned:
                 align_lines.append(cleaned)
         else:
             align_lines.append(cleaned if cleaned else "")
-
-    if collapse_lines:
-        joined = " ".join(align_lines)
-        return collapse_lines_preserve_spacing_rules(joined)
 
     joined = "\n".join(align_lines).rstrip("\n")
     return joined + "\n" if joined else ""

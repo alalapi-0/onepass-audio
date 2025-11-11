@@ -1480,7 +1480,11 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
 
     export_srt(result.keeps, srt_path)  # 导出字幕
     export_txt(result.keeps, txt_out_path)  # 导出文本
-    export_audition_markers(result.keeps, markers_path)  # 导出 Audition 标记
+    export_audition_markers(
+        result.keeps,
+        markers_path,
+        note=result.fallback_marker_note if result.fallback_used else None,
+    )  # 导出 Audition 标记
     export_edl_json(result.edl_keep_segments, None, edl_path)  # 导出 EDL，源音频留空待后续指定
 
     stats = result.stats  # 读取统计信息

@@ -1,14 +1,27 @@
 from __future__ import annotations
 
-import argparse
-import re
+import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+import argparse
+import json
+import re
+
+from onepass.asr_loader import Word
+from onepass.retake_keep_last import compute_retake_keep_last
+from onepass.text_norm import collapse_and_resplit
 from scripts.onepass_cli import DEFAULT_CHAR_MAP, run_all_in_one, run_prep_norm
 
 
 def _allowed_boundary_chars() -> set[str]:
-    return set("。！？!?；;…．.」』”’》）】")
+    return set("。！？!?；;：:…．.」』”’》）】\"")
 
 
 def _assert_sentence_lines(text: str, *, enforce_boundary: bool = True) -> None:
@@ -44,22 +57,52 @@ def test_norm_outputs_are_sentence_lines(tmp_path: Path) -> None:
     norm_text = norm_path.read_text(encoding="utf-8")
     align_text = align_path.read_text(encoding="utf-8")
     assert norm_text.strip(), "normalized text should not be empty"
+    assert "\r" not in norm_text
+    assert "\t" not in norm_text
+    assert norm_text.count("\n") >= 1
     _assert_sentence_lines(norm_text)
+    assert "\r" not in align_text
+    assert "\t" not in align_text
+    assert align_text.count("\n") >= 1
     _assert_sentence_lines(align_text, enforce_boundary=False)
 
 
 def test_all_in_one_without_audio_reports_records(tmp_path: Path) -> None:
+    materials_dir = tmp_path / "materials"
+    materials_dir.mkdir()
     repo_root = Path(__file__).resolve().parents[1]
-    output_dir = repo_root / "out" / "tests" / tmp_path.name / "batch"
+    out_dir = repo_root / "out" / "tests" / tmp_path.name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    text_path = materials_dir / "sample.txt"
+    text_path.write_text("第一句內容。\n第二句變了。", encoding="utf-8")
+    words_path = materials_dir / "sample.words.json"
+    words_payload = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 2.2,
+                "words": [
+                    {"word": "第一", "start": 0.0, "end": 0.3},
+                    {"word": "句", "start": 0.3, "end": 0.6},
+                    {"word": "內容", "start": 0.6, "end": 0.9},
+                    {"word": "第二", "start": 1.0, "end": 1.3},
+                    {"word": "句", "start": 1.3, "end": 1.6},
+                    {"word": "變", "start": 1.6, "end": 1.9},
+                    {"word": "更", "start": 1.9, "end": 2.2},
+                ],
+            }
+        ]
+    }
+    words_path.write_text(json.dumps(words_payload, ensure_ascii=False), encoding="utf-8")
     args = argparse.Namespace(
-        input_dir=str(repo_root / "materials"),
-        output_dir=str(output_dir),
+        input_dir=str(materials_dir),
+        output_dir=str(out_dir),
         emit_align=True,
         collapse_lines=True,
         char_map=str(DEFAULT_CHAR_MAP),
         opencc="none",
         norm_glob="*.txt",
-        glob_words="*.json",
+        glob_words="*.words.json",
         glob_audio="*.wav;*.m4a;*.mp3;*.flac",
         render_mode="auto",
         workers=None,
@@ -80,7 +123,69 @@ def test_all_in_one_without_audio_reports_records(tmp_path: Path) -> None:
         if record["status"] != "ok":
             continue
         stem = record["stem"]
-        assert (output_dir / f"{stem}.keepLast.srt").exists()
-        assert (output_dir / f"{stem}.keepLast.txt").exists()
-        assert (output_dir / f"{stem}.keepLast.edl.json").exists()
-        assert (output_dir / f"{stem}.keepLast.audition_markers.csv").exists()
+        assert (out_dir / f"{stem}.keepLast.srt").exists()
+        assert (out_dir / f"{stem}.keepLast.txt").exists()
+        assert (out_dir / f"{stem}.keepLast.edl.json").exists()
+        assert (out_dir / f"{stem}.keepLast.audition_markers.csv").exists()
+
+
+def test_collapse_and_resplit_handles_cjk_spacing() -> None:
+    sample = (
+        "第一段「測試」包含\t空白……第二段緊接。"
+        "第三段混合 English. Next Sentence!\n第四段：結束。"
+    )
+    lines = collapse_and_resplit(sample)
+    assert len(lines) > 1
+    for line in lines:
+        assert "\t" not in line
+        assert "\r" not in line
+        assert not re.search(r"[\u4e00-\u9fff]\s+[\u4e00-\u9fff]", line)
+
+
+def test_compute_retake_keep_last_uses_fuzzy_match(tmp_path: Path) -> None:
+    text_path = tmp_path / "source.txt"
+    text_path.write_text("第一句內容。\n第二句變了。", encoding="utf-8")
+    words = [
+        Word(text="第一", start=0.0, end=0.3),
+        Word(text="句", start=0.3, end=0.6),
+        Word(text="內容", start=0.6, end=0.9),
+        Word(text="第二", start=1.0, end=1.3),
+        Word(text="句", start=1.3, end=1.6),
+        Word(text="變", start=1.6, end=1.9),
+        Word(text="更", start=1.9, end=2.2),
+    ]
+    result = compute_retake_keep_last(
+        words,
+        text_path,
+        pause_align=False,
+        pad_before=0.0,
+        pad_after=0.0,
+        merge_gap_sec=0.0,
+    )
+    assert result.stats["strict_matches"] == 1
+    assert result.stats["fallback_matches"] == 1
+    assert not result.fallback_used
+    assert result.keeps, "expected keep spans from fuzzy alignment"
+
+
+def test_compute_retake_keep_last_triggers_fallback(tmp_path: Path) -> None:
+    text_path = tmp_path / "mismatch.txt"
+    text_path.write_text("完全不同的句子。\n另一句也不同。", encoding="utf-8")
+    words = [
+        Word(text="你好", start=0.0, end=0.4),
+        Word(text="世界", start=0.4, end=0.8),
+    ]
+    result = compute_retake_keep_last(
+        words,
+        text_path,
+        pause_align=False,
+        pad_before=0.0,
+        pad_after=0.0,
+        merge_gap_sec=0.0,
+    )
+    assert result.fallback_used
+    assert result.stats["fallback_used"] is True
+    assert result.stats["fallback_reason"] == "no-match"
+    assert result.stats["matched_lines"] == 0
+    assert result.edl_keep_segments == [(0.0, words[-1].end)]
+    assert result.fallback_marker_note and "NO_MATCH_FALLBACK" in result.fallback_marker_note
