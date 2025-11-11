@@ -19,6 +19,7 @@ __all__ = [
     "run_opencc_if_available",
     "scan_suspects",
     "normalize_for_align",
+    "prepare_alignment_text",
     "cjk_or_latin_seq",
     "build_char_index_map",
 ]
@@ -416,6 +417,21 @@ def normalize_for_align(text: str) -> str:
     text = text.translate(_REMOVE_OTHER_PUNCT)  # 其他标点直接移除
     text = " ".join(text.split())  # 折叠多余空白为单空格
     return text.strip()  # 去掉首尾空白后返回
+
+
+def prepare_alignment_text(text: str) -> str:
+    """将规范化文本进一步转换为词级对齐友好的纯文本。"""
+
+    normalised_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
+    align_lines: list[str] = []
+    for line in normalised_newlines.split("\n"):
+        cleaned = normalize_for_align(line)
+        if cleaned:
+            align_lines.append(cleaned)
+        else:
+            align_lines.append("")
+    joined = "\n".join(align_lines).rstrip("\n")
+    return joined + "\n" if joined else ""
 
 
 def _remove_spaces(text: str) -> str:

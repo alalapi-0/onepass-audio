@@ -1151,6 +1151,7 @@ def main() -> None:  # CLI 主入口
                 str(materials_dir),
                 "--out",
                 str(norm_out_dir),
+                "--emit-align",
             ]
             if char_map.exists():
                 prep_cmd.extend(["--char-map", str(char_map)])
