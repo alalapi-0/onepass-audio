@@ -37,6 +37,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     render_audio,
     resolve_source_audio,
 )
+from onepass.normalize import collapse_soft_linebreaks
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
     MAX_WINDOW_SEC,
@@ -283,7 +284,12 @@ def _process_single_text(
         validate_sentence_lines(sentence_lines)
     converted_text = "\n".join(sentence_lines)
     converted_text = normalize_chinese_text(converted_text, collapse_lines=collapse_lines)
-    suspects = scan_suspects(converted_text)  # 扫描可疑字符
+    payload_text = converted_text.replace("\r\n", "\n").replace("\r", "\n")
+    if collapse_lines:
+        payload_text = collapse_soft_linebreaks(payload_text)
+    else:
+        payload_text = payload_text.replace("\t", " ")
+    suspects = scan_suspects(payload_text)  # 扫描可疑字符
     suspects_found = any(value.get("count", 0) for value in suspects.values())  # 是否发现异常
     suspects_examples = "; ".join(  # 汇总示例
         f"{key}:{','.join(str(item) for item in info.get('examples', []))}"
@@ -307,8 +313,7 @@ def _process_single_text(
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
-        payload = converted_text.replace("\r\n", "\n").replace("\r", "\n")
-        payload = payload.replace("\t", " ")
+        payload = payload_text
         try:
             with out_path.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
@@ -316,7 +321,7 @@ def _process_single_text(
             return {
                 "file": str(path),
                 "orig_len": len(raw_text),
-                "norm_len": len(converted_text),
+                "norm_len": len(payload_text),
                 "deleted_count": stats.get("deleted_count", 0),
                 "mapped_count": stats.get("mapped_count", 0),
                 "width_normalized_count": stats.get("width_normalized_count", 0),
@@ -331,6 +336,8 @@ def _process_single_text(
 
         if emit_align:
             align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
+            if collapse_lines:
+                align_payload = collapse_soft_linebreaks(align_payload)
             if collapse_lines and align_payload:
                 if "\n" in align_payload:
                     raise ValueError("对齐文本在 collapse-lines 模式下不应包含换行。")
@@ -352,7 +359,7 @@ def _process_single_text(
     return {
         "file": str(path),
         "orig_len": len(raw_text),
-        "norm_len": len(converted_text),
+        "norm_len": len(payload_text),
         "deleted_count": stats.get("deleted_count", 0),
         "mapped_count": stats.get("mapped_count", 0),
         "width_normalized_count": stats.get("width_normalized_count", 0),
@@ -415,6 +422,10 @@ def run_prep_norm(
     failed = 0  # 统计失败数量
     total = len(files)
     LOGGER.info("[stage] norm start total=%s", total)
+    if collapse_lines:
+        LOGGER.info("[normalize] collapse-lines=on (ascii-ascii -> space, others -> join)")
+    else:
+        LOGGER.info("[normalize] collapse-lines=off (preserve original line breaks)")
     start = time.perf_counter()  # 记录起始时间
     last_progress = start
     processed = 0
