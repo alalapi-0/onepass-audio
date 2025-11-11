@@ -10,12 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+from .text_norm import normalize_for_align
+
 # 重新导出旧版 API 依赖的符号，保持向后兼容。
 __all__ = [
     "Sentence",
     "split_sentences",
     "normalize_sentence",
     "tokenize_for_match",
+    "normalize_for_align",
     "TextNormConfig",
     "DEFAULT_COMPAT_MAP",
     "load_custom_map",
