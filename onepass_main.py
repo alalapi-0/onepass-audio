@@ -191,6 +191,16 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
         print_error("未找到 scripts/normalize_original.py，请确认仓库已更新。")
         return
 
+    print_info("请选择输出模式：")
+    print_info("1) 仅 .norm（保留原标点，不生成 .asr）")
+    print_info("2) .norm + .asr（去换行 + 去标点［保留句末］）")
+    print_info("3) .norm + .asr（去换行 + 去全部标点）")
+    while True:
+        mode_choice = _clean_input_path(prompt_text("输出模式", default="2", allow_empty=False))
+        if mode_choice in {"1", "2", "3"}:
+            break
+        print_warning("请输入 1/2/3。")
+
     cmd = [
         sys.executable,
         str(script_path),
@@ -205,6 +215,17 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
     ]
     if glob_pattern:
         cmd.extend(["--glob", glob_pattern])
+
+    extra_args: list[str] = []
+    emit_asr_selected = True
+    if mode_choice == "1":
+        extra_args.append("--no-emit-asr")
+        emit_asr_selected = False
+    elif mode_choice == "2":
+        extra_args.extend(["--profile", "asr", "--strip-punct-mode", "keep-eos"])
+    elif mode_choice == "3":
+        extra_args.extend(["--profile", "asr", "--strip-punct-mode", "all"])
+    cmd.extend(extra_args)
 
     dry_run = prompt_yes_no("是否仅生成报表 (Dry-Run)?", default=False)
     if dry_run:
@@ -229,8 +250,10 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
             cli_cmd.extend(["--glob", glob_pattern])
         if dry_run:
             cli_cmd.append("--dry-run")
-        print_info("统一 CLI 等价命令:")
+        print_info("统一 CLI 等价命令（当前未包含 ASR 预设参数）:")
         print_info(shlex.join(cli_cmd))
+        if extra_args:
+            print_warning("如需 --profile asr 或关闭 .asr 输出，请直接执行 normalize_original.py。")
     else:
         print_warning("未找到 scripts/onepass_cli.py，暂无法展示统一 CLI 命令。")
 
@@ -241,7 +264,10 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
-    before_files = set(out_dir.rglob("*.norm.txt"))  # 记录执行前的 norm 文件
+    before_norm = set(out_dir.rglob("*.norm.txt"))  # 记录执行前的 norm 文件
+    before_asr: set[Path] = set()
+    if emit_asr_selected and not dry_run:
+        before_asr = set(out_dir.rglob("*.asr.txt"))
 
     try:
         result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))  # 执行脚本
@@ -263,11 +289,15 @@ def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚
         print_success("Dry-Run 已完成，可根据上方命令实际执行。")
         return
 
-    after_files = set(out_dir.rglob("*.norm.txt"))  # 执行后的 norm 文件
-    new_files = [p for p in after_files - before_files if p.is_file()]
-    print_success(f"本次共生成 {len(new_files)} 个规范化文本。输出目录: {out_dir}")
-    if not new_files:
+    after_norm = set(out_dir.rglob("*.norm.txt"))  # 执行后的 norm 文件
+    new_norm = [p for p in after_norm - before_norm if p.is_file()]
+    print_success(f"本次共生成 {len(new_norm)} 个规范化文本。输出目录: {out_dir}")
+    if not new_norm:
         print_warning("未检测到新增 .norm.txt，可能输入为空或文件已存在。")
+    if emit_asr_selected:
+        after_asr = set(out_dir.rglob("*.asr.txt"))
+        new_asr = [p for p in after_asr - before_asr if p.is_file()]
+        print_info(f"新增 .asr.txt 数量：{len(new_asr)}")
 
 
 def _run_edl_render_menu() -> None:  # 交互式调用 EDL 渲染脚本

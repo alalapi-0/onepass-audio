@@ -396,6 +396,21 @@ python scripts/sentence_review.py \
 - `normalize_width` / `preserve_cjk_punct`：控制是否执行 NFKC 宽度归一，并在归一后回写全角中文标点。
 - `normalize_space`：折叠多余空白、清理行首尾空格，避免对齐时出现看不见的分隔符。
 
+脚本会在写出 `<stem>.norm.txt` 的同时默认生成 `<stem>.asr.txt`，用于驱动语音对齐或 ASR 粗分句。`--profile asr` 预设会一键启用“去换行 + 去破折号 + 去标点”的极简策略，并可通过 `--strip-punct-mode keep-eos|all` 决定是否保留句末 `。！？`。若仅需传统规范化，可在菜单选择“仅 .norm”或直接传入 `--no-emit-asr` 关闭额外输出。常用组合示例：
+
+```bash
+# 仅生成 .norm.txt，保留原始标点
+python scripts/normalize_original.py --in materials/example/demo.txt --out out/norm --no-emit-asr
+
+# 为 ASR 预处理生成极简文本，保留句末 。！？
+python scripts/normalize_original.py --in materials/example/demo.txt --out out/norm --profile asr --strip-punct-mode keep-eos
+
+# 为完全去标点的场景生成 .asr.txt
+python scripts/normalize_original.py --in materials/example/demo.txt --out out/norm --profile asr --strip-punct-mode all
+```
+
+另外提供了白名单式的危险字形映射，可在确认无误后通过 `--glyph-map data/cjk_compat_safe.json` 启用。映射文件仅包含安全的兼容字符 → 常用写法替换，避免误把偏旁部首改成完整汉字。
+
 如需繁简转换，可额外安装 OpenCC；脚本会先检测本地是否存在 `opencc` 可执行文件，缺失时会在报表中提示“跳过转换”，同时保留原文内容。
 
 最小示例：
