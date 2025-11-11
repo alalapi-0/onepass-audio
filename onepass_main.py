@@ -136,6 +136,144 @@ def _prompt_optional_int(prompt: str) -> int | None:  # 允许留空的正整数
         return value
 
 
+def _prompt_processing_mode() -> str:
+    """询问批处理模式。"""
+
+    print_header("选择处理模式")
+    print_info("[1] 一键流水线：规范化 → 保留最后一遍 → 自动渲染（有音频才渲染）")
+    print_info("[2] 仅保留最后一遍（跳过规范化）")
+    print_info("[3] 仅执行规范化")
+    print_info("[4] 仅渲染音频（需要已有 EDL 与音频）")
+    while True:
+        mode = _clean_input_path(prompt_text("请选择处理模式", default="1"))
+        if mode in {"1", "2", "3", "4"}:
+            return mode
+        print_warning("请输入 1/2/3/4 中的一个选项。")
+
+
+def _run_all_in_one_cli(materials_dir: Path, out_dir: Path) -> None:
+    """调用统一 CLI 执行一键流水线。"""
+
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if not cli_script.exists():
+        print_warning("未找到 scripts/onepass_cli.py，无法执行一键流水线。")
+        return
+    char_map = ROOT_DIR / "config" / "default_char_map.json"
+    cmd = [
+        sys.executable,
+        str(cli_script),
+        "all-in-one",
+        "--in",
+        str(materials_dir),
+        "--out",
+        str(out_dir),
+        "--emit-align",
+        "--opencc",
+        "none",
+        "--glob-text",
+        "*.txt",
+        "--glob-words",
+        "*.words.json",
+        "--render",
+        "auto",
+        "--glob-audio",
+        "*.wav;*.m4a;*.mp3;*.flac",
+        "--no-interaction",
+    ]
+    if char_map.exists():
+        cmd.extend(["--char-map", str(char_map)])
+    else:
+        print_warning("未找到默认字符映射，将在流水线中跳过字符映射阶段。")
+    print_info("等价 CLI：")
+    print_info(shlex.join(cmd))
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用 Python 解释器执行 all-in-one: {exc}")
+        return
+    if result.returncode != 0:
+        print_warning("all-in-one CLI 返回非零状态，请查看上方日志排查。")
+    else:
+        print_success(f"流水线已完成。输出目录: {out_dir}")
+
+
+def _run_norm_only_cli(materials_dir: Path, out_dir: Path) -> None:
+    """仅执行规范化阶段。"""
+
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if not cli_script.exists():
+        print_warning("未找到 scripts/onepass_cli.py，无法执行规范化。")
+        return
+    norm_out = out_dir / "norm"
+    try:
+        norm_out.resolve().relative_to((ROOT_DIR / "out").resolve())
+    except ValueError:
+        print_warning("规范化输出必须位于 out/ 目录下，已回退到默认 out/norm。")
+        norm_out = DEFAULT_NORMALIZED_DIR
+    norm_out.mkdir(parents=True, exist_ok=True)
+    char_map = ROOT_DIR / "config" / "default_char_map.json"
+    cmd = [
+        sys.executable,
+        str(cli_script),
+        "prep-norm",
+        "--in",
+        str(materials_dir),
+        "--out",
+        str(norm_out),
+        "--glob",
+        "*.txt",
+        "--emit-align",
+        "--opencc",
+        "none",
+    ]
+    if char_map.exists():
+        cmd.extend(["--char-map", str(char_map)])
+    else:
+        print_warning("未找到默认字符映射，将跳过字符映射配置。")
+    print_info("等价 CLI：")
+    print_info(shlex.join(cmd))
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用 Python 解释器执行 prep-norm: {exc}")
+        return
+    if result.returncode != 0:
+        print_warning("prep-norm CLI 返回非零状态，请检查终端输出。")
+    else:
+        print_success(f"规范化完成，输出目录: {norm_out}")
+
+
+def _run_render_only_cli(materials_dir: Path, out_dir: Path) -> None:
+    """仅执行渲染阶段。"""
+
+    cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
+    if not cli_script.exists():
+        print_warning("未找到 scripts/onepass_cli.py，无法执行渲染。")
+        return
+    cmd = [
+        sys.executable,
+        str(cli_script),
+        "render-audio",
+        "--materials",
+        str(out_dir),
+        "--audio-root",
+        str(materials_dir),
+        "--out",
+        str(out_dir),
+    ]
+    print_info("等价 CLI：")
+    print_info(shlex.join(cmd))
+    try:
+        result = subprocess.run(cmd, check=False, cwd=str(ROOT_DIR))
+    except FileNotFoundError as exc:
+        print_error(f"无法调用 Python 解释器执行 render-audio: {exc}")
+        return
+    if result.returncode != 0:
+        print_warning("render-audio CLI 返回非零状态，请检查终端输出。")
+    else:
+        print_success(f"渲染阶段完成，输出目录: {out_dir}")
+
+
 def _run_normalize_original_menu() -> None:  # 交互式调用原文规范化脚本
     print_header("预处理：原文规范化")  # 显示步骤标题
 
@@ -1133,14 +1271,35 @@ def main() -> None:  # CLI 主入口
         return
 
     materials_dir = _prompt_materials_directory()  # 询问素材目录
+    outdir = _ensure_output_directory()  # 询问输出目录
+    mode_choice = _prompt_processing_mode()
+
+    if mode_choice == "1":
+        _run_all_in_one_cli(materials_dir, outdir)
+        return
+    if mode_choice == "3":
+        _run_norm_only_cli(materials_dir, outdir)
+        return
+    if mode_choice == "4":
+        _run_render_only_cli(materials_dir, outdir)
+        return
 
     cli_script = ROOT_DIR / "scripts" / "onepass_cli.py"
-    do_norm_first = prompt_yes_no("是否先对原文做规范化?", default=True)
+    if mode_choice == "2":
+        print_info("已选择“仅保留最后一遍”，跳过规范化阶段。")
+        do_norm_first = False
+    else:
+        do_norm_first = prompt_yes_no("是否先对原文做规范化?", default=True)
     if do_norm_first:
         if not cli_script.exists():
             print_warning("未找到 scripts/onepass_cli.py，暂无法调用统一 CLI 进行规范化。")
         else:
-            norm_out_dir = DEFAULT_NORMALIZED_DIR
+            norm_out_dir = outdir / "norm"
+            try:
+                norm_out_dir.resolve().relative_to((ROOT_DIR / "out").resolve())
+            except ValueError:
+                print_warning("规范化输出必须位于 out/ 目录下，已回退到默认 out/norm。")
+                norm_out_dir = DEFAULT_NORMALIZED_DIR
             norm_out_dir.mkdir(parents=True, exist_ok=True)
             char_map = ROOT_DIR / "config" / "default_char_map.json"
             prep_cmd = [
@@ -1155,6 +1314,8 @@ def main() -> None:  # CLI 主入口
             ]
             if char_map.exists():
                 prep_cmd.extend(["--char-map", str(char_map)])
+            else:
+                print_warning("未找到默认字符映射，将跳过字符映射配置。")
             print_info("规范化阶段等价 CLI:")
             print_info(shlex.join(prep_cmd))
             try:
@@ -1181,8 +1342,6 @@ def main() -> None:  # CLI 主入口
         f"共匹配到 {len(chapters)} 套素材，其中 {with_audio} 套包含音频。" +
         (f" 示例: {preview}" if preview else "")
     )
-
-    outdir = _ensure_output_directory()  # 询问输出目录
 
     if cli_script.exists():  # 展示等价 CLI 便于复现
         retake_cmd = [

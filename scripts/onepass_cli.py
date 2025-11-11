@@ -6,11 +6,12 @@ import csv  # 写入规范化报表
 import json  # 生成批处理 JSON 报告
 import logging  # 控制台日志输出
 import shlex  # 构建可复制的命令示例
+import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
 import time  # 统计耗时
 from concurrent.futures import ThreadPoolExecutor, as_completed  # 批处理并发执行
 from pathlib import Path  # 跨平台路径处理
-from typing import Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 # 计算项目根目录，确保脚本可直接运行
 ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
@@ -298,12 +299,26 @@ def run_prep_norm(
     glob_pattern: str,
     dry_run: bool,
     emit_align: bool,
+    *,
+    allow_missing_char_map: bool = False,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
     if opencc_mode not in {"none", "t2s", "s2t"}:  # 校验 opencc 取值
         raise ValueError("--opencc 仅支持 none/t2s/s2t。")
-    cmap = load_char_map(char_map_path)  # 加载字符映射
+    try:
+        cmap = load_char_map(char_map_path)  # 加载字符映射
+    except FileNotFoundError:
+        if not allow_missing_char_map:
+            raise
+        LOGGER.warning("未找到字符映射 %s，继续执行但不做字符映射。", char_map_path)
+        cmap = {
+            "delete": [],
+            "map": {},
+            "normalize_width": False,
+            "normalize_space": False,
+            "preserve_cjk_punct": True,
+        }
     out_dir = _ensure_out_dir(output_dir)  # 校验并创建输出目录
     input_path = input_path.expanduser().resolve()  # 解析输入路径
     if input_path.is_file():  # 单文件模式
@@ -1239,158 +1254,270 @@ def handle_render_audio(args: argparse.Namespace) -> int:
 def run_all_in_one(args: argparse.Namespace) -> dict:
     """执行 all-in-one 流水线。"""
 
-    out_dir = Path(args.out).expanduser().resolve()  # 解析输出根目录
-    out_dir.mkdir(parents=True, exist_ok=True)  # 确保目录存在
-    report_path = out_dir / "batch_report.json"  # 报告路径
-    report: dict = {}  # 汇总结构
-    total_failed = 0  # 总失败数
-    total_ok = 0  # 总成功数
-    start = time.perf_counter()  # 记录耗时
-    stage_summary: dict[str, dict] = {}  # 各阶段摘要
+    input_dir = Path(args.input_dir).expanduser().resolve()
+    if not input_dir.exists():
+        raise FileNotFoundError(f"输入目录不存在: {input_dir}")
+    out_dir = Path(args.output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = out_dir / "batch_report.json"
+    report: dict[str, dict] = {}
+    stage_summary: dict[str, dict] = {}
+    pipeline_records: list[dict] = []
+    start = time.perf_counter()
 
-    if args.do_norm:  # 可选规范化阶段
-        norm_out = out_dir / "norm"
-        LOGGER.info("开始规范化文本 → %s", norm_out)
-        norm_result = run_prep_norm(
-            Path(args.materials),
-            norm_out,
-            Path(args.char_map),
-            args.opencc,
-            args.norm_glob,
-            args.dry_run,
-            args.emit_align,
-        )
-        report["prep_norm"] = norm_result
-        total_failed += norm_result["summary"].get("failed", 0)
-        total_ok += norm_result["summary"].get("ok", 0)
-        stage_summary["prep_norm"] = norm_result["summary"]
+    norm_pattern = _casefold_pattern(args.norm_glob)
+    norm_out_dir = out_dir / "norm"
+    LOGGER.info(_safe_text(f"开始规范化文本 → {norm_out_dir}"))
+    norm_result = run_prep_norm(
+        input_dir,
+        norm_out_dir,
+        Path(args.char_map),
+        args.opencc,
+        norm_pattern,
+        dry_run=False,
+        emit_align=args.emit_align,
+        allow_missing_char_map=True,
+    )
+    report["prep_norm"] = norm_result
+    stage_summary["prep_norm"] = norm_result.get("summary", {})
 
-    LOGGER.info("开始保留最后一遍生成字幕/EDL → %s", out_dir)
+    LOGGER.info(_safe_text(f"开始保留最后一遍生成字幕/EDL → {out_dir}"))
+    retake_text_patterns = _derive_retake_text_patterns([args.norm_glob])
     retake_namespace = argparse.Namespace(
         words_json=None,
         text=None,
-        materials=args.materials,
-        glob_words=args.glob_words,
-        glob_text=args.glob_text,
+        materials=str(input_dir),
+        glob_words=_casefold_pattern(args.glob_words),
+        glob_text=retake_text_patterns,
         workers=args.workers,
         out=str(out_dir),
         source_audio=None,
-        samplerate=args.samplerate,
-        channels=args.channels,
-        min_sent_chars=args.min_sent_chars,
-        max_dup_gap_sec=args.max_dup_gap_sec,
-        max_window_sec=args.max_window_sec,
-        merge_adj_gap_sec=args.merge_adj_gap_sec,
-        low_conf=args.low_conf,
-        sentence_strict=args.sentence_strict,
-        review_only=args.review_only,
+        samplerate=None,
+        channels=None,
+        min_sent_chars=MIN_SENT_CHARS,
+        max_dup_gap_sec=None,
+        max_window_sec=MAX_WINDOW_SEC,
+        merge_adj_gap_sec=None,
+        low_conf=None,
+        sentence_strict=False,
+        review_only=False,
+        no_pause_align=False,
+        pause_gap_sec=PAUSE_GAP_SEC,
+        pause_snap_limit=PAUSE_SNAP_LIMIT,
+        pad_before=PAD_BEFORE,
+        pad_after=PAD_AFTER,
+        min_segment_sec=MIN_SEGMENT_SEC,
+        merge_gap_sec=MERGE_GAP_SEC,
+        no_silence_probe=False,
+        noise_db=-35,
+        silence_min_d=0.28,
+        no_overcut_guard=False,
+        overcut_mode="ask",
+        overcut_threshold=0.60,
+        debug_csv=None,
     )
     retake_result = run_retake_keep_last(retake_namespace, report_path=report_path, write_report=False)
     report["retake_keep_last"] = retake_result
-    total_failed += retake_result["summary"].get("failed", 0)
-    total_ok += retake_result["summary"].get("ok", 0)
-    stage_summary["retake_keep_last"] = retake_result["summary"]
+    stage_summary["retake_keep_last"] = retake_result.get("summary", {})
 
-    if args.render:  # 可选渲染阶段
-        LOGGER.info("开始渲染音频 → %s", out_dir)
-        render_namespace = argparse.Namespace(
-            edl=None,
-            materials=str(out_dir),
-            glob_edl=args.glob_edl,
-            workers=args.workers,
-            audio_root=args.audio_root,
-            out=str(out_dir),
-            samplerate=args.samplerate,
-            channels=args.channels,
+    items = retake_result.get("items", [])
+    total_items = len(items)
+    success_items = sum(1 for item in items if item.get("status") == "ok")
+    stems = [item.get("stem", "") for item in items]
+
+    audio_patterns = [part.strip() for part in args.glob_audio.split(";") if part.strip()]
+    audio_map = _collect_audio_map(input_dir, audio_patterns)
+    audio_flags = {stem.lower(): bool(audio_map.get(stem.lower())) for stem in stems}
+
+    render_mode = args.render_mode
+    render_payload: dict | None = None
+    render_summary: dict[str, dict] = {}
+    render_skipped_no_audio = False
+    if render_mode == "no":
+        LOGGER.info("渲染阶段已禁用，跳过。")
+    else:
+        any_audio = any(audio_flags.values())
+        if render_mode == "auto" and not any_audio:
+            render_skipped_no_audio = True
+            LOGGER.info("未发现任何音频文件，自动跳过渲染阶段。")
+        else:
+            LOGGER.info(_safe_text(f"开始渲染音频 → {out_dir}"))
+            render_namespace = argparse.Namespace(
+                edl=None,
+                materials=str(out_dir),
+                glob_edl=_expand_case_insensitive_patterns(
+                    ["*.keepLast.edl.json", "*.sentence.edl.json"]
+                ),
+                workers=args.workers,
+                audio_root=str(input_dir),
+                out=str(out_dir),
+                samplerate=None,
+                channels=None,
+            )
+            try:
+                render_payload = run_render_audio(render_namespace, report_path=report_path, write_report=False)
+            except Exception as exc:  # pragma: no cover - 渲染异常需要容错
+                LOGGER.exception("渲染阶段出现异常")
+                render_payload = {
+                    "items": [],
+                    "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
+                    "error": str(exc),
+                }
+            report["render_audio"] = render_payload
+            stage_summary["render_audio"] = render_payload.get("summary", {})
+            for entry in render_payload.get("items", []):
+                stem = _stem_from_edl_path(entry.get("edl", "")).lower()
+                render_summary[stem] = entry
+
+    for item in items:
+        stem = item.get("stem", "")
+        stats = item.get("stats", {}) or {}
+        total_sentences = int(
+            stats.get("total_lines")
+            or stats.get("total_sentences")
+            or stats.get("keep_span_count", 0)
         )
-        render_result = run_render_audio(render_namespace, report_path=report_path, write_report=False)
-        report["render_audio"] = render_result
-        total_failed += render_result["summary"].get("failed", 0)
-        total_ok += render_result["summary"].get("ok", 0)
-        stage_summary["render_audio"] = render_result["summary"]
+        kept = int(
+            stats.get("matched_lines")
+            or stats.get("matched_sentences")
+            or stats.get("keep_span_count", 0)
+        )
+        unaligned = int(stats.get("unmatched_lines") or stats.get("unmatched_sentences") or 0)
+        duplicate_windows = int(stats.get("len_gate_skipped", 0)) + int(
+            stats.get("neighbor_gap_skipped", 0)
+        )
+        audio_duration = float(stats.get("audio_duration", 0.0))
+        keep_duration = float(stats.get("keep_duration", 0.0))
+        cut_seconds = max(0.0, audio_duration - keep_duration)
+        has_audio = audio_flags.get(stem.lower(), False)
+        render_note = "渲染=未启用"
+        if render_mode == "auto" and render_skipped_no_audio:
+            render_note = "渲染=无音频(跳过)"
+        elif render_mode in {"auto", "yes"}:
+            entry = render_summary.get(stem.lower())
+            if entry:
+                if entry.get("status") == "ok":
+                    render_note = "渲染=成功"
+                else:
+                    message = entry.get("message") or "渲染失败"
+                    render_note = _safe_text(f"渲染=失败({message})")
+            elif not has_audio and render_mode == "auto":
+                render_note = "渲染=无音频(跳过)"
+            elif not has_audio:
+                render_note = "渲染=无音频"
+        record = {
+            "stem": stem,
+            "status": item.get("status"),
+            "message": item.get("message", ""),
+            "total": total_sentences,
+            "kept": kept,
+            "unaligned": unaligned,
+            "duplicates": duplicate_windows,
+            "cut": cut_seconds,
+            "render": render_note,
+        }
+        pipeline_records.append(record)
 
-    elapsed = time.perf_counter() - start  # 流水线耗时
+    elapsed = time.perf_counter() - start
     report["summary"] = {
-        "total_ok": total_ok,
-        "total_failed": total_failed,
+        "total_items": total_items,
+        "success_items": success_items,
         "elapsed_seconds": elapsed,
         "stages": stage_summary,
     }
     write_json(report_path, report)
+
+    LOGGER.info(_safe_text(f"处理结果：成功 {success_items}/{total_items}"))
+    for record in pipeline_records:
+        if record["status"] == "ok":
+            LOGGER.info(
+                _safe_text(
+                    f"{record['stem']}: 保留{record['kept']}, 重复{record['duplicates']}, 未对齐{record['unaligned']}, "
+                    f"cut={record['cut']:.3f}s, {record['render']}"
+                )
+            )
+        else:
+            LOGGER.warning(
+                _safe_text(
+                    f"{record['stem']}: 处理失败（{record['message'] or '未知原因'}）"
+                )
+            )
+    LOGGER.info(_safe_text(f"输出目录: {out_dir}"))
+
     return report
 
 
 def handle_all_in_one(args: argparse.Namespace) -> int:
     """处理 all-in-one 子命令。"""
 
-    if args.review_only and not args.sentence_strict:
-        raise ValueError("--review-only 仅能与 --sentence-strict 搭配使用。")
+    if args.verbose and args.quiet:
+        raise ValueError("--verbose 与 --quiet 不能同时使用。")
+    if args.verbose:
+        LOGGER.setLevel(logging.DEBUG)
+    elif args.quiet:
+        LOGGER.setLevel(logging.WARNING)
+
     parts: list[str] = [
-        "--materials",
-        str(Path(args.materials)),
-        "--audio-root",
-        str(Path(args.audio_root)),
+        "--in",
+        str(Path(args.input_dir)),
         "--out",
-        str(Path(args.out)),
+        str(Path(args.output_dir)),
+        "--opencc",
+        args.opencc,
+        "--glob-text",
+        args.norm_glob,
+        "--glob-words",
+        args.glob_words,
+        "--render",
+        args.render_mode,
+        "--glob-audio",
+        args.glob_audio,
     ]
-    if args.do_norm:
-        parts.extend(["--do-norm", "--opencc", args.opencc, "--norm-glob", args.norm_glob])
+    if not args.emit_align:
+        parts.append("--no-emit-align")
+    if args.char_map != str(DEFAULT_CHAR_MAP):
         parts.extend(["--char-map", str(Path(args.char_map))])
-        if args.emit_align:
-            parts.append("--emit-align")
-        if args.dry_run:
-            parts.append("--dry-run")
-    parts.extend(["--glob-words", args.glob_words])
-    for pattern in args.glob_text:
-        parts.extend(["--glob-text", pattern])
-    if args.render:
-        parts.append("--render")
-        for pattern in args.glob_edl:
-            parts.extend(["--glob-edl", pattern])
-    if args.samplerate:
-        parts.extend(["--samplerate", str(args.samplerate)])
-    if args.channels:
-        parts.extend(["--channels", str(args.channels)])
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
-    if args.min_sent_chars != MIN_SENT_CHARS:
-        parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
-    if args.max_dup_gap_sec is not None:
-        parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
-    if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
-        parts.extend(["--max-window-sec", str(args.max_window_sec)])
-    if args.merge_adj_gap_sec is not None:
-        parts.extend(["--merge-adj-gap-sec", str(args.merge_adj_gap_sec)])
-    if args.low_conf is not None:
-        parts.extend(["--low-conf", str(args.low_conf)])
-    if args.sentence_strict:
-        parts.append("--sentence-strict")
-    if args.review_only:
-        parts.append("--review-only")
+    if args.no_interaction:
+        parts.append("--no-interaction")
+    if args.verbose:
+        parts.append("--verbose")
+    if args.quiet:
+        parts.append("--quiet")
+
     LOGGER.info(
-        "开始流水线任务: 素材=%s 音频=%s 输出=%s 渲染=%s",
-        args.materials,
-        args.audio_root,
-        args.out,
-        bool(args.render),
+        _safe_text(
+            f"开始流水线任务: 输入={args.input_dir} 输出={args.output_dir} 渲染模式={args.render_mode}"
+        )
     )
     LOGGER.info("等价命令: %s", _build_cli_example("all-in-one", parts))
+    snapshot = {
+        "emit_align": args.emit_align,
+        "char_map": str(args.char_map),
+        "opencc": args.opencc,
+        "norm_glob": args.norm_glob,
+        "glob_words": args.glob_words,
+        "glob_audio": args.glob_audio,
+        "render": args.render_mode,
+        "workers": args.workers,
+        "no_interaction": args.no_interaction,
+    }
+    LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
     try:
         report = run_all_in_one(args)
     except Exception as exc:
         LOGGER.exception("处理 all-in-one 流水线失败")
-        print(f"流水线执行失败: {exc}", file=sys.stderr)
+        print("流水线执行失败: {}".format(exc), file=sys.stderr)
         return 1
     summary = report.get("summary", {})
-    LOGGER.info(
-        "流水线结束，总成功 %s，总失败 %s，耗时 %.2fs",
-        summary.get("total_ok", 0),
-        summary.get("total_failed", 0),
-        summary.get("elapsed_seconds", 0.0),
-    )
-    if summary.get("total_failed"):
-        LOGGER.warning("存在失败条目，请检查 %s", Path(args.out) / "batch_report.json")
+    if summary.get("success_items", 0) != summary.get("total_items", 0):
+        LOGGER.warning(
+            _safe_text(
+                f"部分条目失败，请检查 {Path(args.output_dir) / 'batch_report.json'}"
+            )
+        )
     return 0
 
 
@@ -1561,82 +1688,56 @@ def build_parser() -> argparse.ArgumentParser:
     render.set_defaults(func=handle_render_audio)
 
     pipeline = subparsers.add_parser("all-in-one", help="一键流水线：规范化 → 保留最后一遍 → 渲染音频")
-    pipeline.add_argument("--materials", required=True, help="素材根目录")
-    pipeline.add_argument("--audio-root", required=True, help="音频搜索根目录")
-    pipeline.add_argument("--out", required=True, help="输出根目录")
-    pipeline.add_argument("--do-norm", action="store_true", help="启用文本规范化阶段")
-    pipeline.add_argument("--dry-run", action="store_true", help="规范化阶段仅生成报表")
-    pipeline.add_argument("--opencc", default="none", choices=["none", "t2s", "s2t"], help="opencc 模式")
-    pipeline.add_argument("--char-map", default=str(DEFAULT_CHAR_MAP), help="字符映射配置 JSON")
-    pipeline.add_argument("--norm-glob", default="*.txt", help="规范化阶段的匹配模式")
+    pipeline.add_argument("--in", dest="input_dir", required=True, help="输入目录 (含 *.txt/*.json/音频)")
+    pipeline.add_argument("--out", dest="output_dir", required=True, help="输出目录")
     pipeline.add_argument(
         "--emit-align",
-        action="store_true",
-        help="规范化阶段同步产出无标点的 .align.txt",
+        dest="emit_align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规范化阶段是否产出 .align.txt (默认开启)",
     )
-    pipeline.add_argument("--glob-words", default="*.words.json", help="保留最后一遍：JSON 匹配模式")
+    pipeline.add_argument(
+        "--char-map",
+        dest="char_map",
+        default=str(DEFAULT_CHAR_MAP),
+        help="字符映射配置 JSON (默认 config/default_char_map.json)",
+    )
+    pipeline.add_argument(
+        "--opencc",
+        choices=["none", "t2s", "s2t"],
+        default="none",
+        help="opencc 模式 (默认 none)",
+    )
     pipeline.add_argument(
         "--glob-text",
-        nargs="+",
-        default=["*.norm.txt", "*.txt"],
-        help="保留最后一遍：文本匹配模式",
-    )
-    pipeline.add_argument("--render", action="store_true", help="执行渲染阶段")
-    pipeline.add_argument(
-        "--glob-edl",
-        nargs="+",
-        default=["*.keepLast.edl.json", "*.sentence.edl.json"],
-        help="渲染阶段 EDL 匹配模式",
-    )
-    pipeline.add_argument("--samplerate", type=int, help="渲染采样率")
-    pipeline.add_argument("--channels", type=int, help="渲染声道数")
-    pipeline.add_argument("--workers", type=int, help="批处理并发度 (Windows 需入口保护)")
-    pipeline.add_argument(
-        "--min-sent-chars",
-        type=int,
-        default=MIN_SENT_CHARS,
-        help=f"重复去重的句长下限（默认 {MIN_SENT_CHARS}）",
+        dest="norm_glob",
+        default="*.txt",
+        help="规范化阶段的文本匹配模式",
     )
     pipeline.add_argument(
-        "--max-dup-gap-sec",
-        type=float,
-        default=None,
-        help=(
-            "判定重录的最大近邻间隔，单位秒（行级默认"
-            f" {LINE_MAX_DUP_GAP_SEC:g}，句子模式默认 {SENT_MAX_DUP_GAP_SEC:g}）"
-        ),
+        "--glob-words",
+        dest="glob_words",
+        default="*.words.json",
+        help="词级 JSON 匹配模式",
     )
     pipeline.add_argument(
-        "--max-window-sec",
-        type=float,
-        default=MAX_WINDOW_SEC,
-        help=f"单个 drop 窗口的最长持续时间，单位秒（默认 {MAX_WINDOW_SEC:g}）",
+        "--glob-audio",
+        dest="glob_audio",
+        default="*.wav;*.m4a;*.mp3;*.flac",
+        help="音频匹配模式 (分号分隔，默认 *.wav;*.m4a;*.mp3;*.flac)",
     )
     pipeline.add_argument(
-        "--merge-adj-gap-sec",
-        type=float,
-        default=None,
-        help=f"句子级命中合并间隔阈值（默认 {MERGE_ADJ_GAP_SEC:g} 秒）",
+        "--render",
+        dest="render_mode",
+        choices=["auto", "yes", "no"],
+        default="auto",
+        help="渲染策略：auto=有音频才渲染，yes=强制渲染，no=跳过",
     )
-    pipeline.add_argument(
-        "--low-conf",
-        type=float,
-        default=None,
-        help=f"句子命中置信度阈值（默认 {SENT_LOW_CONF:.2f}）",
-    )
-    pipeline.add_argument(
-        "--low-conf-threshold",
-        dest="low_conf",
-        type=float,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    pipeline.add_argument("--sentence-strict", action="store_true", help="流水线中启用句子级审阅模式")
-    pipeline.add_argument(
-        "--review-only",
-        action="store_true",
-        help="句子级模式下仅打点不裁剪，EDL 保留整段",
-    )
+    pipeline.add_argument("--workers", type=int, help="批处理并发度")
+    pipeline.add_argument("--no-interaction", action="store_true", help="无交互模式，直接执行")
+    pipeline.add_argument("--verbose", action="store_true", help="输出调试日志")
+    pipeline.add_argument("--quiet", action="store_true", help="仅输出警告及以上")
     pipeline.set_defaults(func=handle_all_in_one)
 
     return parser
@@ -1659,3 +1760,116 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
+def _safe_text(payload: str) -> str:
+    """确保字符串在 UTF-8 环境下安全输出。"""
+
+    return payload.encode("utf-8", errors="replace").decode("utf-8")
+
+
+def _casefold_pattern(pattern: str) -> str:
+    """将 glob 模式转换为大小写不敏感的形式。"""
+
+    result: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "[":
+            # 保留原有字符集，直到遇到 ']'
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                result.append(ch)
+                i += 1
+                continue
+            result.append(pattern[i : end + 1])
+            i = end + 1
+            continue
+        if ch.isalpha():
+            lower = ch.lower()
+            upper = ch.upper()
+            if lower == upper:
+                result.append(ch)
+            else:
+                result.append(f"[{lower}{upper}]")
+        else:
+            result.append(ch)
+        i += 1
+    return "".join(result)
+
+
+def _expand_case_insensitive_patterns(patterns: Iterable[str]) -> list[str]:
+    """针对每个模式返回大小写无关匹配的等价形式。"""
+
+    expanded: list[str] = []
+    for pattern in patterns:
+        if not pattern:
+            continue
+        converted = _casefold_pattern(pattern)
+        if converted not in expanded:
+            expanded.append(converted)
+    return expanded
+
+
+def _derive_retake_text_patterns(patterns: Iterable[str]) -> list[str]:
+    """根据规范化模式生成保留阶段的文本匹配顺序。"""
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        base = _casefold_pattern(pattern)
+        if base not in seen:
+            ordered.append(base)
+            seen.add(base)
+        # 若模式看起来是 *.txt，自动优先匹配 .norm.txt
+        if pattern.lower().endswith(".txt"):
+            norm_variant = pattern[:-4] + ".norm.txt"
+            converted = _casefold_pattern(norm_variant)
+            if converted not in seen:
+                ordered.insert(0, converted)
+                seen.add(converted)
+    if not ordered:
+        ordered = _expand_case_insensitive_patterns(["*.norm.txt", "*.txt"])
+    return ordered
+
+
+def _iter_casefold_files(root: Path, patterns: Iterable[str]) -> list[Path]:
+    """在目录下执行大小写无关的模式匹配。"""
+
+    root = root.expanduser().resolve()
+    if not root.exists():
+        return []
+    matched: dict[Path, None] = {}
+    compiled = [pattern.lower() for pattern in patterns if pattern]
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        for pattern in compiled:
+            if fnmatch.fnmatch(name, pattern):
+                matched[path] = None
+                break
+    return sorted(matched.keys())
+
+
+def _collect_audio_map(base_dir: Path, patterns: Iterable[str]) -> dict[str, list[Path]]:
+    """按 stem 收集可用音频文件。"""
+
+    audio_map: dict[str, list[Path]] = {}
+    for audio_path in _iter_casefold_files(base_dir, patterns):
+        stem = audio_path.stem.lower()
+        audio_map.setdefault(stem, []).append(audio_path)
+    return audio_map
+
+
+def _stem_from_edl_path(edl_path: str) -> str:
+    """根据 EDL 文件名推导素材 stem。"""
+
+    name = Path(edl_path).name
+    for suffix in (".keepLast.edl.json", ".sentence.edl.json", ".edl.json"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return Path(name).stem
+
+
