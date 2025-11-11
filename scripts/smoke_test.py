@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     stem = stem or "demo"
     srt_path = out_dir / f"{stem}.keepLast.srt"
     txt_path = out_dir / f"{stem}.keepLast.txt"
-    markers_path = out_dir / f"{stem}.audition_markers.csv"
+    markers_path = out_dir / f"{stem}.keepLast.audition_markers.csv"
     edl_path = out_dir / f"{stem}.keepLast.edl.json"
 
     ffmpeg_path = shutil.which("ffmpeg")

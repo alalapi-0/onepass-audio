@@ -83,4 +83,4 @@ def test_all_in_one_without_audio_reports_records(tmp_path: Path) -> None:
         assert (output_dir / f"{stem}.keepLast.srt").exists()
         assert (output_dir / f"{stem}.keepLast.txt").exists()
         assert (output_dir / f"{stem}.keepLast.edl.json").exists()
-        assert (output_dir / f"{stem}.audition_markers.csv").exists()
+        assert (output_dir / f"{stem}.keepLast.audition_markers.csv").exists()

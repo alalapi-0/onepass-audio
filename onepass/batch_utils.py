@@ -2,8 +2,24 @@
 from __future__ import annotations
 
 import json  # 写入 JSON 报告
+import fnmatch
+import re
 from pathlib import Path  # 统一路径处理
-from typing import Dict
+from typing import Dict, Iterable
+
+
+def _normalize_patterns(patterns: Iterable[str]) -> list[str]:
+    """拆分并清理 glob 模式字符串，支持分号分隔。"""
+
+    normalized: list[str] = []
+    for pattern in patterns:
+        if not pattern:
+            continue
+        for part in re.split(r"[;]+", pattern):
+            token = part.strip()
+            if token:
+                normalized.append(token)
+    return normalized
 
 
 def iter_files(root: Path, patterns: list[str]) -> list[Path]:
@@ -12,11 +28,25 @@ def iter_files(root: Path, patterns: list[str]) -> list[Path]:
     root = root.expanduser().resolve()  # 展开用户目录并转换为绝对路径
     if not root.exists():  # 若根目录不存在则直接返回空列表
         return []
+
+    normalized_patterns = _normalize_patterns(patterns)
+    if not normalized_patterns:
+        return []
+
     seen: Dict[Path, None] = {}  # 使用字典保持插入顺序并去重
-    for pattern in patterns:  # 遍历所有模式
-        for path in root.rglob(pattern):  # 递归匹配模式
-            if path.is_file() and path not in seen:  # 仅保留文件并去重
-                seen[path] = None  # 记录文件路径
+    compiled = [pat.lower().replace("\\", "/") for pat in normalized_patterns]
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix().lower()
+        name = path.name.lower()
+        for pattern in compiled:
+            target = rel if "/" in pattern else name
+            if fnmatch.fnmatch(target, pattern):
+                resolved = path.resolve()
+                if resolved not in seen:
+                    seen[resolved] = None
+                break
     return sorted(seen.keys())  # 按路径排序以获得稳定输出
 
 
