@@ -140,8 +140,8 @@ def _prompt_processing_mode() -> str:
     """询问批处理模式。"""
 
     print_header("选择处理模式")
-    print_info("[1] 一键流水线：规范化（含去换行与空格修复） → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）")
-    print_info("[2] 仅保留最后一遍（跳过规范化）")
+    print_info("[1] 一键流水线：规范化 → 保留最后一遍/对齐（有音频时自动渲染）")
+    print_info("[2] 仅保留最后一遍/对齐（跳过规范化）")
     print_info("[3] 仅执行规范化")
     print_info("[4] 仅渲染音频（需要已有 EDL 与音频）")
     while True:
@@ -176,7 +176,7 @@ def _run_all_in_one_cli(materials_dir: Path, out_dir: Path) -> None:
         "--glob-text",
         "*.txt",
         "--glob-words",
-        "*.words.json",
+        "*.words.json;*.json",
         "--render",
         "auto",
         "--glob-audio",
@@ -1475,7 +1475,7 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
 
     srt_path = out_dir / f"{stem}.keepLast.srt"  # 字幕路径
     txt_out_path = out_dir / f"{stem}.keepLast.txt"  # 文本路径
-    markers_path = out_dir / f"{stem}.audition_markers.csv"  # 标记路径
+    markers_path = out_dir / f"{stem}.keepLast.audition_markers.csv"  # 标记路径
     edl_path = out_dir / f"{stem}.keepLast.edl.json"  # EDL 路径
 
     export_srt(result.keeps, srt_path)  # 导出字幕

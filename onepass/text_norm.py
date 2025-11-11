@@ -9,6 +9,26 @@ import unicodedata  # 进行 Unicode 归一化
 from pathlib import Path  # 使用 Path 处理路径
 from typing import Any, Dict, Sequence
 
+try:  # 优先复用脚本目录实现的折行规则，便于单独调试
+    from scripts.text_normalize import collapse_lines_preserve_spacing_rules
+except ModuleNotFoundError:  # pragma: no cover - fallback when脚本不可用
+    _CJK_RANGE = r"\u3400-\u9FFF\U00020000-\U0002FFFF"
+
+    def collapse_lines_preserve_spacing_rules(text: str) -> str:
+        """折叠换行并按照中英文空格规则收敛空白。"""
+
+        if not text:
+            return ""
+
+        collapsed = text.replace("\t", "")
+        collapsed = re.sub(r"\r?\n+", "", collapsed)
+        collapsed = re.sub(r"[ \u00A0]+", " ", collapsed)
+        collapsed = re.sub(fr"(?<=[{_CJK_RANGE}])\s+(?=[{_CJK_RANGE}])", "", collapsed)
+        collapsed = re.sub(fr"(?<=[{_CJK_RANGE}])\s+(?=[A-Za-z0-9])", "", collapsed)
+        collapsed = re.sub(fr"(?<=[A-Za-z0-9])\s+(?=[{_CJK_RANGE}])", "", collapsed)
+        collapsed = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])", " ", collapsed)
+        return collapsed.strip()
+
 __all__ = [
     "load_char_map",
     "fullwidth_halfwidth_normalize",
@@ -219,7 +239,7 @@ def normalize_chinese_text(text: str, *, collapse_lines: bool = True) -> str:
     normalized = _RE_MULTISPACE.sub(" ", normalized)
 
     if collapse_lines:
-        normalized = normalized.replace("\n", "")
+        normalized = collapse_lines_preserve_spacing_rules(normalized)
     else:
         normalized = "\n".join(part.strip() for part in normalized.splitlines())
 
@@ -426,14 +446,11 @@ def sentence_lines_from_text(text: str, collapse_lines: bool = True) -> list[str
     if not normalized:
         return []
     if collapse_lines:
-        compact = _LINE_BREAK_CLEAN_PATTERN.sub(" ", normalized)
-        compact = _MULTI_SPACE_PATTERN.sub(" ", compact).strip()
+        compact = collapse_lines_preserve_spacing_rules(normalized)
         if not compact:
             return []
         sentences = _split_sentences(compact)
-        if sentences:
-            return sentences
-        return [compact]
+        return sentences or [compact]
     return normalized.split("\n")
 
 
@@ -540,17 +557,23 @@ def normalize_for_align(text: str) -> str:
     return text.strip()  # 去掉首尾空白后返回
 
 
-def prepare_alignment_text(text: str) -> str:
+def prepare_alignment_text(text: str, collapse_lines: bool = False) -> str:
     """将规范化文本进一步转换为词级对齐友好的纯文本。"""
 
     normalised_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
     align_lines: list[str] = []
     for line in normalised_newlines.split("\n"):
         cleaned = normalize_for_align(line)
-        if cleaned:
-            align_lines.append(cleaned)
+        if collapse_lines:
+            if cleaned:
+                align_lines.append(cleaned)
         else:
-            align_lines.append("")
+            align_lines.append(cleaned if cleaned else "")
+
+    if collapse_lines:
+        joined = " ".join(align_lines)
+        return collapse_lines_preserve_spacing_rules(joined)
+
     joined = "\n".join(align_lines).rstrip("\n")
     return joined + "\n" if joined else ""
 

@@ -20,6 +20,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
 if str(ROOT_DIR) not in sys.path:  # 若根目录未在 sys.path 中则插入
     sys.path.insert(0, str(ROOT_DIR))
 
+from match_materials import match_materials, parse_glob_list
+
 from onepass.asr_loader import load_words  # 载入词级 JSON
 from onepass.batch_utils import (  # 批处理通用工具
     find_text_for_stem,
@@ -225,10 +227,10 @@ def _process_single_text(
     LOGGER.debug("Normalize %s", path)  # 调试输出当前文件
     raw_text = ""
     try:
-        raw_text = path.read_text(encoding="utf-8")  # 按 UTF-8 读取原文
+        raw_text = path.read_text(encoding="utf-8-sig")  # 按 UTF-8-sig 读取原文
         decode_note = ""  # 初始化编码提示
     except UnicodeDecodeError:
-        raw_text = path.read_text(encoding="utf-8", errors="replace")  # 若解码失败则替换异常字符
+        raw_text = path.read_text(encoding="utf-8-sig", errors="replace")  # 若解码失败则替换异常字符
         decode_note = "原文包含无法解码的字符，已用替换符号保留。"  # 记录提示
     except OSError as exc:
         LOGGER.error("[error] 读取失败 %s: %s", path, exc)
@@ -326,14 +328,14 @@ def _process_single_text(
             }
 
         if emit_align:
-            align_payload = prepare_alignment_text(payload)
+            align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
             if collapse_lines and align_payload:
-                align_lines = align_payload.rstrip("\n").splitlines()
-                for line in align_lines:
-                    if "\t" in line:
-                        raise ValueError("对齐文本包含制表符，请检查规范化结果。")
-                    if line != line.strip():
-                        raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
+                if "\n" in align_payload or "\r" in align_payload:
+                    raise ValueError("对齐文本包含换行，请检查折行规则。")
+                if "\t" in align_payload:
+                    raise ValueError("对齐文本包含制表符，请检查规范化结果。")
+                if align_payload != align_payload.strip():
+                    raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
             try:
                 align_path.write_text(align_payload, encoding="utf-8")
@@ -530,7 +532,7 @@ def _export_retake_outputs(
     else:
         srt_path = out_dir / f"{stem}.keepLast.srt"
         txt_path = out_dir / f"{stem}.keepLast.txt"
-        markers_path = out_dir / f"{stem}.audition_markers.csv"
+        markers_path = out_dir / f"{stem}.keepLast.audition_markers.csv"
         edl_path = out_dir / f"{stem}.keepLast.edl.json"
         export_srt(result.keeps, srt_path)
         export_txt(result.keeps, txt_path)
@@ -651,7 +653,7 @@ def _process_retake_item(
 
         def _load_context_preview() -> str:
             try:
-                raw = text_path.read_text(encoding="utf-8", errors="ignore")
+                raw = text_path.read_text(encoding="utf-8-sig", errors="ignore")
             except OSError:
                 return ""
             return _summarize_context(raw)
@@ -831,7 +833,7 @@ def _build_retake_stats_from_item(item: dict) -> RetakeStats:
 def _run_retake_batch(
     materials_dir: Path,
     out_dir: Path,
-    glob_words: str,
+    glob_words: list[str],
     text_patterns: list[str],
     workers: Optional[int],
     min_sent_chars: int,
@@ -860,7 +862,7 @@ def _run_retake_batch(
 ) -> dict:
     """执行目录批处理的配对与导出。"""
 
-    words_files = iter_files(materials_dir, [glob_words])  # 收集所有 JSON
+    words_files = iter_files(materials_dir, glob_words)  # 收集所有 JSON
     if not words_files:  # 未找到文件
         return {"items": [], "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0}}
     total = len(words_files)  # 总任务数
@@ -1084,7 +1086,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         raise ValueError("单文件模式必须提供 --words-json")
     else:  # 目录批处理
         text_patterns = [_casefold_pattern(pattern) for pattern in args.glob_text]
-        glob_words_pattern = _casefold_pattern(args.glob_words)
+        glob_words_pattern = parse_glob_list(args.glob_words)
         result = _run_retake_batch(
             Path(args.materials),
             out_dir,
@@ -1151,7 +1153,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     if write_report:  # 写入批处理报告
         existing = {}
         if report_path.exists():
-            existing = json.loads(report_path.read_text(encoding="utf-8"))
+            existing = json.loads(report_path.read_text(encoding="utf-8-sig"))
         existing["retake_keep_last"] = payload
         write_json(report_path, existing)
     return payload
@@ -1385,7 +1387,7 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
     if write_report:
         existing = {}
         if report_path.exists():
-            existing = json.loads(report_path.read_text(encoding="utf-8"))
+            existing = json.loads(report_path.read_text(encoding="utf-8-sig"))
         existing.setdefault("retake_keep_last", {})
         existing["render_audio"] = payload
         write_json(report_path, existing)
@@ -1466,45 +1468,130 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
 
-    LOGGER.info(_safe_text(f"开始保留最后一遍生成字幕/EDL → {out_dir}"))
+    parsed_words = parse_glob_list(args.glob_words)
+    parsed_audio = parse_glob_list(args.glob_audio)
+    LOGGER.info("解析后的词级匹配模式: %s", parsed_words or [args.glob_words])
+    LOGGER.info("解析后的音频匹配模式: %s", parsed_audio or [args.glob_audio])
+
     retake_text_patterns = _derive_retake_text_patterns([args.norm_glob])
-    retake_namespace = argparse.Namespace(
-        words_json=None,
-        text=None,
-        materials=str(input_dir),
-        glob_words=_casefold_pattern(args.glob_words),
-        glob_text=retake_text_patterns,
-        workers=args.workers,
-        out=str(out_dir),
-        source_audio=None,
-        samplerate=None,
-        channels=None,
-        min_sent_chars=MIN_SENT_CHARS,
-        max_dup_gap_sec=None,
-        max_window_sec=MAX_WINDOW_SEC,
-        merge_adj_gap_sec=None,
-        low_conf=None,
-        sentence_strict=False,
-        review_only=False,
-        no_pause_align=False,
-        pause_gap_sec=PAUSE_GAP_SEC,
-        pause_snap_limit=PAUSE_SNAP_LIMIT,
-        pad_before=PAD_BEFORE,
-        pad_after=PAD_AFTER,
-        min_segment_sec=MIN_SEGMENT_SEC,
-        merge_gap_sec=MERGE_GAP_SEC,
-        no_silence_probe=False,
-        noise_db=-35,
-        silence_min_d=0.28,
-        no_overcut_guard=False,
-        overcut_mode="ask",
-        overcut_threshold=0.60,
-        debug_csv=None,
-        no_interaction=args.no_interaction,
+    kits = match_materials(
+        input_dir,
+        norm_out_dir,
+        retake_text_patterns,
+        args.glob_words,
+        args.glob_audio,
     )
-    retake_result = run_retake_keep_last(retake_namespace, report_path=report_path, write_report=False)
+    kit_count = len(kits)
+    audio_kits = sum(1 for kit in kits if kit.audio)
+    LOGGER.info("素材扫描完成: 共 %s 套，其中 %s 套包含音频。", kit_count, audio_kits)
+
+    def _flag(value: object) -> str:
+        return "Y" if value else "-"
+
+    for kit in kits:
+        LOGGER.info(
+            "[kit] %s | text=%s words=%s audio=%s",
+            kit.stem,
+            _flag(kit.best_text()),
+            _flag(kit.words),
+            _flag(kit.audio),
+        )
+
+    if not kits:
+        LOGGER.warning("未匹配到任何素材套件，请检查目录结构或 glob 配置。")
+
+    missing_words = [kit for kit in kits if not kit.words]
+    if missing_words:
+        LOGGER.warning(
+            "检测到 %s 套素材缺少词级 JSON（支持 *.words.json;*.json），请确认文件名。",
+            len(missing_words),
+        )
+
+    retake_items: list[dict] = []
+    failed = 0
+    retake_start = time.perf_counter()
+    for kit in kits:
+        stem = kit.stem
+        words_path = kit.words
+        text_path = kit.best_text()
+        if words_path is None:
+            retake_items.append(
+                {
+                    "stem": stem,
+                    "words_json": "",
+                    "text": safe_rel(norm_out_dir, text_path) if text_path else "",
+                    "outputs": {},
+                    "stats": {},
+                    "status": "failed",
+                    "message": "未找到匹配的词级 JSON",
+                }
+            )
+            failed += 1
+            continue
+        if text_path is None:
+            retake_items.append(
+                {
+                    "stem": stem,
+                    "words_json": safe_rel(input_dir, words_path),
+                    "text": "",
+                    "outputs": {},
+                    "stats": {},
+                    "status": "failed",
+                    "message": "未找到匹配的 TXT/.norm/.align 文件",
+                }
+            )
+            failed += 1
+            continue
+        _, item = _process_retake_item(
+            words_path,
+            text_path,
+            out_dir,
+            None,
+            None,
+            None,
+            input_dir,
+            out_dir,
+            MIN_SENT_CHARS,
+            LINE_MAX_DUP_GAP_SEC,
+            SENT_MAX_DUP_GAP_SEC,
+            MAX_WINDOW_SEC,
+            False,
+            False,
+            MERGE_ADJ_GAP_SEC,
+            SENT_LOW_CONF,
+            pause_align=True,
+            pause_gap_sec=PAUSE_GAP_SEC,
+            pause_snap_limit=PAUSE_SNAP_LIMIT,
+            pad_before=PAD_BEFORE,
+            pad_after=PAD_AFTER,
+            min_segment_sec=MIN_SEGMENT_SEC,
+            merge_gap_sec=MERGE_GAP_SEC,
+            silence_probe_enabled=True,
+            noise_db=-35,
+            silence_min_d=0.28,
+            overcut_guard=True,
+            overcut_mode="ask",
+            overcut_threshold=0.60,
+            no_interaction=args.no_interaction,
+            debug_csv=None,
+        )
+        retake_items.append(item)
+        if item.get("status") != "ok":
+            failed += 1
+    retake_elapsed = time.perf_counter() - retake_start
+    retake_items.sort(key=lambda entry: entry.get("stem", ""))
+    total_items = len(retake_items)
+    success_items = total_items - failed
+    retake_summary = {
+        "total": total_items,
+        "ok": success_items,
+        "failed": failed,
+        "elapsed_seconds": retake_elapsed,
+    }
+    retake_result = {"items": retake_items, "summary": retake_summary, "retake_stats": []}
     report["retake_keep_last"] = retake_result
-    stage_summary["retake_keep_last"] = retake_result.get("summary", {})
+    stage_summary["retake_keep_last"] = retake_summary
+    LOGGER.info("[stage] retake done elapsed=%.2fs", retake_elapsed)
 
     items = retake_result.get("items", [])
     total_items = len(items)
@@ -1537,9 +1624,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                 ordered_stats.append(fallback)
                 seen_stems.add(stem)
 
-    audio_patterns = [part.strip() for part in re.split(r"[;,]", args.glob_audio) if part.strip()]
-    audio_map = _collect_audio_map(input_dir, audio_patterns)
-    audio_flags = {stem.lower(): bool(audio_map.get(stem.lower())) for stem in stems}
+    audio_flags = {kit.stem.lower(): bool(kit.audio) for kit in kits}
     seen_no_audio: set[str] = set()
     for stem in stems:
         if not stem:
@@ -1550,11 +1635,15 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             seen_no_audio.add(stem_key)
 
     render_mode = args.render_mode
+    if render_mode == "yes":
+        render_mode = "always"
+    elif render_mode == "no":
+        render_mode = "never"
     render_payload: dict | None = None
     render_summary: dict[str, dict] = {}
     render_skipped_no_audio = False
     render_error = ""
-    if render_mode == "no":
+    if render_mode == "never":
         LOGGER.info("渲染阶段已禁用，跳过。")
         render_payload = {
             "items": [],
@@ -1564,10 +1653,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         report["render_audio"] = render_payload
         stage_summary["render_audio"] = render_payload["summary"]
     else:
-        any_audio = any(audio_flags.values())
+        any_audio = any(audio_flags.get(stem.lower(), False) for stem in stems)
         if render_mode == "auto" and not any_audio:
             render_skipped_no_audio = True
-            LOGGER.info("[skip] 无音频，已生成可对齐产物（SRT/TXT/EDL/CSV）")
+            LOGGER.info("未检测到音频，已跳过渲染，但已生成对齐产物。")
             render_payload = {
                 "items": [],
                 "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
@@ -1640,6 +1729,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         "records": pipeline_records,
     }
     if ordered_stats:
+        retake_result["retake_stats"] = [asdict(stat) for stat in ordered_stats]
         report["summary"]["retake_stats"] = [asdict(stat) for stat in ordered_stats]
     write_json(report_path, report)
 
@@ -1673,6 +1763,13 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     elif args.quiet:
         LOGGER.setLevel(logging.WARNING)
 
+    canonical_render = args.render_mode
+    if canonical_render == "yes":
+        canonical_render = "always"
+    elif canonical_render == "no":
+        canonical_render = "never"
+    args.render_mode = canonical_render
+
     parts: list[str] = [
         "--in",
         str(Path(args.input_dir)),
@@ -1687,7 +1784,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-words",
         args.glob_words,
         "--render",
-        args.render_mode,
+        canonical_render,
         "--glob-audio",
         args.glob_audio,
     ]
@@ -1715,9 +1812,11 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "opencc": args.opencc,
         "norm_glob": args.norm_glob,
         "glob_words": args.glob_words,
+        "glob_words_list": parse_glob_list(args.glob_words),
         "glob_audio": args.glob_audio,
+        "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
-        "render": args.render_mode,
+        "render": canonical_render,
         "workers": args.workers,
         "no_interaction": args.no_interaction,
     }
@@ -1772,7 +1871,11 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--materials", help="目录批处理模式：素材根目录")
     retake.add_argument("--text", help="单文件模式：原文 TXT")
     retake.add_argument("--out", required=True, help="输出目录")
-    retake.add_argument("--glob-words", default="*.words.json", help="批处理模式：JSON 匹配模式")
+    retake.add_argument(
+        "--glob-words",
+        default="*.words.json;*.json",
+        help="批处理模式：JSON 匹配模式 (分号或空格分隔)",
+    )
     retake.add_argument(
         "--glob-text",
         nargs="+",
@@ -1965,8 +2068,8 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--glob-words",
         dest="glob_words",
-        default="*.words.json",
-        help="词级 JSON 匹配模式",
+        default="*.words.json;*.json",
+        help="词级 JSON 匹配模式 (分号或空格分隔)",
     )
     pipeline.add_argument(
         "--glob-audio",
@@ -1977,9 +2080,9 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--render",
         dest="render_mode",
-        choices=["auto", "yes", "no"],
+        choices=["auto", "always", "never", "yes", "no"],
         default="auto",
-        help="渲染策略：auto=有音频才渲染，yes=强制渲染，no=跳过",
+        help="渲染策略：auto=有音频才渲染，always=总是渲染，never=跳过",
     )
     pipeline.add_argument("--workers", type=int, help="批处理并发度")
     pipeline.add_argument("--no-interaction", action="store_true", help="无交互模式，直接执行")
@@ -2120,7 +2223,7 @@ def _resolve_render_status(
 ) -> str:
     """根据渲染配置与执行结果推导最终状态字符串。"""
 
-    if render_mode == "no":
+    if render_mode in {"no", "never"}:
         return "skipped(manual)"
     stem_key = stem.lower()
     if render_mode == "auto" and render_skipped_no_audio:

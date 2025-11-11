@@ -515,7 +515,7 @@ def compute_retake_keep_last(
     if not words:  # 无词序列时无法继续
         raise ValueError("词序列为空，无法执行保留最后一遍逻辑。请先导入有效的 ASR JSON。")
     try:
-        raw_text = original_txt.read_text(encoding="utf-8")  # 读取原文文本
+        raw_text = original_txt.read_text(encoding="utf-8-sig")  # 读取原文文本
     except FileNotFoundError as exc:  # 文件不存在
         raise FileNotFoundError(f"未找到原文 TXT: {original_txt}. 请确认路径是否正确。") from exc
     except OSError as exc:  # 其他 I/O 异常
@@ -666,7 +666,7 @@ def compute_sentence_review(
     if not words:
         raise ValueError("词序列为空，无法执行句子级审阅逻辑。")
     try:
-        raw_text = original_txt.read_text(encoding="utf-8")
+        raw_text = original_txt.read_text(encoding="utf-8-sig")
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"未找到原文 TXT: {original_txt}. 请确认路径是否正确。") from exc
     except OSError as exc:
