@@ -5,6 +5,7 @@ import argparse  # 解析命令行参数
 import csv  # 写入规范化报表
 import json  # 生成批处理 JSON 报告
 import logging  # 控制台日志输出
+import re  # 处理 glob 参数拆分与上下文清理
 import shlex  # 构建可复制的命令示例
 import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
@@ -58,6 +59,7 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
 from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.text_norm import (  # 规范化工具
     load_char_map,
+    normalize_chinese_text,
     normalize_pipeline,
     prepare_alignment_text,
     run_opencc_if_available,
@@ -102,6 +104,42 @@ def _build_cli_example(subcommand: str, parts: Sequence[str]) -> str:
 
     args = [sys.executable, str(Path(__file__).resolve()), subcommand, *parts]  # 拼接完整命令
     return shlex.join(args)  # 返回 shell 风格字符串
+
+
+def _summarize_context(text: str, width: int = 20) -> str:
+    """截取文本前后片段用于错误上下文展示。"""
+
+    if not text:
+        return ""
+    sanitized = re.sub(r"\s+", " ", text.replace("\u3000", " ").replace("\t", " "))
+    sanitized = sanitized.strip()
+    if len(sanitized) <= width * 2:
+        return sanitized
+    return f"{sanitized[:width]}…{sanitized[-width:]}"
+
+
+def _progress_tick(
+    stage: str,
+    processed: int,
+    total: int,
+    start_ts: float,
+    last_ts: float,
+    *,
+    interval: float = 1.0,
+) -> float:
+    """根据进度打印日志并返回最近一次输出的时间戳。"""
+
+    if total <= 0:
+        return last_ts
+    now = time.perf_counter()
+    should_report = processed == total or processed % 200 == 0 or (now - last_ts) >= interval
+    if not should_report or processed <= 0:
+        return last_ts
+    elapsed = now - start_ts
+    remaining = max(total - processed, 0)
+    eta = (elapsed / processed * remaining) if processed else 0.0
+    LOGGER.info("[progress] %s %s/%s ETA=%.1fs", stage, processed, total, max(0.0, eta))
+    return now
 
 
 def _append_normalize_report(rows: list[dict]) -> None:
@@ -185,6 +223,7 @@ def _process_single_text(
     """对单个文本执行规范化处理并返回报表行。"""
 
     LOGGER.debug("Normalize %s", path)  # 调试输出当前文件
+    raw_text = ""
     try:
         raw_text = path.read_text(encoding="utf-8")  # 按 UTF-8 读取原文
         decode_note = ""  # 初始化编码提示
@@ -192,6 +231,7 @@ def _process_single_text(
         raw_text = path.read_text(encoding="utf-8", errors="replace")  # 若解码失败则替换异常字符
         decode_note = "原文包含无法解码的字符，已用替换符号保留。"  # 记录提示
     except OSError as exc:
+        LOGGER.error("[error] 读取失败 %s: %s", path, exc)
         return {
             "file": str(path),
             "orig_len": 0,
@@ -217,7 +257,8 @@ def _process_single_text(
             preserve_cjk_punct=bool(cmap.get("preserve_cjk_punct", False)),  # 是否保留中日韩标点
         )
     except Exception as exc:
-        LOGGER.exception("规范化流程失败: %s", path)
+        context_preview = _summarize_context(raw_text)
+        LOGGER.exception("规范化流程失败: %s 上下文=%s", path, context_preview)
         return {
             "file": str(path),
             "orig_len": len(raw_text),
@@ -231,7 +272,7 @@ def _process_single_text(
             "suspects_found": "false",
             "suspects_examples": "",
             "status": "failed",
-            "message": f"规范化失败: {exc}",
+            "message": f"规范化失败: {exc}; ctx={context_preview}",
         }
 
     converted_text, opencc_applied = run_opencc_if_available(normalized_text, opencc_mode)  # 运行 OpenCC
@@ -239,6 +280,7 @@ def _process_single_text(
     if collapse_lines and sentence_lines:
         validate_sentence_lines(sentence_lines)
     converted_text = "\n".join(sentence_lines)
+    converted_text = normalize_chinese_text(converted_text, collapse_lines=collapse_lines)
     suspects = scan_suspects(converted_text)  # 扫描可疑字符
     suspects_found = any(value.get("count", 0) for value in suspects.values())  # 是否发现异常
     suspects_examples = "; ".join(  # 汇总示例
@@ -263,7 +305,7 @@ def _process_single_text(
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
-        payload = converted_text if converted_text.endswith("\n") else (converted_text + "\n" if converted_text else "")  # 确保换行
+        payload = converted_text
         try:
             out_path.write_text(payload, encoding="utf-8")  # 写入规范化文本
         except OSError as exc:
@@ -363,7 +405,11 @@ def run_prep_norm(
 
     rows: list[dict] = []  # 收集报表行
     failed = 0  # 统计失败数量
+    total = len(files)
+    LOGGER.info("[stage] norm start total=%s", total)
     start = time.perf_counter()  # 记录起始时间
+    last_progress = start
+    processed = 0
     for path in files:  # 遍历每个文件
         row = _process_single_text(
             path,
@@ -381,7 +427,10 @@ def run_prep_norm(
             LOGGER.warning("[failed] %s %s", path, row.get("message"))  # 打印失败信息
         else:
             LOGGER.info("[ok] %s", path)  # 打印成功信息
+        processed += 1
+        last_progress = _progress_tick("norm", processed, total, start, last_progress)
     elapsed = time.perf_counter() - start  # 计算耗时
+    LOGGER.info("[stage] norm done elapsed=%.2fs", elapsed)
     if rows:
         _append_normalize_report(rows)  # 写入报表
     summary = {"total": len(rows), "ok": len(rows) - failed, "failed": failed, "elapsed_seconds": elapsed}  # 汇总
@@ -532,6 +581,7 @@ def _process_retake_item(
     overcut_guard: bool,
     overcut_mode: str,
     overcut_threshold: float,
+    no_interaction: bool,
     debug_csv: Path | None,
 ) -> Tuple[str, dict]:
     """处理单个词级 JSON + 文本的组合。"""
@@ -599,12 +649,39 @@ def _process_retake_item(
                 debug_label=stem,
             )
 
-        result = _run_compute(
-            current_min_sent,
-            current_line_gap,
-            current_sentence_gap,
-            current_pause_gap,
-        )
+        def _load_context_preview() -> str:
+            try:
+                raw = text_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                return ""
+            return _summarize_context(raw)
+
+        try:
+            result = _run_compute(
+                current_min_sent,
+                current_line_gap,
+                current_sentence_gap,
+                current_pause_gap,
+            )
+        except Exception as exc:
+            context_preview = _load_context_preview()
+            LOGGER.exception(
+                "保留最后一遍处理失败: stem=%s text=%s 上下文=%s",
+                stem,
+                text_path,
+                context_preview,
+            )
+            base_dir = materials_base or text_path.parent
+            item = {
+                "stem": stem,
+                "words_json": safe_rel(base_dir, words_path) if base_dir else str(words_path),
+                "text": safe_rel(base_dir, text_path) if base_dir else str(text_path),
+                "outputs": {},
+                "stats": {},
+                "status": "failed",
+                "message": f"处理失败: {exc}; ctx={context_preview}",
+            }
+            return stem, item
         stats = dict(result.stats)
         cut_ratio = float(stats.get("cut_ratio", 0.0))
         action = "none"
@@ -614,11 +691,13 @@ def _process_retake_item(
             elif overcut_mode == "abort":
                 action = "abort"
             else:
-                if not sys.stdin.isatty():
+                if no_interaction or not sys.stdin.isatty():
+                    reason = "--no-interaction 模式下" if no_interaction else "非交互环境下"
                     LOGGER.warning(
-                        "剪切比例 %.2f 超过阈值 %.2f，非交互环境自动选择 auto。",
+                        "剪切比例 %.2f 超过阈值 %.2f，%s自动选择 auto。",
                         cut_ratio,
                         overcut_threshold,
+                        reason,
                     )
                     action = "auto"
                 else:
@@ -776,6 +855,7 @@ def _run_retake_batch(
     overcut_guard: bool,
     overcut_mode: str,
     overcut_threshold: float,
+    no_interaction: bool,
     debug_csv: Path | None,
 ) -> dict:
     """执行目录批处理的配对与导出。"""
@@ -783,12 +863,15 @@ def _run_retake_batch(
     words_files = iter_files(materials_dir, [glob_words])  # 收集所有 JSON
     if not words_files:  # 未找到文件
         return {"items": [], "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0}}
+    total = len(words_files)  # 总任务数
+    LOGGER.info("[stage] retake start total=%s", total)
     start = time.perf_counter()  # 记录耗时
     items: list[dict] = []  # 存储处理结果
     failed = 0  # 统计失败数
-    total = len(words_files)  # 总任务数
     executor: ThreadPoolExecutor | None = None  # 线程池引用
     futures = []  # 并发任务列表
+    processed = 0
+    last_progress = start
     try:
         if workers and workers > 1:  # 并发模式
             executor = ThreadPoolExecutor(max_workers=workers)  # 构建线程池
@@ -806,6 +889,8 @@ def _run_retake_batch(
                     }
                     failed += 1
                     items.append(item)
+                    processed += 1
+                    last_progress = _progress_tick("retake", processed, total, start, last_progress)
                     continue
                 futures.append(
                     executor.submit(
@@ -839,6 +924,7 @@ def _run_retake_batch(
                         overcut_guard=overcut_guard,
                         overcut_mode=overcut_mode,
                         overcut_threshold=overcut_threshold,
+                        no_interaction=no_interaction,
                         debug_csv=debug_csv,
                     )
                 )  # 提交任务
@@ -847,6 +933,8 @@ def _run_retake_batch(
                 items.append(item)
                 if item["status"] != "ok":  # 统计失败
                     failed += 1
+                processed += 1
+                last_progress = _progress_tick("retake", processed, total, start, last_progress)
         else:  # 串行模式
             for words_path in words_files:
                 text_path = find_text_for_stem(materials_dir, stem_from_words_json(words_path), text_patterns)  # 配对文本
@@ -863,6 +951,8 @@ def _run_retake_batch(
                         }
                     )
                     failed += 1
+                    processed += 1
+                    last_progress = _progress_tick("retake", processed, total, start, last_progress)
                     continue
                 _, item = _process_retake_item(
                     words_path,
@@ -894,15 +984,19 @@ def _run_retake_batch(
                     overcut_guard=overcut_guard,
                     overcut_mode=overcut_mode,
                     overcut_threshold=overcut_threshold,
+                    no_interaction=no_interaction,
                     debug_csv=debug_csv,
                 )  # 直接处理
                 items.append(item)
                 if item["status"] != "ok":  # 更新失败计数
                     failed += 1
+                processed += 1
+                last_progress = _progress_tick("retake", processed, total, start, last_progress)
     finally:
         if executor:  # 清理线程池
             executor.shutdown()
     elapsed = time.perf_counter() - start  # 计算耗时
+    LOGGER.info("[stage] retake done elapsed=%.2fs", elapsed)
     items.sort(key=lambda item: item.get("stem", ""))  # 按 stem 排序
     summary = {"total": total, "ok": total - failed, "failed": failed, "elapsed_seconds": elapsed}  # 汇总
     return {"items": items, "summary": summary}
@@ -941,9 +1035,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     if debug_csv and args.workers and args.workers > 1:
         LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
         debug_csv = None
+    no_interaction = bool(getattr(args, "no_interaction", False))
     if args.words_json:  # 单文件模式
         if not args.text:
             raise ValueError("单文件模式需要同时提供 --text")
+        LOGGER.info("[stage] retake start total=1")
+        single_start = time.perf_counter()
         _, item = _process_retake_item(
             Path(args.words_json),
             Path(args.text),
@@ -974,19 +1071,24 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             overcut_guard=overcut_guard,
             overcut_mode=overcut_mode,
             overcut_threshold=overcut_threshold,
+            no_interaction=no_interaction,
             debug_csv=debug_csv,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
-        summary = {"total": 1, "ok": 1 - failed, "failed": failed, "elapsed_seconds": 0.0}
+        _progress_tick("retake", 1, 1, single_start, single_start)
+        elapsed_single = time.perf_counter() - single_start
+        LOGGER.info("[stage] retake done elapsed=%.2fs", elapsed_single)
+        summary = {"total": 1, "ok": 1 - failed, "failed": failed, "elapsed_seconds": elapsed_single}
     elif args.text:  # 仅给出文本但缺少 JSON
         raise ValueError("单文件模式必须提供 --words-json")
     else:  # 目录批处理
-        text_patterns = list(args.glob_text)
+        text_patterns = [_casefold_pattern(pattern) for pattern in args.glob_text]
+        glob_words_pattern = _casefold_pattern(args.glob_words)
         result = _run_retake_batch(
             Path(args.materials),
             out_dir,
-            args.glob_words,
+            glob_words_pattern,
             text_patterns,
             args.workers,
             args.min_sent_chars,
@@ -1010,6 +1112,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             overcut_guard,
             overcut_mode,
             overcut_threshold,
+            no_interaction,
             debug_csv,
         )
         items = result["items"]
@@ -1080,6 +1183,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         if args.workers:
             parts.extend(["--workers", str(args.workers)])
     parts.extend(["--out", str(Path(args.out))])
+    parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
     if args.source_audio:
         parts.extend(["--source-audio", args.source_audio])
     if args.samplerate:
@@ -1128,6 +1232,8 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.append("--sentence-strict")
     if args.review_only:
         parts.append("--review-only")
+    if getattr(args, "no_interaction", False):
+        parts.append("--no-interaction")
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -1214,6 +1320,8 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
         raise ValueError("--channels 必须为正整数")
 
     if args.edl:  # 单文件模式
+        LOGGER.info("[stage] render start total=1")
+        single_start = time.perf_counter()
         items = [
             _process_render_item(Path(args.edl), audio_root, out_dir, samplerate, channels)
         ]
@@ -1221,16 +1329,22 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
             "total": 1,
             "ok": 1 if items[0]["status"] == "ok" else 0,
             "failed": 0 if items[0]["status"] == "ok" else 1,
-            "elapsed_seconds": 0.0,
+            "elapsed_seconds": time.perf_counter() - single_start,
         }
+        _progress_tick("render", 1, 1, single_start, single_start)
+        LOGGER.info("[stage] render done elapsed=%.2fs", summary["elapsed_seconds"])
     else:  # 批处理模式
         edl_files = iter_files(Path(args.materials), list(args.glob_edl))  # 搜索 EDL
         if not edl_files:
             return {"items": [], "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0}}
+        total = len(edl_files)
+        LOGGER.info("[stage] render start total=%s", total)
         start = time.perf_counter()  # 记录耗时
         items = []
         failed = 0
         workers = args.workers or 1
+        processed = 0
+        last_progress = start
         if workers > 1:  # 并发执行
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
@@ -1249,15 +1363,20 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
                     items.append(item)
                     if item["status"] != "ok":
                         failed += 1
+                    processed += 1
+                    last_progress = _progress_tick("render", processed, total, start, last_progress)
         else:  # 串行执行
             for edl_path in edl_files:
                 item = _process_render_item(edl_path, audio_root, out_dir, samplerate, channels)
                 items.append(item)
                 if item["status"] != "ok":
                     failed += 1
+                processed += 1
+                last_progress = _progress_tick("render", processed, total, start, last_progress)
         elapsed = time.perf_counter() - start  # 计算耗时
+        LOGGER.info("[stage] render done elapsed=%.2fs", elapsed)
         items.sort(key=lambda item: item.get("edl", ""))  # 按 EDL 名称排序
-        summary = {"total": len(edl_files), "ok": len(edl_files) - failed, "failed": failed, "elapsed_seconds": elapsed}
+        summary = {"total": total, "ok": total - failed, "failed": failed, "elapsed_seconds": elapsed}
     payload = {"items": items, "summary": summary}
     summary["aggregated_stats"] = {
         "segments": sum(int(item.get("stats", {}).get("segments", 0)) for item in items if item.get("status") == "ok"),
@@ -1381,6 +1500,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         overcut_mode="ask",
         overcut_threshold=0.60,
         debug_csv=None,
+        no_interaction=args.no_interaction,
     )
     retake_result = run_retake_keep_last(retake_namespace, report_path=report_path, write_report=False)
     report["retake_keep_last"] = retake_result
@@ -1417,9 +1537,17 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                 ordered_stats.append(fallback)
                 seen_stems.add(stem)
 
-    audio_patterns = [part.strip() for part in args.glob_audio.split(";") if part.strip()]
+    audio_patterns = [part.strip() for part in re.split(r"[;,]", args.glob_audio) if part.strip()]
     audio_map = _collect_audio_map(input_dir, audio_patterns)
     audio_flags = {stem.lower(): bool(audio_map.get(stem.lower())) for stem in stems}
+    seen_no_audio: set[str] = set()
+    for stem in stems:
+        if not stem:
+            continue
+        stem_key = stem.lower()
+        if not audio_flags.get(stem_key, False) and stem_key not in seen_no_audio:
+            LOGGER.info("[no-audio] stem=%s", stem)
+            seen_no_audio.add(stem_key)
 
     render_mode = args.render_mode
     render_payload: dict | None = None
@@ -1439,7 +1567,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         any_audio = any(audio_flags.values())
         if render_mode == "auto" and not any_audio:
             render_skipped_no_audio = True
-            LOGGER.info("未发现任何音频文件，自动跳过渲染阶段。")
+            LOGGER.info("[skip] 无音频，已生成可对齐产物（SRT/TXT/EDL/CSV）")
             render_payload = {
                 "items": [],
                 "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
@@ -1648,8 +1776,20 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--glob-text",
         nargs="+",
-        default=["*.norm.txt", "*.txt"],
+        default=["*.align.txt", "*.norm.txt", "*.txt"],
         help="批处理模式：文本匹配模式 (可多次指定)",
+    )
+    retake.add_argument(
+        "--collapse-lines",
+        dest="collapse_lines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规范化文本是否已折叠换行（默认开启，用于诊断时可关闭）",
+    )
+    retake.add_argument(
+        "--no-interaction",
+        action="store_true",
+        help="无交互模式，不等待用户确认",
     )
     retake.add_argument("--workers", type=int, help="批处理并发度")
     retake.add_argument("--source-audio", help="单文件模式：EDL 中记录的源音频相对路径")
@@ -1786,7 +1926,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pipeline = subparsers.add_parser(
         "all-in-one",
-        help="一键流水线：规范化 → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）",
+        help="一键流水线：规范化（含去换行与空格修复） → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）",
     )
     pipeline.add_argument("--in", dest="input_dir", required=True, help="输入目录 (含 *.txt/*.json/音频)")
     pipeline.add_argument("--out", dest="output_dir", required=True, help="输出目录")
@@ -1917,26 +2057,37 @@ def _expand_case_insensitive_patterns(patterns: Iterable[str]) -> list[str]:
 def _derive_retake_text_patterns(patterns: Iterable[str]) -> list[str]:
     """根据规范化模式生成保留阶段的文本匹配顺序。"""
 
-    ordered: list[str] = []
+    align_patterns: list[str] = []
+    norm_patterns: list[str] = []
+    others: list[str] = []
     seen: set[str] = set()
     for pattern in patterns:
         pattern = pattern.strip()
         if not pattern:
             continue
+        lower = pattern.lower()
         base = _casefold_pattern(pattern)
+        if lower.endswith(".align.txt"):
+            target = align_patterns
+        elif lower.endswith(".norm.txt"):
+            target = norm_patterns
+        else:
+            target = others
+            if lower.endswith(".txt"):
+                align_variant = _casefold_pattern(pattern[:-4] + ".align.txt")
+                if align_variant not in seen:
+                    align_patterns.append(align_variant)
+                    seen.add(align_variant)
+                norm_variant = _casefold_pattern(pattern[:-4] + ".norm.txt")
+                if norm_variant not in seen:
+                    norm_patterns.append(norm_variant)
+                    seen.add(norm_variant)
         if base not in seen:
-            ordered.append(base)
+            target.append(base)
             seen.add(base)
-        # 若模式看起来是 *.txt，自动优先匹配 .norm.txt
-        if pattern.lower().endswith(".txt"):
-            norm_variant = pattern[:-4] + ".norm.txt"
-            converted = _casefold_pattern(norm_variant)
-            if converted not in seen:
-                ordered.insert(0, converted)
-                seen.add(converted)
-    if not ordered:
-        ordered = _expand_case_insensitive_patterns(["*.norm.txt", "*.txt"])
-    return ordered
+    if not (align_patterns or norm_patterns or others):
+        return _expand_case_insensitive_patterns(["*.align.txt", "*.norm.txt", "*.txt"])
+    return align_patterns + norm_patterns + others
 
 
 def _iter_casefold_files(root: Path, patterns: Iterable[str]) -> list[Path]:
@@ -1997,6 +2148,7 @@ def _collect_audio_map(base_dir: Path, patterns: Iterable[str]) -> dict[str, lis
     audio_map: dict[str, list[Path]] = {}
     for audio_path in _iter_casefold_files(base_dir, patterns):
         stem = audio_path.stem.lower()
+        LOGGER.info("[audio] stem=%s path=%s", stem, safe_rel(base_dir, audio_path))
         audio_map.setdefault(stem, []).append(audio_path)
     return audio_map
 

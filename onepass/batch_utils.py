@@ -35,14 +35,18 @@ def find_text_for_stem(root: Path, stem: str, text_patterns: list[str]) -> Path 
     """根据 stem 优先匹配 .norm.txt，再回退到 .txt。"""
 
     root = root.expanduser().resolve()  # 解析根目录
+    align_name = f"{stem}.align.txt"
     norm_name = f"{stem}.norm.txt"  # 期望的规范化文件名
     txt_name = f"{stem}.txt"  # 原始文本文件名
     candidates = iter_files(root, text_patterns)  # 先收集所有候选文件
     for path in candidates:  # 遍历候选文件
-        if path.name == norm_name:  # 优先返回规范化文本
+        if path.name.lower() == align_name.lower():
+            return path
+    for path in candidates:
+        if path.name.lower() == norm_name.lower():  # 优先返回规范化文本
             return path
     for path in candidates:  # 再次遍历寻找原始文本
-        if path.name == txt_name:  # 匹配原始文本
+        if path.name.lower() == txt_name.lower():  # 匹配原始文本
             return path
     return None  # 找不到匹配项返回 None
 
