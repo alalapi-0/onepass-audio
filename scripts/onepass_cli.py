@@ -9,6 +9,7 @@ import shlex  # 构建可复制的命令示例
 import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
 import time  # 统计耗时
+from dataclasses import asdict, dataclass  # 复用数据类结构化统计
 from concurrent.futures import ThreadPoolExecutor, as_completed  # 批处理并发执行
 from pathlib import Path  # 跨平台路径处理
 from typing import Iterable, Optional, Sequence, Tuple
@@ -61,6 +62,8 @@ from onepass.text_norm import (  # 规范化工具
     prepare_alignment_text,
     run_opencc_if_available,
     scan_suspects,
+    sentence_lines_from_text,
+    validate_sentence_lines,
 )
 from onepass.sent_align import (
     LOW_CONF as SENT_LOW_CONF,
@@ -73,6 +76,18 @@ from onepass.logging_utils import default_log_dir, setup_logger
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
+
+
+@dataclass(slots=True)
+class RetakeStats:
+    """抽取保留最后一遍阶段的核心统计数据。"""
+
+    stem: str
+    total: int
+    kept: int
+    unaligned: int
+    dedup_window: int
+    cut_seconds: float
 
 
 def _configure_logging() -> None:
@@ -164,6 +179,7 @@ def _process_single_text(
     cmap: dict,
     opencc_mode: str,
     dry_run: bool,
+    collapse_lines: bool,
     emit_align: bool,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
@@ -219,6 +235,10 @@ def _process_single_text(
         }
 
     converted_text, opencc_applied = run_opencc_if_available(normalized_text, opencc_mode)  # 运行 OpenCC
+    sentence_lines = sentence_lines_from_text(converted_text, collapse_lines=collapse_lines)
+    if collapse_lines and sentence_lines:
+        validate_sentence_lines(sentence_lines)
+    converted_text = "\n".join(sentence_lines)
     suspects = scan_suspects(converted_text)  # 扫描可疑字符
     suspects_found = any(value.get("count", 0) for value in suspects.values())  # 是否发现异常
     suspects_examples = "; ".join(  # 汇总示例
@@ -243,7 +263,7 @@ def _process_single_text(
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
-        payload = converted_text if converted_text.endswith("\n") else converted_text + "\n"  # 确保换行
+        payload = converted_text if converted_text.endswith("\n") else (converted_text + "\n" if converted_text else "")  # 确保换行
         try:
             out_path.write_text(payload, encoding="utf-8")  # 写入规范化文本
         except OSError as exc:
@@ -265,6 +285,13 @@ def _process_single_text(
 
         if emit_align:
             align_payload = prepare_alignment_text(payload)
+            if collapse_lines and align_payload:
+                align_lines = align_payload.rstrip("\n").splitlines()
+                for line in align_lines:
+                    if "\t" in line:
+                        raise ValueError("对齐文本包含制表符，请检查规范化结果。")
+                    if line != line.strip():
+                        raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
             try:
                 align_path.write_text(align_payload, encoding="utf-8")
@@ -298,6 +325,7 @@ def run_prep_norm(
     opencc_mode: str,
     glob_pattern: str,
     dry_run: bool,
+    collapse_lines: bool,
     emit_align: bool,
     *,
     allow_missing_char_map: bool = False,
@@ -344,6 +372,7 @@ def run_prep_norm(
             cmap,
             opencc_mode,
             dry_run,
+            collapse_lines,
             emit_align,
         )  # 处理单个文件
         rows.append(row)
@@ -383,6 +412,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             "--glob",
             args.glob,
         ]
+        + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
         + (["--emit-align"] if args.emit_align else [])
         + (["--dry-run"] if args.dry_run else []),
     )
@@ -396,6 +426,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.opencc,
             args.glob,
             args.dry_run,
+            args.collapse_lines,
             args.emit_align,
         )
     except Exception as exc:
@@ -686,6 +717,38 @@ def _process_retake_item(
     return stem, item  # 返回 stem 及结果条目
 
 
+def _build_retake_stats_from_item(item: dict) -> RetakeStats:
+    """提炼单条 retake 结果中的关键统计。"""
+
+    stats = item.get("stats") or {}
+    total = int(
+        stats.get("total_lines")
+        or stats.get("total_sentences")
+        or stats.get("keep_span_count")
+        or 0
+    )
+    kept = int(
+        stats.get("matched_lines")
+        or stats.get("matched_sentences")
+        or stats.get("keep_span_count")
+        or 0
+    )
+    unaligned = int(stats.get("unmatched_lines") or stats.get("unmatched_sentences") or 0)
+    dedup_window = int(stats.get("len_gate_skipped", 0)) + int(stats.get("neighbor_gap_skipped", 0))
+    dedup_window += int(stats.get("max_window_splits", 0))
+    audio_duration = float(stats.get("audio_duration", 0.0))
+    keep_duration = float(stats.get("keep_duration", 0.0))
+    cut_seconds = max(0.0, audio_duration - keep_duration)
+    return RetakeStats(
+        stem=str(item.get("stem", "")),
+        total=total,
+        kept=kept,
+        unaligned=unaligned,
+        dedup_window=dedup_window,
+        cut_seconds=cut_seconds,
+    )
+
+
 def _run_retake_batch(
     materials_dir: Path,
     out_dir: Path,
@@ -953,6 +1016,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         summary = result["summary"]
         failed = summary.get("failed", 0)
     payload = {"items": items, "summary": summary}
+    retake_stats = [_build_retake_stats_from_item(item) for item in items]
+    payload["retake_stats"] = [asdict(stat) for stat in retake_stats]
     stat_keys = [
         "total_words",
         "total_lines",
@@ -1275,6 +1340,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         args.opencc,
         norm_pattern,
         dry_run=False,
+        collapse_lines=args.collapse_lines,
         emit_align=args.emit_align,
         allow_missing_char_map=True,
     )
@@ -1324,6 +1390,32 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     total_items = len(items)
     success_items = sum(1 for item in items if item.get("status") == "ok")
     stems = [item.get("stem", "") for item in items]
+    retake_stats_entries: list[RetakeStats] = []
+    for entry in retake_result.get("retake_stats", []):
+        try:
+            retake_stats_entries.append(RetakeStats(**entry))
+        except TypeError:
+            LOGGER.debug("跳过无法解析的 retake 统计: %s", entry)
+    stats_by_stem: dict[str, RetakeStats] = {
+        stat.stem: stat for stat in retake_stats_entries if stat.stem
+    }
+    for item in items:
+        stem = item.get("stem", "")
+        if stem and stem not in stats_by_stem:
+            stats_by_stem[stem] = _build_retake_stats_from_item(item)
+    ordered_stats: list[RetakeStats] = []
+    seen_stems: set[str] = set()
+    for stat in retake_stats_entries:
+        if stat.stem and stat.stem not in seen_stems:
+            ordered_stats.append(stat)
+            seen_stems.add(stat.stem)
+    for item in items:
+        stem = item.get("stem", "")
+        if stem and stem not in seen_stems:
+            fallback = stats_by_stem.get(stem)
+            if fallback:
+                ordered_stats.append(fallback)
+                seen_stems.add(stem)
 
     audio_patterns = [part.strip() for part in args.glob_audio.split(";") if part.strip()]
     audio_map = _collect_audio_map(input_dir, audio_patterns)
@@ -1333,13 +1425,28 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     render_payload: dict | None = None
     render_summary: dict[str, dict] = {}
     render_skipped_no_audio = False
+    render_error = ""
     if render_mode == "no":
         LOGGER.info("渲染阶段已禁用，跳过。")
+        render_payload = {
+            "items": [],
+            "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
+            "status": "skipped(manual)",
+        }
+        report["render_audio"] = render_payload
+        stage_summary["render_audio"] = render_payload["summary"]
     else:
         any_audio = any(audio_flags.values())
         if render_mode == "auto" and not any_audio:
             render_skipped_no_audio = True
             LOGGER.info("未发现任何音频文件，自动跳过渲染阶段。")
+            render_payload = {
+                "items": [],
+                "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
+                "status": "skipped(no-audio)",
+            }
+            report["render_audio"] = render_payload
+            stage_summary["render_audio"] = render_payload["summary"]
         else:
             LOGGER.info(_safe_text(f"开始渲染音频 → {out_dir}"))
             render_namespace = argparse.Namespace(
@@ -1365,55 +1472,33 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                 }
             report["render_audio"] = render_payload
             stage_summary["render_audio"] = render_payload.get("summary", {})
+            render_error = str(render_payload.get("error", ""))
             for entry in render_payload.get("items", []):
                 stem = _stem_from_edl_path(entry.get("edl", "")).lower()
                 render_summary[stem] = entry
 
+    pipeline_records: list[dict] = []
     for item in items:
         stem = item.get("stem", "")
-        stats = item.get("stats", {}) or {}
-        total_sentences = int(
-            stats.get("total_lines")
-            or stats.get("total_sentences")
-            or stats.get("keep_span_count", 0)
-        )
-        kept = int(
-            stats.get("matched_lines")
-            or stats.get("matched_sentences")
-            or stats.get("keep_span_count", 0)
-        )
-        unaligned = int(stats.get("unmatched_lines") or stats.get("unmatched_sentences") or 0)
-        duplicate_windows = int(stats.get("len_gate_skipped", 0)) + int(
-            stats.get("neighbor_gap_skipped", 0)
-        )
-        audio_duration = float(stats.get("audio_duration", 0.0))
-        keep_duration = float(stats.get("keep_duration", 0.0))
-        cut_seconds = max(0.0, audio_duration - keep_duration)
+        stats = stats_by_stem.get(stem) or _build_retake_stats_from_item(item)
         has_audio = audio_flags.get(stem.lower(), False)
-        render_note = "渲染=未启用"
-        if render_mode == "auto" and render_skipped_no_audio:
-            render_note = "渲染=无音频(跳过)"
-        elif render_mode in {"auto", "yes"}:
-            entry = render_summary.get(stem.lower())
-            if entry:
-                if entry.get("status") == "ok":
-                    render_note = "渲染=成功"
-                else:
-                    message = entry.get("message") or "渲染失败"
-                    render_note = _safe_text(f"渲染=失败({message})")
-            elif not has_audio and render_mode == "auto":
-                render_note = "渲染=无音频(跳过)"
-            elif not has_audio:
-                render_note = "渲染=无音频"
+        render_note = _resolve_render_status(
+            stem,
+            render_mode=render_mode,
+            has_audio=has_audio,
+            render_skipped_no_audio=render_skipped_no_audio,
+            render_summary=render_summary,
+            global_error=render_error,
+        )
         record = {
             "stem": stem,
             "status": item.get("status"),
             "message": item.get("message", ""),
-            "total": total_sentences,
-            "kept": kept,
-            "unaligned": unaligned,
-            "duplicates": duplicate_windows,
-            "cut": cut_seconds,
+            "total": stats.total,
+            "kept": stats.kept,
+            "unaligned": stats.unaligned,
+            "window": stats.dedup_window,
+            "cut": stats.cut_seconds,
             "render": render_note,
         }
         pipeline_records.append(record)
@@ -1424,7 +1509,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         "success_items": success_items,
         "elapsed_seconds": elapsed,
         "stages": stage_summary,
+        "records": pipeline_records,
     }
+    if ordered_stats:
+        report["summary"]["retake_stats"] = [asdict(stat) for stat in ordered_stats]
     write_json(report_path, report)
 
     LOGGER.info(_safe_text(f"处理结果：成功 {success_items}/{total_items}"))
@@ -1432,8 +1520,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         if record["status"] == "ok":
             LOGGER.info(
                 _safe_text(
-                    f"{record['stem']}: 保留{record['kept']}, 重复{record['duplicates']}, 未对齐{record['unaligned']}, "
-                    f"cut={record['cut']:.3f}s, {record['render']}"
+                    f"{record['stem']}: kept={record['kept']}, window={record['window']}, unaligned={record['unaligned']}, "
+                    f"cut={record['cut']:.3f}s, render={record['render']}"
                 )
             )
         else:
@@ -1462,6 +1550,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         str(Path(args.input_dir)),
         "--out",
         str(Path(args.output_dir)),
+        "--char-map",
+        str(Path(args.char_map)),
         "--opencc",
         args.opencc,
         "--glob-text",
@@ -1473,10 +1563,9 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-audio",
         args.glob_audio,
     ]
+    parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
     if not args.emit_align:
         parts.append("--no-emit-align")
-    if args.char_map != str(DEFAULT_CHAR_MAP):
-        parts.extend(["--char-map", str(Path(args.char_map))])
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
     if args.no_interaction:
@@ -1499,6 +1588,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "norm_glob": args.norm_glob,
         "glob_words": args.glob_words,
         "glob_audio": args.glob_audio,
+        "collapse_lines": args.collapse_lines,
         "render": args.render_mode,
         "workers": args.workers,
         "no_interaction": args.no_interaction,
@@ -1533,6 +1623,13 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--char-map", dest="char_map", default=str(DEFAULT_CHAR_MAP), help="字符映射配置 JSON")
     prep.add_argument("--opencc", choices=["none", "t2s", "s2t"], default="none", help="opencc 模式")
     prep.add_argument("--glob", default="*.txt", help="目录模式匹配 (默认 *.txt)")
+    prep.add_argument(
+        "--collapse-lines",
+        dest="collapse_lines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规范化时折叠换行并按句分行 (默认开启)",
+    )
     prep.add_argument(
         "--emit-align",
         action="store_true",
@@ -1687,7 +1784,10 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--channels", type=int, help="渲染声道数 (可选)")
     render.set_defaults(func=handle_render_audio)
 
-    pipeline = subparsers.add_parser("all-in-one", help="一键流水线：规范化 → 保留最后一遍 → 渲染音频")
+    pipeline = subparsers.add_parser(
+        "all-in-one",
+        help="一键流水线：规范化 → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）",
+    )
     pipeline.add_argument("--in", dest="input_dir", required=True, help="输入目录 (含 *.txt/*.json/音频)")
     pipeline.add_argument("--out", dest="output_dir", required=True, help="输出目录")
     pipeline.add_argument(
@@ -1696,6 +1796,13 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="规范化阶段是否产出 .align.txt (默认开启)",
+    )
+    pipeline.add_argument(
+        "--collapse-lines",
+        dest="collapse_lines",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规范化阶段是否折叠换行并按句输出 (默认开启)",
     )
     pipeline.add_argument(
         "--char-map",
@@ -1849,6 +1956,39 @@ def _iter_casefold_files(root: Path, patterns: Iterable[str]) -> list[Path]:
                 matched[path] = None
                 break
     return sorted(matched.keys())
+
+
+def _resolve_render_status(
+    stem: str,
+    *,
+    render_mode: str,
+    has_audio: bool,
+    render_skipped_no_audio: bool,
+    render_summary: dict[str, dict],
+    global_error: str,
+) -> str:
+    """根据渲染配置与执行结果推导最终状态字符串。"""
+
+    if render_mode == "no":
+        return "skipped(manual)"
+    stem_key = stem.lower()
+    if render_mode == "auto" and render_skipped_no_audio:
+        return "skipped(no-audio)"
+    entry = render_summary.get(stem_key)
+    if entry:
+        if entry.get("status") == "ok":
+            return "ok"
+        reason = entry.get("message") or entry.get("error") or "failed"
+        cleaned = " ".join(str(reason).split())
+        return f"failed:{cleaned}" if cleaned else "failed"
+    if global_error:
+        cleaned = " ".join(str(global_error).split())
+        return f"failed:{cleaned}" if cleaned else "failed"
+    if render_mode == "auto" and not has_audio:
+        return "skipped(no-audio)"
+    if not has_audio:
+        return "missing-audio"
+    return "skipped(no-edl)"
 
 
 def _collect_audio_map(base_dir: Path, patterns: Iterable[str]) -> dict[str, list[Path]]:

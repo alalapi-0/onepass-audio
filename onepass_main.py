@@ -140,7 +140,7 @@ def _prompt_processing_mode() -> str:
     """询问批处理模式。"""
 
     print_header("选择处理模式")
-    print_info("[1] 一键流水线：规范化 → 保留最后一遍 → 自动渲染（有音频才渲染）")
+    print_info("[1] 一键流水线：规范化 → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）")
     print_info("[2] 仅保留最后一遍（跳过规范化）")
     print_info("[3] 仅执行规范化")
     print_info("[4] 仅渲染音频（需要已有 EDL 与音频）")
@@ -168,6 +168,9 @@ def _run_all_in_one_cli(materials_dir: Path, out_dir: Path) -> None:
         "--out",
         str(out_dir),
         "--emit-align",
+        "--collapse-lines",
+        "--char-map",
+        str(char_map),
         "--opencc",
         "none",
         "--glob-text",
@@ -180,9 +183,7 @@ def _run_all_in_one_cli(materials_dir: Path, out_dir: Path) -> None:
         "*.wav;*.m4a;*.mp3;*.flac",
         "--no-interaction",
     ]
-    if char_map.exists():
-        cmd.extend(["--char-map", str(char_map)])
-    else:
+    if not char_map.exists():
         print_warning("未找到默认字符映射，将在流水线中跳过字符映射阶段。")
     print_info("等价 CLI：")
     print_info(shlex.join(cmd))

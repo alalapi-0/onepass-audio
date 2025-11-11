@@ -7,7 +7,7 @@ import shutil  # 检测可执行文件是否存在
 import subprocess  # 调用外部 opencc
 import unicodedata  # 进行 Unicode 归一化
 from pathlib import Path  # 使用 Path 处理路径
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 
 __all__ = [
     "load_char_map",
@@ -22,6 +22,8 @@ __all__ = [
     "prepare_alignment_text",
     "cjk_or_latin_seq",
     "build_char_index_map",
+    "sentence_lines_from_text",
+    "validate_sentence_lines",
 ]
 
 _ZERO_WIDTH_AND_CONTROL = {
@@ -259,6 +261,11 @@ def apply_char_map(s: str, cmap: dict) -> tuple[str, dict]:
 
 _SPACE_PATTERN = re.compile(r"[^\S\n]+")
 
+_SENTENCE_SPLIT_PATTERN = re.compile(r"([。！？!?；;…\.]+[”’」』》）】]?)(?=\s|$)")
+_LINE_BREAK_CLEAN_PATTERN = re.compile(r"[\n\t\u3000\xa0]+")
+_MULTI_SPACE_PATTERN = re.compile(r" {2,}")
+_ALLOWED_BOUNDARY_CHARS = set("。！？!?；;…．.」』”’》）】")
+
 
 def normalize_spaces(s: str) -> str:
     """归一空白字符为单空格，同时折叠空行。"""
@@ -328,6 +335,55 @@ def normalize_pipeline(
         stats["space_normalized_count"] = space_changes  # 写入空白统计
 
     return text, stats
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按照句末标点分句，包含尾随右引号与括号。"""
+
+    sentences: list[str] = []
+    last = 0
+    for match in _SENTENCE_SPLIT_PATTERN.finditer(text):
+        end = match.end()
+        chunk = text[last:end].strip()
+        if chunk:
+            sentences.append(chunk)
+        last = end
+    tail = text[last:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def sentence_lines_from_text(text: str, collapse_lines: bool = True) -> list[str]:
+    """根据需求生成按句分行的文本。"""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        return []
+    if collapse_lines:
+        compact = _LINE_BREAK_CLEAN_PATTERN.sub(" ", normalized)
+        compact = _MULTI_SPACE_PATTERN.sub(" ", compact).strip()
+        if not compact:
+            return []
+        sentences = _split_sentences(compact)
+        if sentences:
+            return sentences
+        return [compact]
+    return normalized.split("\n")
+
+
+def validate_sentence_lines(lines: Sequence[str]) -> None:
+    """确保句子行满足无制表符、无首尾空格等约束。"""
+
+    for line in lines:
+        if "\t" in line:
+            raise ValueError("检测到制表符，请检查规范化结果。")
+        if line != line.strip():
+            raise ValueError("句子行存在首尾空格，请检查规范化结果。")
+    joined = "\n".join(lines)
+    for match in re.finditer(r"(\S)\n(?=\S)", joined):
+        if match.group(1) not in _ALLOWED_BOUNDARY_CHARS:
+            raise ValueError("检测到疑似行内断句，请确认分句逻辑是否正确。")
 
 
 def run_opencc_if_available(s: str, mode: str) -> tuple[str, bool]:
