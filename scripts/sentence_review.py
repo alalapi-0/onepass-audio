@@ -119,15 +119,18 @@ def main(argv: list[str] | None = None) -> int:
     export_sentence_srt(result.hits, srt_path)
     export_sentence_txt(result.hits, txt_path)
     export_sentence_markers(result.hits, result.review_points, markers_path)
+    source_audio_name = Path(args.source_audio).name if args.source_audio else None
     export_sentence_edl_json(
         result.edl_keep_segments,
         result.audio_start,
         result.audio_end,
         edl_path,
         review_only=args.review_only,
-        source_audio_rel=args.source_audio,
+        source_audio_rel=source_audio_name,
         samplerate=args.samplerate,
         channels=args.channels,
+        stem=stem,
+        source_samplerate=args.samplerate,
     )
     stats = dict(result.stats)
     matched = stats.get("matched_sentences", 0)

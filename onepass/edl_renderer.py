@@ -37,10 +37,30 @@ class EDLDoc:
     segments: list[EDLSegment]
     samplerate: int | None = None
     channels: int | None = None
+    stem: str | None = None
+    version: int | None = None
+    source_samplerate: int | None = None
 
 
 _EPSILON = 1e-6  # 用于浮点比较的容差
 _AUDIO_SUFFIXES: tuple[str, ...] = (".wav", ".flac", ".m4a", ".aac", ".mp3", ".ogg", ".wma")
+
+
+def _derive_stem_from_path(edl_path: Path) -> str:
+    """根据 EDL 文件名推断素材 stem。"""
+
+    name = edl_path.name
+    if name.endswith(".edl.json"):
+        base = name[: -len(".edl.json")]
+    else:
+        base = edl_path.stem
+    if base.endswith(".edl"):
+        base = base[:-4]
+    for suffix in (".sentence", ".keepLast", ".keep"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base
 
 
 def _to_float(value: object, field: str) -> float:
@@ -114,8 +134,18 @@ def load_edl(edl_path: Path) -> EDLDoc:
     # 解析采样率与声道设置
     samplerate = data.get("samplerate") or data.get("sample_rate")
     samplerate_int = int(samplerate) if isinstance(samplerate, (int, float)) else None
+    source_samplerate = data.get("source_samplerate")
+    source_samplerate_int = (
+        int(source_samplerate) if isinstance(source_samplerate, (int, float)) else None
+    )
     channels = data.get("channels")
     channels_int = int(channels) if isinstance(channels, (int, float)) else None
+    version = data.get("version")
+    version_int = int(version) if isinstance(version, (int, float)) else None
+    stem_field = data.get("stem")
+    stem_value = stem_field.strip() if isinstance(stem_field, str) else ""
+    if not stem_value:
+        stem_value = _derive_stem_from_path(edl_path)
 
     raw_segments = data.get("segments")  # 尝试读取新式片段列表
     if not isinstance(raw_segments, list):  # 当缺失时兼容旧式 actions
@@ -153,48 +183,69 @@ def load_edl(edl_path: Path) -> EDLDoc:
         segments=segments,
         samplerate=samplerate_int,
         channels=channels_int,
+        stem=stem_value,
+        version=version_int,
+        source_samplerate=source_samplerate_int,
     )
+
+
+def _scan_audio_root(audio_root: Path, *, name_hint: str, stem_hint: str) -> list[Path]:
+    """在音频根目录内按文件名或 stem 查找候选音频。"""
+
+    if not audio_root.exists():
+        return []
+    name_lower = name_hint.lower()
+    stem_lower = stem_hint.lower()
+    direct_hits: list[Path] = []
+    stem_hits: list[Path] = []
+    for path in audio_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in _AUDIO_SUFFIXES:
+            continue
+        lower_name = path.name.lower()
+        if name_lower and lower_name == name_lower:
+            direct_hits.append(path.resolve())
+            continue
+        if stem_lower and path.stem.lower() == stem_lower:
+            stem_hits.append(path.resolve())
+    return direct_hits or stem_hits
 
 
 def resolve_source_audio(edl: EDLDoc, edl_path: Path, audio_root: Path) -> Path:
     """根据 EDL 描述解析源音频的实际路径。"""
 
-    raw_path = Path(edl.source_audio.strip()) if edl.source_audio else Path()
-    candidates: list[Path] = []  # 准备候选路径集合
+    raw_value = edl.source_audio.strip() if edl.source_audio else ""
+    raw_path = Path(raw_value) if raw_value else Path()
+    candidates: list[Path] = []
 
-    if raw_path.is_absolute():  # 若 EDL 已提供绝对路径
-        candidates.append(raw_path)
-    elif raw_path and raw_path.parts:  # 处理相对路径
-        search_bases = [audio_root, edl_path.parent, audio_root.parent]
+    if raw_path and raw_path.is_absolute():
+        candidates.append(raw_path.expanduser().resolve())
+    elif raw_path:
+        bases = [audio_root, edl_path.parent]
         seen: set[Path] = set()
-        for base in search_bases:  # 遍历搜索基准目录
+        for base in bases:
             if not base:
                 continue
-            try:
-                base_resolved = base.resolve()
-            except FileNotFoundError:
-                base_resolved = base
-            if base_resolved in seen:
+            resolved_base = base.expanduser().resolve()
+            if resolved_base in seen:
                 continue
-            seen.add(base_resolved)
-            candidates.append((base_resolved / raw_path).resolve())
-    else:  # 当缺少路径信息时回退为空候选
-        candidates = []
+            seen.add(resolved_base)
+            candidates.append((resolved_base / raw_path).resolve())
 
-    for candidate in candidates:  # 检查候选是否存在
+    for candidate in candidates:
         if candidate.exists():
             return candidate
 
-    if raw_path and not raw_path.suffix and audio_root.exists():  # 根据文件名前缀扫描
-        matches: list[Path] = []
-        for suffix in _AUDIO_SUFFIXES:
-            matches.extend(audio_root.rglob(f"{raw_path.name}{suffix}"))
-        if matches:
-            return matches[0].resolve()
+    stem_hint = edl.stem or _derive_stem_from_path(edl_path)
+    name_hint = raw_path.name if raw_path.name else ""
+    matches = _scan_audio_root(audio_root.expanduser().resolve(), name_hint=name_hint, stem_hint=stem_hint)
+    if matches:
+        return matches[0]
 
+    details = f"source_audio={raw_value or '(空)'} stem={stem_hint or '-'}"
     raise FileNotFoundError(
-        "无法定位源音频。请确认 EDL 中的 source_audio 字段填写正确，"
-        "或在命令行中调整 --audio-root 指向包含音频的目录。"
+        f"无法定位源音频（{details}）。请确认 EDL 中的 source_audio 字段填写正确，或在命令行中调整 --audio-root 指向包含音频的目录。"
     )
 
 

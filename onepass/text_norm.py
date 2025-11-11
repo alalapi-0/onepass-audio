@@ -39,6 +39,7 @@ __all__ = [
     "run_opencc_if_available",
     "scan_suspects",
     "normalize_for_align",
+    "normalize_for_alignment",
     "prepare_alignment_text",
     "cjk_or_latin_seq",
     "build_char_index_map",
@@ -684,6 +685,28 @@ def scan_suspects(s: str, max_examples: int = 8) -> dict:
     }
 
 
+_ALIGNMENT_CJK_RANGE = _CJK_EXTENDED_RANGE
+_ALIGNMENT_ASCII_RANGE = "A-Za-z0-9"
+_RE_ALIGN_CJK_STRICT_SPACE = re.compile(
+    rf"(?<=[{_ALIGNMENT_CJK_RANGE}])\s+(?=[{_ALIGNMENT_CJK_RANGE}])"
+)
+_RE_ALIGN_CJK_ASCII_SPACE = re.compile(
+    rf"(?<=[{_ALIGNMENT_CJK_RANGE}])\s+(?=[{_ALIGNMENT_ASCII_RANGE}])"
+)
+_RE_ALIGN_ASCII_CJK_SPACE = re.compile(
+    rf"(?<=[{_ALIGNMENT_ASCII_RANGE}])\s+(?=[{_ALIGNMENT_CJK_RANGE}])"
+)
+_RE_ALIGN_CJK_ASCII_COMPACT = re.compile(
+    rf"([{_ALIGNMENT_CJK_RANGE}])([{_ALIGNMENT_ASCII_RANGE}])"
+)
+_RE_ALIGN_ASCII_CJK_COMPACT = re.compile(
+    rf"([{_ALIGNMENT_ASCII_RANGE}])([{_ALIGNMENT_CJK_RANGE}])"
+)
+_RE_ALIGN_ASCII_WORD_SPACE = re.compile(
+    rf"([{_ALIGNMENT_ASCII_RANGE}])\s+([{_ALIGNMENT_ASCII_RANGE}])"
+)
+
+
 def normalize_for_align(text: str) -> str:
     """规范化文本以便做粗对齐。"""
 
@@ -696,26 +719,45 @@ def normalize_for_align(text: str) -> str:
     return text.strip()  # 去掉首尾空白后返回
 
 
+def normalize_for_alignment(text: str, keep_ascii_word_spaces: bool = True) -> str:
+    """生成用于词级对齐的单行文本。"""
+
+    if not text:
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\t", " ")
+    normalized = re.sub(r"\s+", " ", normalized)
+
+    base = normalize_for_align(normalized)
+    if not base:
+        return ""
+
+    compacted = _RE_ALIGN_CJK_STRICT_SPACE.sub("", base)
+    compacted = _RE_ALIGN_CJK_ASCII_SPACE.sub("", compacted)
+    compacted = _RE_ALIGN_ASCII_CJK_SPACE.sub("", compacted)
+    compacted = _RE_ALIGN_CJK_ASCII_COMPACT.sub(r"\1 \2", compacted)
+    compacted = _RE_ALIGN_ASCII_CJK_COMPACT.sub(r"\1 \2", compacted)
+
+    if not keep_ascii_word_spaces:
+        compacted = _RE_ALIGN_ASCII_WORD_SPACE.sub(r"\1\2", compacted)
+
+    compacted = re.sub(r"\s+", " ", compacted)
+    return compacted.strip()
+
+
 def prepare_alignment_text(text: str, collapse_lines: bool = False) -> str:
     """将规范化文本进一步转换为词级对齐友好的纯文本。"""
 
     normalised_newlines = text.replace("\r\n", "\n").replace("\r", "\n")
-    align_lines: list[str] = []
     if collapse_lines:
-        source_lines = collapse_and_resplit(normalised_newlines)
-    else:
-        source_lines = normalised_newlines.split("\n")
+        return normalize_for_alignment(normalised_newlines)
 
-    for line in source_lines:
-        cleaned = normalize_for_align(line)
-        if collapse_lines:
-            if cleaned:
-                align_lines.append(cleaned)
-        else:
-            align_lines.append(cleaned if cleaned else "")
+    align_lines: list[str] = []
+    for line in normalised_newlines.split("\n"):
+        align_lines.append(normalize_for_alignment(line))
 
-    joined = "\n".join(align_lines).rstrip("\n")
-    return joined + "\n" if joined else ""
+    return "\n".join(align_lines)
 
 
 def _remove_spaces(text: str) -> str:
