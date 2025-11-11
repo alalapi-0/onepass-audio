@@ -41,7 +41,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from onepass.text_norm import merge_hard_wraps
+from onepass.text_norm import merge_hard_wraps, sentence_lines_from_text, validate_sentence_lines
 
 # ========== 可选依赖：OpenCC ==========
 _OPENCC = None
@@ -254,6 +254,7 @@ def apply_output_policies(text: str, *, options: Dict[str, object]) -> str:
     collapse_space = bool(options.get("collapse_space", True))
     ascii_gap = bool(options.get("ascii_gap", True))
     strip_punct = str(options.get("strip_punct", "none"))
+    collapse_lines_opt = bool(options.get("collapse_lines", True))
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u2028", "\n").replace("\u2029", "\n")
@@ -274,6 +275,14 @@ def apply_output_policies(text: str, *, options: Dict[str, object]) -> str:
 
     if collapse_space:
         processed = _WS_RE.sub(" ", processed)
+
+    if collapse_lines_opt:
+        lines = sentence_lines_from_text(processed, collapse_lines=True)
+        if lines:
+            validate_sentence_lines(lines)
+        processed = "\n".join(lines)
+    else:
+        processed = "\n".join(sentence_lines_from_text(processed, collapse_lines=False))
 
     return processed.strip()
 
@@ -406,6 +415,10 @@ def main() -> None:
                     help="去掉所有换行（默认开启，可用 --no-strip-newlines 覆盖）")
     ap.add_argument("--no-strip-newlines", dest="strip_newlines", action="store_false",
                     help="保留换行（覆盖 --strip-newlines）")
+    ap.add_argument("--collapse-lines", dest="collapse_lines", action="store_true", default=None,
+                    help="合并换行/制表符为单空格后再按句分行（默认开启，可用 --no-collapse-lines 覆盖）")
+    ap.add_argument("--no-collapse-lines", dest="collapse_lines", action="store_false",
+                    help="保留原始换行结构（覆盖 --collapse-lines）")
     ap.add_argument("--collapse-space", dest="collapse_space", action="store_true", default=None,
                     help="合并重复空白为单空格（默认开启，可用 --no-collapse-space 覆盖）")
     ap.add_argument("--no-collapse-space", dest="collapse_space", action="store_false",
@@ -449,6 +462,7 @@ def main() -> None:
         "ascii_gap": _bool_or_default(args.ascii_gap, True),
         "dash_policy": args.dash_policy,
         "strip_punct": args.strip_punct,
+        "collapse_lines": _bool_or_default(args.collapse_lines, True),
     }
     if args.profile == "asr":
         asr_options = {
@@ -457,6 +471,7 @@ def main() -> None:
             "ascii_gap": True,
             "dash_policy": "remove",
             "strip_punct": args.strip_punct_mode,
+            "collapse_lines": True,
         } if emit_asr else None
     else:
         asr_options = norm_options.copy() if emit_asr else None
