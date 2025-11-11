@@ -10,11 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+from . import text_norm as _legacy_text_norm
+
 # 重新导出旧版 API 依赖的符号，保持向后兼容。
 __all__ = [
     "Sentence",
     "split_sentences",
     "normalize_sentence",
+    "normalize_for_align",
     "tokenize_for_match",
     "TextNormConfig",
     "DEFAULT_COMPAT_MAP",
@@ -81,6 +84,12 @@ def tokenize_for_match(text: str) -> List[str]:
     if pending_ascii:
         tokens.append("".join(pending_ascii))
     return tokens
+
+
+def normalize_for_align(text: str) -> str:
+    """兼容旧版对齐逻辑的文本规范化包装。"""
+
+    return _legacy_text_norm.normalize_for_align(text)
 
 
 @dataclass(slots=True)
