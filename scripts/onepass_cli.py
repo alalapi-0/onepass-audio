@@ -1758,8 +1758,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
 
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
 def _safe_text(payload: str) -> str:
     """确保字符串在 UTF-8 环境下安全输出。"""
 
@@ -1871,5 +1869,9 @@ def _stem_from_edl_path(edl_path: str) -> str:
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return Path(name).stem
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
 
 
