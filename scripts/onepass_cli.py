@@ -307,9 +307,11 @@ def _process_single_text(
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
-        payload = converted_text
+        payload = converted_text.replace("\r\n", "\n").replace("\r", "\n")
+        payload = payload.replace("\t", " ")
         try:
-            out_path.write_text(payload, encoding="utf-8")  # 写入规范化文本
+            with out_path.open("w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
         except OSError as exc:
             return {
                 "file": str(path),
@@ -330,6 +332,8 @@ def _process_single_text(
         if emit_align:
             align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
             if collapse_lines and align_payload:
+                if "\n" in align_payload:
+                    raise ValueError("对齐文本在 collapse-lines 模式下不应包含换行。")
                 if "\r" in align_payload:
                     raise ValueError("对齐文本包含回车符，请检查折行规则。")
                 if "\t" in align_payload:
@@ -339,7 +343,8 @@ def _process_single_text(
                         raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
             try:
-                align_path.write_text(align_payload, encoding="utf-8")
+                with align_path.open("w", encoding="utf-8", newline="\n") as handle:
+                    handle.write(align_payload)
                 align_written = True
             except OSError as exc:
                 LOGGER.warning("写入对齐文本失败: %s", exc)
@@ -502,7 +507,7 @@ def _export_retake_outputs(
     result,
     stem: str,
     out_dir: Path,
-    source_audio: Optional[str],
+    source_audio_name: Optional[str],
     samplerate: Optional[int],
     channels: Optional[int],
     *,
@@ -526,9 +531,10 @@ def _export_retake_outputs(
             result.audio_end,
             edl_path,
             review_only=review_only,
-            source_audio_rel=source_audio,
+            source_audio_rel=source_audio_name,
             samplerate=samplerate,
             channels=channels,
+            stem=stem,
         )
     else:
         srt_path = out_dir / f"{stem}.keepLast.srt"
@@ -544,10 +550,12 @@ def _export_retake_outputs(
         )
         export_edl_json(
             result.edl_keep_segments,
-            source_audio,
+            source_audio_name,
             edl_path,
+            stem=stem,
             samplerate=samplerate,
             channels=channels,
+            source_samplerate=samplerate,
         )
     return {
         "srt": srt_path,
@@ -561,7 +569,7 @@ def _process_retake_item(
     words_path: Path,
     text_path: Path,
     out_dir: Path,
-    source_audio: Optional[str],
+    source_audio_path: Optional[Path],
     samplerate: Optional[int],
     channels: Optional[int],
     materials_base: Optional[Path],
@@ -598,11 +606,17 @@ def _process_retake_item(
         doc = load_words(words_path)  # 读取词级 JSON
         words = list(doc)
         audio_path: Path | None = None
-        if source_audio:
-            candidate = Path(source_audio)
+        source_audio_name: str | None = None
+        if source_audio_path is not None:
+            candidate = source_audio_path
             if not candidate.is_absolute():
-                candidate = (words_path.parent / candidate).resolve()
-            audio_path = candidate
+                base_dir = materials_base or words_path.parent
+                candidate = (base_dir / candidate).expanduser().resolve()
+            else:
+                candidate = candidate.expanduser().resolve()
+            source_audio_name = candidate.name
+            if candidate.exists():
+                audio_path = candidate
         silence_ranges: list[tuple[float, float]] | None = None
         if pause_align and silence_probe_enabled and audio_path is not None:
             silence_ranges = probe_silence_ffmpeg(audio_path, noise_db=noise_db, min_d=silence_min_d)
@@ -734,6 +748,13 @@ def _process_retake_item(
                 )
                 stats = dict(result.stats)
                 cut_ratio = float(stats.get("cut_ratio", 0.0))
+                LOGGER.info(
+                    "自动调参后参数: min_sent=%s line_gap=%.2f sentence_gap=%.2f pause_gap=%.2f",
+                    current_min_sent,
+                    current_line_gap,
+                    current_sentence_gap,
+                    current_pause_gap,
+                )
             elif action == "abort":
                 raise RuntimeError(
                     f"剪切比例 {cut_ratio:.2%} 超过阈值 {overcut_threshold:.2%}，已根据设置中止。"
@@ -742,6 +763,9 @@ def _process_retake_item(
         stats["review_only"] = bool(review_only)
         stats["sentence_strict"] = bool(sentence_strict)
         stats["pause_gap_final"] = current_pause_gap
+        stats["min_sent_final"] = current_min_sent
+        stats["line_gap_final"] = current_line_gap
+        stats["sentence_gap_final"] = current_sentence_gap
 
         if sentence_strict:
             outputs = _export_retake_outputs(
@@ -759,7 +783,7 @@ def _process_retake_item(
                 result,
                 stem,
                 out_dir,
-                source_audio,
+                source_audio_name,
                 samplerate,
                 channels,
                 sentence_mode=False,
@@ -782,6 +806,8 @@ def _process_retake_item(
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
         if result.fallback_used:
             stats["fallback_message"] = result.fallback_reason or "keep_full_audio"
+        if source_audio_name:
+            stats["source_audio_name"] = source_audio_name
         item = {
             "stem": stem,
             "words_json": safe_rel(materials_base or words_path.parent, words_path),
@@ -1054,11 +1080,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             raise ValueError("单文件模式需要同时提供 --text")
         LOGGER.info("[stage] retake start total=1")
         single_start = time.perf_counter()
+        source_audio_path = Path(args.source_audio).expanduser() if args.source_audio else None
         _, item = _process_retake_item(
             Path(args.words_json),
             Path(args.text),
             out_dir,
-            args.source_audio,
+            source_audio_path,
             args.samplerate,
             args.channels,
             None,
@@ -1280,7 +1307,22 @@ def _process_render_item(
 
     try:
         edl = load_edl(edl_path)  # 读取 EDL JSON
+        stem_hint = edl.stem or _stem_from_edl_path(str(edl_path))
+        source_hint = edl.source_audio or ""
+        LOGGER.info(
+            "[render] resolve audio: stem=%s source_audio=%s audio_root=%s",
+            stem_hint,
+            source_hint,
+            audio_root,
+        )
         source_audio = resolve_source_audio(edl, edl_path, audio_root)  # 定位源音频
+        LOGGER.info(
+            "[render] resolve audio: stem=%s source_audio=%s audio_root=%s resolved=%s",
+            stem_hint,
+            source_hint,
+            audio_root,
+            source_audio,
+        )
         duration = probe_duration(source_audio)  # 探测音频时长
         keeps = normalize_segments(edl.segments, duration)  # 归一化保留片段
         actual_samplerate = samplerate or edl.samplerate  # 采样率优先使用命令行
@@ -1557,7 +1599,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             words_path,
             text_path,
             out_dir,
-            None,
+            kit.audio,
             None,
             None,
             input_dir,
@@ -1667,7 +1709,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         any_audio = any(audio_flags.get(stem.lower(), False) for stem in stems)
         if render_mode == "auto" and not any_audio:
             render_skipped_no_audio = True
-            LOGGER.info("未检测到音频，已跳过渲染，但已生成对齐产物。")
+            LOGGER.info("未发现音频文件，已跳过渲染，仅导出标记/字幕产物。")
             render_payload = {
                 "items": [],
                 "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},

@@ -701,20 +701,19 @@ def compute_retake_keep_last(
                     LOGGER.debug("窗口匹配无法映射到词区间: %s", window_match.match_range)
             else:
                 unmatched += 1
-                if len(mismatch_samples) < 2:
-                    mismatch_samples.append(
-                        {
-                            "line_no": index,
-                            "text": _preview_text(line, 120),
-                            "text_view": _preview_text(units, 120),
-                            "words_view": _preview_text(window_match.alt_text, 120),
-                        }
-                    )
+                if len(mismatch_samples) < 3:
+                    sample = {
+                        "line_no": index,
+                        "text": _preview_text(line, 120),
+                        "text_view": _preview_text(units, 120),
+                        "words_view": _preview_text(window_match.alt_text, 120),
+                    }
+                    mismatch_samples.append(sample)
                     LOGGER.warning(
                         "[unmatched] line=%s text=%s | words=%s",
                         index,
-                        mismatch_samples[-1]["text_view"],
-                        mismatch_samples[-1]["words_view"] or "-",
+                        sample["text_view"],
+                        sample["words_view"] or "-",
                     )
                 continue
         if not spans:  # 若没有任何命中
@@ -790,6 +789,15 @@ def compute_retake_keep_last(
         "mismatch_examples": mismatch_samples,
     }
     stats.update(refine_stats)
+    if unmatched >= 3 and mismatch_samples:
+        preview = "; ".join(
+            f"L{sample['line_no']}: {sample['text']}" for sample in mismatch_samples
+        )
+        LOGGER.warning(
+            "检测到 %s 行未匹配。示例: %s。可尝试调整字符映射/同音合并或放宽匹配阈值。",
+            unmatched,
+            preview,
+        )
     keep_duration = stats["keep_duration"]
     if audio_duration > 0:
         stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
@@ -1100,8 +1108,11 @@ def export_edl_json(
     edl_keep_segments: list[tuple[float, float]],
     source_audio_rel: str | None,
     out_path: Path,
+    *,
+    stem: str,
     samplerate: int | None = None,
     channels: int | None = None,
+    source_samplerate: int | None = None,
 ) -> Path:
     """导出仅包含 keep 动作的 EDL JSON。"""
 
@@ -1109,11 +1120,20 @@ def export_edl_json(
         {"start": start, "end": end, "t0": start, "t1": end, "action": "keep"}
         for start, end in edl_keep_segments
     ]
-    payload = {  # 组装完整的 EDL 结构
-        "source_audio": source_audio_rel,
+    audio_name = Path(source_audio_rel).name if source_audio_rel else ""
+    actions = [
+        {"t0": start, "t1": end, "keep": True}
+        for start, end in edl_keep_segments
+    ]
+    payload = {
+        "version": 1,
+        "stem": stem,
+        "source_audio": audio_name,
+        "source_samplerate": source_samplerate,
         "samplerate": samplerate,
         "channels": channels,
         "segments": segments,
+        "actions": actions,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
     content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"  # 序列化 JSON
@@ -1203,6 +1223,8 @@ def export_sentence_edl_json(
     source_audio_rel: str | None = None,
     samplerate: int | None = None,
     channels: int | None = None,
+    stem: str,
+    source_samplerate: int | None = None,
 ) -> Path:
     """根据句子级命中导出专用 EDL JSON。"""
 
@@ -1214,8 +1236,12 @@ def export_sentence_edl_json(
             {"start": start, "end": end, "action": "keep"}
             for start, end in keep_segments
         ]
+    audio_name = Path(source_audio_rel).name if source_audio_rel else ""
     payload = {
-        "source_audio": source_audio_rel,
+        "version": 1,
+        "stem": stem,
+        "source_audio": audio_name,
+        "source_samplerate": source_samplerate,
         "samplerate": samplerate,
         "channels": channels,
         "segments": segments,

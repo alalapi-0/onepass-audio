@@ -100,12 +100,15 @@ def main(argv: list[str] | None = None) -> int:
         markers_path,
         note=result.fallback_marker_note if result.fallback_used else None,
     )
+    source_audio_name = Path(args.source_audio).name if args.source_audio else None
     export_edl_json(
         result.edl_keep_segments,
-        args.source_audio,
+        source_audio_name,
         edl_path,
+        stem=stem,
         samplerate=args.samplerate,
         channels=args.channels,
+        source_samplerate=args.samplerate,
     )
 
     stats = result.stats
