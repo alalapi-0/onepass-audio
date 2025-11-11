@@ -24,6 +24,7 @@ __all__ = [
     "build_char_index_map",
     "sentence_lines_from_text",
     "validate_sentence_lines",
+    "normalize_chinese_text",
 ]
 
 _ZERO_WIDTH_AND_CONTROL = {
@@ -55,6 +56,27 @@ _OTHER_PUNCT = {
     for ch in "`~!@#$%^&*()-_=+[]{}\\|;:'\",<.>/?"
 }
 _OTHER_PUNCT.update({ord(ch) for ch in "·、—…【】（）〈〉《》「」『』“”’‘`"})
+
+_CJK_CHAR_CLASS = "\u4e00-\u9fff"
+_CJK_PUNCT_CHARS = "，。！？；：、“”‘’（）《》〈〉『』【】〔〕—…·"
+_FULLWIDTH_SPACE = "\u3000"
+
+_RE_MULTISPACE = re.compile(r"[ \t]+")
+_RE_CJK_GAPS = re.compile(rf"(?<=[{_CJK_CHAR_CLASS}])\s+(?=[{_CJK_CHAR_CLASS}])")
+_RE_CJK_PUNCT_LEFT = re.compile(rf"\s+(?=[{_CJK_PUNCT_CHARS}])")
+_RE_CJK_PUNCT_RIGHT = re.compile(rf"(?<=[{_CJK_PUNCT_CHARS}])\s+")
+_RE_LATIN_GAPS_LEFT = re.compile(rf"([{_CJK_CHAR_CLASS}])\s{{2,}}([0-9A-Za-z])")
+_RE_LATIN_GAPS_RIGHT = re.compile(rf"([0-9A-Za-z])\s{{2,}}([{_CJK_CHAR_CLASS}])")
+_RE_PAREN_INNER_LEFT = re.compile(r"（\s+")
+_RE_PAREN_INNER_RIGHT = re.compile(r"\s+）")
+_RE_PAREN_OUTER_LEFT = re.compile(rf"(?<=[{_CJK_CHAR_CLASS}])\s+（")
+_RE_PAREN_OUTER_RIGHT = re.compile(rf"）\s+(?=[{_CJK_CHAR_CLASS}])")
+_RE_ELLIPSIS = re.compile(r"。{2,}")
+_RE_FULLWIDTH_DOT_ELLIPSIS = re.compile(r"．{2,}")
+_RE_ASCII_DOT_ELLIPSIS = re.compile(r"\.{6,}")
+_RE_DASH_VARIANTS = re.compile(r"\s*(?:—|-){2,}\s*")
+_RE_EM_DASH_SPACES = re.compile(r"\s*——\s*")
+_RE_ELLIPSIS_SPACES = re.compile(r"\s*……\s*")
 
 _REMOVE_ZERO_WIDTH = {code: None for code in _ZERO_WIDTH_AND_CONTROL}
 _REMOVE_OTHER_PUNCT = {code: None for code in _OTHER_PUNCT}
@@ -161,6 +183,49 @@ def merge_hard_wraps(raw: str) -> str:
         "examples": merged_examples,
     }  # type: ignore[attr-defined]
     return result
+
+
+def normalize_chinese_text(text: str, *, collapse_lines: bool = True) -> str:
+    """针对中文文本执行空白与标点修正，支持可选折叠换行。"""
+
+    if not text:
+        return ""
+
+    normalized = (
+        text.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u2028", "\n")
+        .replace("\u2029", "\n")
+        .replace("\t", " ")
+    )
+    normalized = normalized.replace(_FULLWIDTH_SPACE, " ")
+    normalized = normalized.replace("\xa0", " ")
+    normalized = _RE_MULTISPACE.sub(" ", normalized)
+    normalized = _RE_CJK_GAPS.sub("", normalized)
+    normalized = _RE_CJK_PUNCT_LEFT.sub("", normalized)
+    normalized = _RE_CJK_PUNCT_RIGHT.sub("", normalized)
+    normalized = _RE_PAREN_INNER_LEFT.sub("（", normalized)
+    normalized = _RE_PAREN_INNER_RIGHT.sub("）", normalized)
+    normalized = _RE_PAREN_OUTER_LEFT.sub("（", normalized)
+    normalized = _RE_PAREN_OUTER_RIGHT.sub("）", normalized)
+    normalized = _RE_DASH_VARIANTS.sub("——", normalized)
+    normalized = _RE_EM_DASH_SPACES.sub("——", normalized)
+    normalized = _RE_ELLIPSIS.sub("……", normalized)
+    normalized = _RE_FULLWIDTH_DOT_ELLIPSIS.sub("……", normalized)
+    normalized = _RE_ASCII_DOT_ELLIPSIS.sub("……", normalized)
+    normalized = _RE_ELLIPSIS_SPACES.sub("……", normalized)
+    normalized = _RE_LATIN_GAPS_LEFT.sub(r"\1 \2", normalized)
+    normalized = _RE_LATIN_GAPS_RIGHT.sub(r"\1 \2", normalized)
+    normalized = _RE_MULTISPACE.sub(" ", normalized)
+
+    if collapse_lines:
+        normalized = normalized.replace("\n", "")
+    else:
+        normalized = "\n".join(part.strip() for part in normalized.splitlines())
+
+    normalized = normalized.replace("\t", "")
+    normalized = normalized.strip()
+    return normalized
 
 
 def load_char_map(path: Path) -> dict:

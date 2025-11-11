@@ -41,7 +41,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from onepass.text_norm import merge_hard_wraps, sentence_lines_from_text, validate_sentence_lines
+from onepass.text_norm import (
+    merge_hard_wraps,
+    normalize_chinese_text,
+    sentence_lines_from_text,
+    validate_sentence_lines,
+)
 
 # ========== 可选依赖：OpenCC ==========
 _OPENCC = None
@@ -325,10 +330,14 @@ def process_text(
         text, ok = run_opencc(text, args.opencc)
         stats["opencc_applied"] = ok
 
+    collapse_lines_flag = bool(norm_options.get("collapse_lines", True))
     norm_text = apply_output_policies(text, options=norm_options)
+    norm_text = normalize_chinese_text(norm_text, collapse_lines=collapse_lines_flag)
     asr_text: Optional[str] = None
     if asr_options is not None:
         asr_text = apply_output_policies(text, options=asr_options)
+        asr_collapse_flag = bool(asr_options.get("collapse_lines", True))
+        asr_text = normalize_chinese_text(asr_text, collapse_lines=asr_collapse_flag)
 
     return norm_text, asr_text, stats
 

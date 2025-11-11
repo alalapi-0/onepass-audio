@@ -1,13 +1,14 @@
 """保留最后一遍的核心策略与导出工具。"""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Sequence
 import csv
 import json
 import math
 import subprocess
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
 
 from .asr_loader import Word
 from .sent_align import (
@@ -855,10 +856,21 @@ def export_txt(keeps: list[KeepSpan], out_path: Path) -> Path:
     return out_path  # 返回输出路径
 
 
+def _format_marker_seconds(value: float) -> str:
+    return f"{max(0.0, value):.3f}"
+
+
+def _clean_marker_text(text: str, limit: int = 48) -> str:
+    sanitized = re.sub(r"\s+", " ", text).strip()
+    if len(sanitized) <= limit:
+        return sanitized
+    return sanitized[: limit - 1] + "…"
+
+
 def export_audition_markers(keeps: list[KeepSpan], out_path: Path) -> Path:
     """导出 Adobe Audition 标记 CSV。"""
 
-    from .markers import ensure_csv_header, seconds_to_hmsms  # 局部导入避免循环
+    from .markers import ensure_csv_header  # 局部导入避免循环
 
     header = ["Name", "Start", "Duration", "Type", "Description"]
     out_path.parent.mkdir(parents=True, exist_ok=True)  # 确保目录存在
@@ -867,12 +879,12 @@ def export_audition_markers(keeps: list[KeepSpan], out_path: Path) -> Path:
         writer.writerow(header)  # 写入表头
         for span in keeps:  # 遍历所有保留段
             duration = max(0.0, span.end - span.start)  # 计算持续时间，确保非负
-            description = span.text[:24]  # 截取描述预览
+            description = f"[keep] {_clean_marker_text(span.text)}".strip()
             writer.writerow(
                 [
                     f"L{span.line_no}",
-                    seconds_to_hmsms(span.start),
-                    seconds_to_hmsms(duration),
+                    _format_marker_seconds(span.start),
+                    _format_marker_seconds(duration),
                     "cue",
                     description,
                 ]
@@ -938,7 +950,7 @@ def export_sentence_markers(
 ) -> Path:
     """导出句子级命中与审阅点的 Audition 标记。"""
 
-    from .markers import ensure_csv_header, seconds_to_hmsms
+    from .markers import ensure_csv_header
 
     header = ["Name", "Start", "Duration", "Type", "Description"]
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -947,18 +959,19 @@ def export_sentence_markers(
         writer.writerow(header)
         for hit in sorted(hits, key=lambda item: (item.start_time, item.end_time)):
             duration = max(0.0, hit.end_time - hit.start_time)
+            description = f"[keep] {_clean_marker_text(hit.sent_text, 64)}".strip()
             writer.writerow(
                 [
                     f"L{hit.sent_idx}",
-                    seconds_to_hmsms(hit.start_time),
-                    seconds_to_hmsms(duration),
+                    _format_marker_seconds(hit.start_time),
+                    _format_marker_seconds(duration),
                     "cue",
-                    hit.sent_text[:48],
+                    description,
                 ]
             )
         for point in review_points:
-            description_prefix = "[LOW]" if point.kind == "low_conf" else "[REVIEW]"
-            description = f"{description_prefix} {point.sent_text[:48]}".strip()
+            label = "[review-low]" if point.kind == "low_conf" else "[review]"
+            description = f"{label} {_clean_marker_text(point.sent_text, 64)}".strip()
             start_time = point.at_time if point.at_time is not None else point.start_time or 0.0
             duration = max(
                 0.0,
@@ -967,8 +980,8 @@ def export_sentence_markers(
             writer.writerow(
                 [
                     f"R{point.sent_idx}",
-                    seconds_to_hmsms(start_time or 0.0),
-                    seconds_to_hmsms(duration),
+                    _format_marker_seconds(start_time or 0.0),
+                    _format_marker_seconds(duration),
                     "cue",
                     description,
                 ]
