@@ -314,6 +314,8 @@ def _process_single_text(
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
         payload = payload_text
+        if payload and not payload.endswith("\n"):
+            payload = payload + "\n"
         try:
             with out_path.open("w", encoding="utf-8", newline="\n") as handle:
                 handle.write(payload)
@@ -593,6 +595,12 @@ def _process_retake_item(
     review_only: bool,
     merge_adj_gap_sec: float,
     low_conf: float,
+    fast_match: bool,
+    max_windows: int,
+    match_timeout: float,
+    max_distance_ratio: float,
+    min_anchor_ngram: int,
+    fallback_policy: str,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -679,6 +687,12 @@ def _process_retake_item(
                 silence_ranges=effective_silence,
                 audio_path=audio_path,
                 debug_label=stem,
+                fast_match=fast_match,
+                max_windows=max_windows,
+                match_timeout=match_timeout,
+                max_distance_ratio=max_distance_ratio,
+                min_anchor_ngram=min_anchor_ngram,
+                fallback_policy=fallback_policy,
             )
 
         def _load_context_preview() -> str:
@@ -892,6 +906,12 @@ def _run_retake_batch(
     review_only: bool,
     merge_adj_gap_sec: float,
     low_conf: float,
+    fast_match: bool,
+    max_windows: int,
+    match_timeout: float,
+    max_distance_ratio: float,
+    min_anchor_ngram: int,
+    fallback_policy: str,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -961,6 +981,12 @@ def _run_retake_batch(
                         review_only,
                         merge_adj_gap_sec,
                         low_conf,
+                        fast_match,
+                        max_windows,
+                        match_timeout,
+                        max_distance_ratio,
+                        min_anchor_ngram,
+                        fallback_policy,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1021,6 +1047,12 @@ def _run_retake_batch(
                     review_only,
                     merge_adj_gap_sec,
                     low_conf,
+                    fast_match,
+                    max_windows,
+                    match_timeout,
+                    max_distance_ratio,
+                    min_anchor_ngram,
+                    fallback_policy,
                     pause_align=pause_align,
                     pause_gap_sec=pause_gap_sec,
                     pause_snap_limit=pause_snap_limit,
@@ -1081,6 +1113,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     overcut_guard = not args.no_overcut_guard
     overcut_mode = args.overcut_mode
     overcut_threshold = float(args.overcut_threshold)
+    fast_match = bool(args.fast_match)
+    max_windows = int(args.max_windows)
+    match_timeout = float(args.match_timeout)
+    max_distance_ratio = float(args.max_distance_ratio)
+    min_anchor_ngram = int(args.min_anchor_ngram)
+    fallback_policy = args.fallback_policy
     debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
     if debug_csv and args.workers and args.workers > 1:
         LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
@@ -1109,6 +1147,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.review_only,
             merge_adj_gap_sec,
             low_conf,
+            fast_match,
+            max_windows,
+            match_timeout,
+            max_distance_ratio,
+            min_anchor_ngram,
+            fallback_policy,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1150,6 +1194,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             args.review_only,
             merge_adj_gap_sec,
             low_conf,
+            fast_match,
+            max_windows,
+            match_timeout,
+            max_distance_ratio,
+            min_anchor_ngram,
+            fallback_policy,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1193,11 +1243,25 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "auto_merged",
         "too_short_dropped",
         "silence_regions",
+        "kept_count",
+        "deleted_count",
+        "cut_seconds",
     ]  # 汇总字段
-    aggregated = {
-        key: sum(int(item.get("stats", {}).get(key, 0)) for item in items if item.get("status") == "ok")
-        for key in stat_keys
-    }  # 聚合统计
+    float_keys = {"cut_seconds"}
+    aggregated = {}
+    for key in stat_keys:
+        if key in float_keys:
+            aggregated[key] = sum(
+                float(item.get("stats", {}).get(key, 0.0))
+                for item in items
+                if item.get("status") == "ok"
+            )
+        else:
+            aggregated[key] = sum(
+                int(item.get("stats", {}).get(key, 0))
+                for item in items
+                if item.get("status") == "ok"
+            )
     summary["aggregated_stats"] = aggregated
     if write_report:  # 写入批处理报告
         existing = {}
@@ -1285,6 +1349,12 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.append("--review-only")
     if getattr(args, "no_interaction", False):
         parts.append("--no-interaction")
+    parts.append("--fast-match" if args.fast_match else "--no-fast-match")
+    parts.extend(["--max-windows", str(args.max_windows)])
+    parts.extend(["--match-timeout", str(args.match_timeout)])
+    parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
+    parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
+    parts.extend(["--fallback-policy", args.fallback_policy])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -1571,6 +1641,13 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             len(missing_words),
         )
 
+    fast_match = bool(getattr(args, "fast_match", True))
+    max_windows = int(getattr(args, "max_windows", 50))
+    match_timeout = float(getattr(args, "match_timeout", 20.0))
+    max_distance_ratio = float(getattr(args, "max_distance_ratio", 0.25))
+    min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
+    fallback_policy = getattr(args, "fallback_policy", "safe")
+
     retake_items: list[dict] = []
     failed = 0
     retake_start = time.perf_counter()
@@ -1623,6 +1700,12 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             False,
             MERGE_ADJ_GAP_SEC,
             SENT_LOW_CONF,
+            fast_match,
+            max_windows,
+            match_timeout,
+            max_distance_ratio,
+            min_anchor_ngram,
+            fallback_policy,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -1863,6 +1946,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--verbose")
     if args.quiet:
         parts.append("--quiet")
+    parts.append("--fast-match" if args.fast_match else "--no-fast-match")
+    parts.extend(["--max-windows", str(args.max_windows)])
+    parts.extend(["--match-timeout", str(args.match_timeout)])
+    parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
+    parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
+    parts.extend(["--fallback-policy", args.fallback_policy])
 
     LOGGER.info(
         _safe_text(
@@ -1883,6 +1972,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "render": canonical_render,
         "workers": args.workers,
         "no_interaction": args.no_interaction,
+        "fast_match": args.fast_match,
+        "max_windows": args.max_windows,
+        "match_timeout": args.match_timeout,
+        "max_distance_ratio": args.max_distance_ratio,
+        "min_anchor_ngram": args.min_anchor_ngram,
+        "fallback_policy": args.fallback_policy,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2039,6 +2134,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=MERGE_GAP_SEC,
         help=f"补偿后相邻片段自动合并的最大间隙，秒（默认 {MERGE_GAP_SEC:.2f}）",
     )
+    retake.add_argument(
+        "--fast-match",
+        dest="fast_match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="启用快速候选预筛与带宽受限匹配（默认开启）",
+    )
+    retake.add_argument(
+        "--max-windows",
+        type=int,
+        default=50,
+        help="每行最多尝试的候选窗口数（默认 50）",
+    )
+    retake.add_argument(
+        "--match-timeout",
+        type=float,
+        default=20.0,
+        help="每个条目的匹配时间预算（秒，默认 20.0）",
+    )
+    retake.add_argument(
+        "--max-distance-ratio",
+        type=float,
+        default=0.25,
+        help="允许的编辑距离占比上限（默认 0.25）",
+    )
+    retake.add_argument(
+        "--min-anchor-ngram",
+        type=int,
+        default=8,
+        help="候选预筛锚点 n-gram 长度（默认 8）",
+    )
+    retake.add_argument(
+        "--fallback-policy",
+        choices=["safe", "keep-all", "align-greedy"],
+        default="safe",
+        help="对齐失败时的回退策略（默认 safe）",
+    )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
         "--noise-db",
@@ -2152,6 +2284,43 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--no-interaction", action="store_true", help="无交互模式，直接执行")
     pipeline.add_argument("--verbose", action="store_true", help="输出调试日志")
     pipeline.add_argument("--quiet", action="store_true", help="仅输出警告及以上")
+    pipeline.add_argument(
+        "--fast-match",
+        dest="fast_match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="启用快速候选预筛与带宽受限匹配（默认开启）",
+    )
+    pipeline.add_argument(
+        "--max-windows",
+        type=int,
+        default=50,
+        help="每行最多尝试的候选窗口数（默认 50）",
+    )
+    pipeline.add_argument(
+        "--match-timeout",
+        type=float,
+        default=20.0,
+        help="每个条目的匹配时间预算（秒，默认 20.0）",
+    )
+    pipeline.add_argument(
+        "--max-distance-ratio",
+        type=float,
+        default=0.25,
+        help="允许的编辑距离占比上限（默认 0.25）",
+    )
+    pipeline.add_argument(
+        "--min-anchor-ngram",
+        type=int,
+        default=8,
+        help="候选预筛锚点 n-gram 长度（默认 8）",
+    )
+    pipeline.add_argument(
+        "--fallback-policy",
+        choices=["safe", "keep-all", "align-greedy"],
+        default="safe",
+        help="对齐失败时的回退策略（默认 safe）",
+    )
     pipeline.set_defaults(func=handle_all_in_one)
 
     return parser

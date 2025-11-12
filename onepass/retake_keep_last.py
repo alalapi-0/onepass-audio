@@ -1,18 +1,20 @@
 """保留最后一遍的核心策略与导出工具。"""
 from __future__ import annotations
 
-import csv
-import difflib
 import json
 import logging
 import math
 import re
 import subprocess
+import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
 from .asr_loader import Word
+from .edl_writer import write_edl
+from .markers_writer import write_audition_csv
 from .sent_align import (
     LOW_CONF as SENT_LOW_CONF,
     MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
@@ -510,6 +512,10 @@ def _bounded_levenshtein(a: str, b: str, limit: int) -> int:
     return result if result <= limit else limit + 1
 
 
+_HASH_BASE = 257
+_HASH_MASK = (1 << 64) - 1
+
+
 @dataclass(slots=True)
 class _WindowMatch:
     """描述模糊窗口搜索的最佳候选。"""
@@ -518,71 +524,189 @@ class _WindowMatch:
     match_distance: int | None
     match_score: float
     match_text: str
-    alt_range: tuple[int, int] | None
+    candidates_evaluated: int
     alt_text: str
-    alt_score: float
+    alt_distance: int | None
+
+
+def _rolling_hash_power(base: int, exp: int) -> int:
+    """计算 base**exp 在 2**64 空间内的值。"""
+
+    if exp <= 0:
+        return 1
+    return pow(base, exp, 1 << 64)
+
+
+def _fast_candidates(words_chars: str, line_chars: str, k: int, limit: int) -> list[int]:
+    """通过 Rabin–Karp 滚动哈希快速筛选可能的窗口起点。"""
+
+    if not words_chars or not line_chars or limit <= 0:
+        return []
+    limit = max(1, limit)
+    max_k = min(max(k, 3), len(words_chars), len(line_chars))
+    best_hits: Counter[int] = Counter()
+    for current_k in range(max_k, 2, -1):
+        if len(line_chars) < current_k or len(words_chars) < current_k:
+            continue
+        high = _rolling_hash_power(_HASH_BASE, current_k - 1)
+        index: dict[int, list[int]] = defaultdict(list)
+        hash_value = 0
+        for idx, ch in enumerate(words_chars):
+            hash_value = ((hash_value * _HASH_BASE) + ord(ch)) & _HASH_MASK
+            if idx + 1 >= current_k:
+                start = idx + 1 - current_k
+                index[hash_value].append(start)
+                leading = ord(words_chars[start])
+                hash_value = (hash_value - (leading * high)) & _HASH_MASK
+        if not index:
+            continue
+        line_hash = 0
+        for idx, ch in enumerate(line_chars):
+            line_hash = ((line_hash * _HASH_BASE) + ord(ch)) & _HASH_MASK
+            if idx + 1 >= current_k:
+                candidate_positions = index.get(line_hash)
+                if candidate_positions:
+                    segment = line_chars[idx + 1 - current_k : idx + 1]
+                    for pos in candidate_positions:
+                        if words_chars[pos : pos + current_k] == segment:
+                            best_hits[pos] += 1
+                leading = ord(line_chars[idx + 1 - current_k])
+                line_hash = (line_hash - (leading * high)) & _HASH_MASK
+        if best_hits:
+            break
+    if not best_hits:
+        snippet_len = min(max_k, len(line_chars))
+        snippet = line_chars[:snippet_len]
+        pos = words_chars.find(snippet)
+        if pos >= 0:
+            best_hits[pos] = 1
+    ordered = sorted(best_hits.items(), key=lambda item: (-item[1], item[0]))
+    return [pos for pos, _ in ordered[:limit]]
+
+
+def _bounded_levenshtein_banded(
+    a: str,
+    b: str,
+    max_dist: int,
+    deadline: float | None = None,
+) -> int:
+    """使用带宽限制的动态规划计算编辑距离。"""
+
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if max_dist < 0:
+        return 0
+    if abs(len(a) - len(b)) > max_dist:
+        return max_dist + 1
+    width = max_dist
+    size = width * 2 + 1
+    inf = max_dist + 1
+    prev = [inf] * size
+    cur = [inf] * size
+    for i in range(0, len(a) + 1):
+        if deadline and time.monotonic() > deadline:
+            raise TimeoutError("banded distance deadline reached")
+        low = max(0, i - width)
+        high = min(len(b), i + width)
+        if not (low <= high):
+            return max_dist + 1
+        row_min = inf
+        for j in range(low, high + 1):
+            band_idx = j - i + width
+            if i == 0:
+                cur[band_idx] = j
+            elif j == 0:
+                cur[band_idx] = i
+            else:
+                cost = 0 if a[i - 1] == b[j - 1] else 1
+                deletion = prev[band_idx + 1] + 1 if band_idx + 1 < size else inf
+                insertion = cur[band_idx - 1] + 1 if band_idx - 1 >= 0 else inf
+                substitution = prev[band_idx] + cost
+                cur[band_idx] = min(deletion, insertion, substitution)
+            if cur[band_idx] < row_min:
+                row_min = cur[band_idx]
+        if row_min > max_dist:
+            return max_dist + 1
+        prev, cur = cur, [inf] * size
+    result_idx = len(b) - len(a) + width
+    if not (0 <= result_idx < len(prev)):
+        return max_dist + 1
+    result = prev[result_idx]
+    return result if result <= max_dist else max_dist + 1
 
 
 def _search_fuzzy_window(
-    units: str,
-    asr_norm: str,
-    char_map: Sequence[tuple[int, int]],
+    words_chars: str,
+    line_chars: str,
     *,
-    max_distance: int,
+    max_distance_ratio: float,
+    max_windows: int,
+    min_anchor_ngram: int,
+    deadline: float | None,
 ) -> _WindowMatch:
-    """在 ASR 规范化串中查找与句子最相近的窗口。"""
+    """在规范化词串中查找与目标文本最接近的窗口。"""
 
-    if not units or not asr_norm or not char_map:
-        return _WindowMatch(None, None, 0.0, "", None, "", 0.0)
-
-    target_len = len(units)
-    total_chars = char_map[-1][1]
-    window_pad = max(4, max_distance * 3)
-    min_len = max(1, target_len - window_pad)
-    max_len = min(total_chars, target_len + window_pad)
-
+    if not words_chars or not line_chars:
+        return _WindowMatch(None, None, 0.0, "", 0, "", None)
+    candidates = _fast_candidates(words_chars, line_chars, min_anchor_ngram, max_windows)
+    LOGGER.info("候选窗口数=%s", len(candidates))
     best_range: tuple[int, int] | None = None
     best_distance: int | None = None
     best_score = 0.0
     best_text = ""
-    alt_range: tuple[int, int] | None = None
     alt_text = ""
-    alt_score = 0.0
-
-    for start_idx, (start_char, _) in enumerate(char_map):
-        if total_chars - start_char < min_len and best_range is not None:
-            break
-        for end_idx in range(start_idx, len(char_map)):
-            end_char = char_map[end_idx][1]
-            window_len = end_char - start_char
-            if window_len <= 0:
+    alt_distance: int | None = None
+    target_len = len(line_chars)
+    evaluated = 0
+    widen = max(1, int(target_len * max_distance_ratio))
+    for start_char in candidates:
+        evaluated += 1
+        if deadline and time.monotonic() > deadline:
+            raise TimeoutError("match deadline reached")
+        candidate_choice: tuple[int, float, tuple[int, int], str] | None = None
+        for delta in range(-widen, widen + 1):
+            local_start = max(0, start_char + delta)
+            local_end = min(len(words_chars), local_start + target_len + widen)
+            if local_end <= local_start:
                 continue
-            if window_len < min_len:
-                continue
-            if window_len > max_len:
-                break
-
-            candidate = asr_norm[start_char:end_char]
-            distance = _bounded_levenshtein(units, candidate, max_distance)
-            if distance <= max_distance:
-                score = 1.0 - distance / max(len(units), len(candidate))
-                if (
-                    best_range is None
-                    or score > best_score
-                    or (math.isclose(score, best_score, rel_tol=1e-6) and window_len < (best_range[1] - best_range[0]))
-                ):
-                    best_range = (start_char, end_char)
-                    best_distance = distance
-                    best_score = score
-                    best_text = candidate
-            elif best_range is None:
-                ratio = difflib.SequenceMatcher(None, units, candidate).ratio() if candidate else 0.0
-                if ratio > alt_score:
-                    alt_score = ratio
-                    alt_text = candidate
-                    alt_range = (start_char, end_char)
-
-    return _WindowMatch(best_range, best_distance, best_score, best_text, alt_range, alt_text, alt_score)
+            candidate_text = words_chars[local_start:local_end]
+            for ratio in (0.10, 0.15, max_distance_ratio):
+                bound = max(1, int(target_len * ratio))
+                distance = _bounded_levenshtein_banded(candidate_text, line_chars, bound, deadline)
+                if distance <= bound:
+                    score = 1.0 - distance / max(len(line_chars), len(candidate_text))
+                    if candidate_choice is None or distance < candidate_choice[0] or (
+                        distance == candidate_choice[0] and score > candidate_choice[1]
+                    ):
+                        candidate_choice = (distance, score, (local_start, local_end), candidate_text)
+                    if distance <= max(1, int(target_len * 0.05)):
+                        best_distance = distance
+                        best_score = score
+                        best_range = (local_start, local_end)
+                        best_text = candidate_text
+                        LOGGER.info("早停: dist=%s ratio=%.3f", distance, score)
+                        return _WindowMatch(best_range, best_distance, best_score, best_text, evaluated, alt_text, alt_distance)
+                    break
+                if alt_distance is None or distance < alt_distance:
+                    alt_distance = distance
+                    alt_text = candidate_text
+        if candidate_choice is None:
+            continue
+        distance, score, match_range, candidate_text = candidate_choice
+        if (
+            best_range is None
+            or score > best_score
+            or (math.isclose(score, best_score, rel_tol=1e-6) and (match_range[1] - match_range[0]) < (best_range[1] - best_range[0]))
+        ):
+            best_range = match_range
+            best_distance = distance
+            best_score = score
+            best_text = candidate_text
+    return _WindowMatch(best_range, best_distance, best_score, best_text, evaluated, alt_text, alt_distance)
 
 
 def _preview_text(text: str, limit: int = 120) -> str:
@@ -622,6 +746,72 @@ def _word_range_to_time(word_range: tuple[int, int], words: list[Word]) -> tuple
     return start_time, end_time  # 返回时间范围
 
 
+def _fallback_keep_all(
+    words: Sequence[Word],
+    audio_duration: float,
+    lines: Sequence[str],
+) -> list[KeepSpan]:
+    """兜底策略：整段保留，确保至少有一个 KEEP 片段。"""
+
+    end_time = audio_duration
+    if end_time <= 0 and words:
+        end_time = words[-1].end
+    if end_time < 0:
+        end_time = 0.0
+    text = next((line.strip() for line in lines if line.strip()), "KEEP_ALL_FALLBACK")
+    keep = KeepSpan(line_no=0, text=text or "KEEP_ALL_FALLBACK", start=0.0, end=end_time)
+    return [keep]
+
+
+def _fallback_align_greedy(
+    words: Sequence[Word],
+    lines: Sequence[str],
+    words_chars: str,
+    char_map: Sequence[tuple[int, int]],
+    *,
+    min_anchor_ngram: int,
+    max_windows: int,
+) -> list[KeepSpan]:
+    """贪心对齐兜底：使用锚点快速吸附文本行。"""
+
+    if not words_chars:
+        return []
+    keeps: list[KeepSpan] = []
+    cursor = 0
+    min_k = max(3, min_anchor_ngram)
+    word_list = list(words)
+    for line_no, line in enumerate(lines, start=1):
+        norm_line = normalize_for_align(line)
+        units = _line_to_units(norm_line)
+        if not units:
+            continue
+        anchor_len = min(len(units), min_k)
+        candidates = _fast_candidates(words_chars, units, anchor_len, max_windows)
+        if not candidates and anchor_len > 3:
+            candidates = _fast_candidates(words_chars, units, 3, max_windows)
+        if not candidates:
+            continue
+        best_pos = min(
+            candidates,
+            key=lambda pos: (pos < cursor, abs(pos - cursor)),
+        )
+        window_start = best_pos
+        window_end = min(len(words_chars), best_pos + max(len(units), anchor_len + min_anchor_ngram))
+        if window_end <= window_start:
+            continue
+        word_range = _char_range_to_word_range((window_start, window_end), char_map)
+        if word_range is None:
+            continue
+        start_time, end_time = _word_range_to_time(word_range, word_list)
+        if keeps and start_time < keeps[-1].end:
+            start_time = keeps[-1].end
+        if end_time < start_time:
+            end_time = start_time
+        keeps.append(KeepSpan(line_no=line_no, text=line, start=start_time, end=end_time))
+        cursor = window_end
+    return keeps
+
+
 def compute_retake_keep_last(
     words: list[Word],
     original_txt: Path,
@@ -639,6 +829,12 @@ def compute_retake_keep_last(
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     audio_path: Path | None = None,
     debug_label: str | None = None,
+    fast_match: bool = True,
+    max_windows: int = 50,
+    match_timeout: float = 20.0,
+    max_distance_ratio: float = 0.25,
+    min_anchor_ngram: int = 8,
+    fallback_policy: str = "safe",
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -653,95 +849,32 @@ def compute_retake_keep_last(
 
     lines = raw_text.splitlines()  # 按行拆分原文
     _, asr_norm_str, char_map = _normalize_words(words)  # 获取规范化词串与索引
+    char_map = list(char_map)
     if not asr_norm_str:  # 如果规范化后为空
         raise ValueError("规范化后的词序列为空，可能所有词都是标点或空白。请检查 JSON 输出。")
 
-    keeps: list[KeepSpan] = []  # 存放最终保留段
-    strict_matches = 0  # 记录严格匹配次数
-    fallback_matches = 0  # 记录回退匹配次数
-    unmatched = 0  # 记录未匹配行数
-    len_gate_skipped = 0  # 记录因长度过短而跳过去重的次数
-    neighbor_gap_skipped = 0  # 记录因近邻间隔过长而跳过去重的次数
-    mismatch_samples: list[dict[str, object]] = []
+    params_snapshot = {
+        "fast_match": bool(fast_match),
+        "max_windows": int(max_windows),
+        "match_timeout": float(match_timeout),
+        "max_distance_ratio": float(max_distance_ratio),
+        "min_anchor_ngram": int(min_anchor_ngram),
+        "fallback_policy": str(fallback_policy),
+        "min_sent_chars": int(min_sent_chars),
+        "max_dup_gap_sec": float(max_dup_gap_sec),
+    }
+    LOGGER.info("参数快照: %s", json.dumps(params_snapshot, ensure_ascii=False, sort_keys=True))
 
-    for index, line in enumerate(lines, start=1):  # 遍历每一行原文
-        norm_line = normalize_for_align(line)  # 规范化当前行
-        units = _line_to_units(norm_line)  # 转换为匹配字符序列
-        if not units:  # 空行直接跳过
-            continue
-        spans: list[tuple[float, float]] = []  # 存放命中的时间区间
-        occurrences = _find_all_occurrences(asr_norm_str, units)  # 严格子串匹配
-        if occurrences:
-            strict_matches += 1
-            for occ in occurrences:
-                word_range = _char_range_to_word_range(occ, char_map)
-                if word_range is None:
-                    continue
-                spans.append(_word_range_to_time(word_range, words))
-        else:
-            allowed_distance = int(math.ceil(max(2.0, len(units) * 0.06)))
-            window_match = _search_fuzzy_window(
-                units,
-                asr_norm_str,
-                char_map,
-                max_distance=allowed_distance,
-            )
-            if window_match.match_range is not None:
-                word_range = _char_range_to_word_range(window_match.match_range, char_map)
-                if word_range is not None:
-                    fallback_matches += 1
-                    spans.append(_word_range_to_time(word_range, words))
-                    LOGGER.info(
-                        "[fallback] line=%s dist=%s score=%.3f",
-                        index,
-                        window_match.match_distance,
-                        window_match.match_score,
-                    )
-                else:
-                    LOGGER.debug("窗口匹配无法映射到词区间: %s", window_match.match_range)
-            else:
-                unmatched += 1
-                if len(mismatch_samples) < 3:
-                    sample = {
-                        "line_no": index,
-                        "text": _preview_text(line, 120),
-                        "text_view": _preview_text(units, 120),
-                        "words_view": _preview_text(window_match.alt_text, 120),
-                    }
-                    mismatch_samples.append(sample)
-                    LOGGER.warning(
-                        "[unmatched] line=%s text=%s | words=%s",
-                        index,
-                        sample["text_view"],
-                        sample["words_view"] or "-",
-                    )
-                continue
-        if not spans:  # 若没有任何命中
-            unmatched += 1  # 记录未匹配
-            continue
-        spans.sort(key=lambda item: item[0])  # 先按起点排序方便去重
-        sentence_length = len(units)  # 规范化后的长度
-        if sentence_length < max(0, min_sent_chars):  # 长度不足阈值时跳过去重
-            len_gate_skipped += max(0, len(spans) - 1)  # 累计被跳过的命中数量
-            filtered_spans = spans  # 全部保留
-        else:
-            filtered_spans, skipped_by_gap = _filter_spans_by_gap(spans, max_dup_gap_sec)
-            neighbor_gap_skipped += skipped_by_gap
-        for span_start, span_end in filtered_spans:  # 逐个保留有效区间
-            keeps.append(
-                KeepSpan(
-                    line_no=index,
-                    text=line,
-                    start=span_start,
-                    end=span_end,
-                )
-            )
+    start_ts = time.monotonic()
+    deadline = None
+    if match_timeout and match_timeout > 0:
+        deadline = time.monotonic() + match_timeout
 
     audio_duration = _resolve_audio_duration(words, audio_path)
-    pause_intervals: list[tuple[float, float]] = []
+    pause_intervals_base: list[tuple[float, float]] = []
     silence_count = 0
     if pause_align:
-        pause_intervals = infer_pause_boundaries(words, pause_gap_sec)
+        pause_intervals_base = infer_pause_boundaries(words, pause_gap_sec)
         if silence_ranges:
             clamped_silence = [
                 (
@@ -752,85 +885,325 @@ def compute_retake_keep_last(
                 if end > start
             ]
             silence_count = len(clamped_silence)
-            pause_intervals.extend(clamped_silence)
-        pause_intervals = _merge_ranges(pause_intervals)
-    active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
-        keeps,
-        audio_duration=audio_duration,
-        pause_intervals=pause_intervals,
-        pause_snap_limit=pause_snap_limit,
-        pad_before=pad_before,
-        pad_after=pad_after,
-        merge_gap_sec=merge_gap_sec,
-        min_segment_sec=min_segment_sec,
-        pause_align=pause_align,
-        debug_label=debug_label,
-    )
-    keeps = [keeps[idx] for idx in range(len(keeps)) if idx in active_indices]
-    keeps.sort(key=lambda item: item.start)
-    edl_keep_segments = final_segments
-    drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)  # 计算补集
-    drops, window_splits = _split_long_segments(drops, max_window_sec)
+            pause_intervals_base.extend(clamped_silence)
+        pause_intervals_base = _merge_ranges(pause_intervals_base)
 
-    matched_line_numbers = {span.line_no for span in keeps}  # 统计匹配到的原文行
-    stats = {  # 汇总统计信息
-        "total_words": len(words),
-        "total_lines": len(lines),
-        "matched_lines": len(matched_line_numbers),
-        "strict_matches": strict_matches,
-        "fallback_matches": fallback_matches,
-        "unmatched_lines": unmatched,
-        "len_gate_skipped": len_gate_skipped,
-        "neighbor_gap_skipped": neighbor_gap_skipped,
-        "max_window_splits": window_splits,
-        "audio_duration": audio_duration,
-        "keep_duration": sum(max(0.0, end - start) for start, end in edl_keep_segments),
-        "silence_regions": silence_count,
-        "mismatch_examples": mismatch_samples,
-    }
-    stats.update(refine_stats)
-    if unmatched >= 3 and mismatch_samples:
-        preview = "; ".join(
-            f"L{sample['line_no']}: {sample['text']}" for sample in mismatch_samples
+    def _align_once(min_sent_cutoff: int, dup_gap: float) -> dict[str, object]:
+        local_keeps: list[KeepSpan] = []
+        strict_count = 0
+        fuzzy_count = 0
+        unmatched_count = 0
+        len_gate_skip = 0
+        neighbor_skip = 0
+        mismatch_details: list[dict[str, object]] = []
+        unmatched_details: list[dict[str, object]] = []
+        for index, line in enumerate(lines, start=1):
+            if deadline and time.monotonic() > deadline:
+                raise TimeoutError("match deadline")
+            norm_line = normalize_for_align(line)
+            units = _line_to_units(norm_line)
+            if not units:
+                continue
+            spans: list[tuple[float, float]] = []
+            occurrences = _find_all_occurrences(asr_norm_str, units)
+            if occurrences:
+                strict_count += 1
+                for occ in occurrences:
+                    word_range = _char_range_to_word_range(occ, char_map)
+                    if word_range is None:
+                        continue
+                    spans.append(_word_range_to_time(word_range, words))
+            else:
+                window_limit = max_windows if fast_match else max(len(asr_norm_str), len(units))
+                window_match = _search_fuzzy_window(
+                    asr_norm_str,
+                    units,
+                    max_distance_ratio=max_distance_ratio,
+                    max_windows=max(1, window_limit),
+                    min_anchor_ngram=min_anchor_ngram,
+                    deadline=deadline,
+                )
+                if window_match.match_range is not None and window_match.match_distance is not None:
+                    word_range = _char_range_to_word_range(window_match.match_range, char_map)
+                    if word_range is not None:
+                        fuzzy_count += 1
+                        spans.append(_word_range_to_time(word_range, words))
+                        LOGGER.info(
+                            "[fuzzy] line=%s dist=%s score=%.3f candidates=%s",
+                            index,
+                            window_match.match_distance,
+                            window_match.match_score,
+                            window_match.candidates_evaluated,
+                        )
+                if not spans:
+                    unmatched_count += 1
+                    preview_line = _preview_text(line, 120)
+                    preview_words = _preview_text(window_match.alt_text, 120)
+                    if len(mismatch_details) < 10:
+                        mismatch_details.append(
+                            {
+                                "line_no": index,
+                                "text": preview_line,
+                                "text_view": _preview_text(units, 120),
+                                "words_view": preview_words,
+                                "distance": window_match.alt_distance,
+                            }
+                        )
+                    if len(unmatched_details) < 10:
+                        unmatched_details.append(
+                            {
+                                "line_no": index,
+                                "text": preview_line,
+                                "closest_words_snippet": preview_words,
+                                "distance": window_match.alt_distance,
+                            }
+                        )
+                    LOGGER.warning(
+                        "[unmatched] line=%s text=%s | words=%s",
+                        index,
+                        _preview_text(units, 120),
+                        preview_words or "-",
+                    )
+                    continue
+            spans.sort(key=lambda item: item[0])
+            sentence_length = len(units)
+            if sentence_length < max(0, min_sent_cutoff):
+                len_gate_skip += max(0, len(spans) - 1)
+                filtered_spans = spans
+            else:
+                filtered_spans, skipped_by_gap = _filter_spans_by_gap(spans, dup_gap)
+                neighbor_skip += skipped_by_gap
+            for span_start, span_end in filtered_spans:
+                local_keeps.append(
+                    KeepSpan(
+                        line_no=index,
+                        text=line,
+                        start=span_start,
+                        end=span_end,
+                    )
+                )
+        return {
+            "keeps": local_keeps,
+            "strict_matches": strict_count,
+            "fallback_matches": fuzzy_count,
+            "unmatched": unmatched_count,
+            "len_gate_skipped": len_gate_skip,
+            "neighbor_gap_skipped": neighbor_skip,
+            "mismatch_samples": mismatch_details,
+            "unmatched_examples": unmatched_details,
+        }
+
+    keeps: list[KeepSpan] = []
+    edl_keep_segments: list[tuple[float, float]] = []
+    drops: list[tuple[float, float]] = []
+    debug_rows: list[dict] = []
+    stats: dict[str, object] | None = None
+    strict_matches = 0
+    fallback_matches = 0
+    unmatched = 0
+    len_gate_skipped = 0
+    neighbor_gap_skipped = 0
+    mismatch_samples: list[dict[str, object]] = []
+    unmatched_examples: list[dict[str, object]] = []
+    window_splits = 0
+    timed_out = False
+    match_engine = "fast-banded"
+
+    current_min_sent = int(min_sent_chars)
+    current_dup_gap = float(max_dup_gap_sec)
+    recomputed = False
+
+    while True:
+        try:
+            alignment = _align_once(current_min_sent, current_dup_gap)
+        except TimeoutError:
+            timed_out = True
+            LOGGER.warning("对齐超时，进入回退策略：%s", fallback_policy)
+            break
+        raw_keeps = list(alignment.get("keeps", []))
+        strict_matches = int(alignment.get("strict_matches", 0))
+        fallback_matches = int(alignment.get("fallback_matches", 0))
+        unmatched = int(alignment.get("unmatched", 0))
+        len_gate_skipped = int(alignment.get("len_gate_skipped", 0))
+        neighbor_gap_skipped = int(alignment.get("neighbor_gap_skipped", 0))
+        mismatch_samples = list(alignment.get("mismatch_samples", []))
+        unmatched_examples = list(alignment.get("unmatched_examples", []))
+
+        pause_intervals = list(pause_intervals_base)
+        active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
+            raw_keeps,
+            audio_duration=audio_duration,
+            pause_intervals=pause_intervals,
+            pause_snap_limit=pause_snap_limit,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            merge_gap_sec=merge_gap_sec,
+            min_segment_sec=min_segment_sec,
+            pause_align=pause_align,
+            debug_label=debug_label,
         )
-        LOGGER.warning(
-            "检测到 %s 行未匹配。示例: %s。可尝试调整字符映射/同音合并或放宽匹配阈值。",
-            unmatched,
-            preview,
-        )
-    keep_duration = stats["keep_duration"]
-    if audio_duration > 0:
-        stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
-    else:
-        stats["cut_ratio"] = 0.0
+        keeps = [raw_keeps[idx] for idx in range(len(raw_keeps)) if idx in active_indices]
+        keeps.sort(key=lambda item: item.start)
+        edl_keep_segments = final_segments
+        drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)
+        drops, window_splits = _split_long_segments(drops, max_window_sec)
+
+        matched_line_numbers = {span.line_no for span in keeps if span.line_no > 0}
+        keep_duration = sum(max(0.0, end - start) for start, end in edl_keep_segments)
+        stats = {
+            "total_words": len(words),
+            "total_lines": len(lines),
+            "matched_lines": len(matched_line_numbers),
+            "strict_matches": strict_matches,
+            "fallback_matches": fallback_matches,
+            "unmatched_lines": unmatched,
+            "len_gate_skipped": len_gate_skipped,
+            "neighbor_gap_skipped": neighbor_gap_skipped,
+            "max_window_splits": window_splits,
+            "audio_duration": audio_duration,
+            "keep_duration": keep_duration,
+            "silence_regions": silence_count,
+            "mismatch_examples": mismatch_samples[:3],
+        }
+        stats.update(refine_stats)
+        if unmatched >= 3 and mismatch_samples:
+            preview = "; ".join(
+                f"L{sample['line_no']}: {sample['text']}" for sample in mismatch_samples[:3]
+            )
+            LOGGER.warning(
+                "检测到 %s 行未匹配。示例: %s。可尝试调整字符映射/同音合并或放宽匹配阈值。",
+                unmatched,
+                preview,
+            )
+        if audio_duration > 0:
+            stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
+        else:
+            stats["cut_ratio"] = 0.0
+
+        if not recomputed and stats["cut_ratio"] > 0.6 and raw_keeps:
+            new_min_sent = max(current_min_sent + 4, int(math.ceil(current_min_sent * 1.2)))
+            new_dup_gap = max(0.5, current_dup_gap * 0.6) if current_dup_gap > 0 else current_dup_gap
+            if new_min_sent != current_min_sent or not math.isclose(new_dup_gap, current_dup_gap, rel_tol=1e-2):
+                LOGGER.warning(
+                    "过裁剪保护触发 -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
+                    current_min_sent,
+                    new_min_sent,
+                    current_dup_gap,
+                    new_dup_gap,
+                )
+                current_min_sent = new_min_sent
+                current_dup_gap = new_dup_gap
+                recomputed = True
+                continue
+        break
+
+    if stats is None:
+        stats = {
+            "total_words": len(words),
+            "total_lines": len(lines),
+            "matched_lines": 0,
+            "strict_matches": 0,
+            "fallback_matches": 0,
+            "unmatched_lines": len(lines),
+            "len_gate_skipped": 0,
+            "neighbor_gap_skipped": 0,
+            "max_window_splits": 0,
+            "audio_duration": audio_duration,
+            "keep_duration": 0.0,
+            "silence_regions": silence_count,
+            "mismatch_examples": [],
+        }
+        keeps = []
+        edl_keep_segments = []
+        drops = []
+        debug_rows = []
+
+    fallback_reasons: list[str] = []
+    if timed_out:
+        fallback_reasons.append("timeout")
+    if stats.get("matched_lines", 0) == 0:
+        fallback_reasons.append("no-match")
+    if not edl_keep_segments:
+        fallback_reasons.append("empty-segments")
 
     fallback_used = False
-    fallback_reason = ""
     fallback_note: str | None = None
-    if stats["matched_lines"] == 0:
-        fallback_used = True
-        fallback_reason = "no-match"
-    elif stats["cut_ratio"] >= 0.98:
-        fallback_used = True
-        fallback_reason = f"cut-ratio>={stats['cut_ratio']:.3f}"
 
-    if fallback_used:
-        fallback_end = audio_duration
-        if fallback_end <= 0 and words:
-            fallback_end = words[-1].end
-        if fallback_end < 0:
-            fallback_end = 0.0
-        edl_keep_segments = [(0.0, fallback_end)] if fallback_end > 0 else []
-        keeps = []
-        drops = []
-        stats["keep_duration"] = fallback_end
-        stats["cut_ratio"] = 0.0 if fallback_end > 0 else 1.0
-        fallback_note = "NO_MATCH_FALLBACK" if fallback_reason == "no-match" else f"NO_MATCH_FALLBACK({fallback_reason})"
-        stats["fallback_keep_duration"] = fallback_end
-        LOGGER.warning("触发兜底策略: %s", fallback_reason)
+    if fallback_reasons:
+        fallback_used = True
+        fallback_keeps: list[KeepSpan] | None = None
+        fallback_engine = match_engine
+        if fallback_policy in {"safe", "align-greedy"}:
+            fallback_keeps = _fallback_align_greedy(
+                words,
+                lines,
+                asr_norm_str,
+                char_map,
+                min_anchor_ngram=min_anchor_ngram,
+                max_windows=max_windows,
+            )
+            if fallback_keeps:
+                fallback_engine = "fallback-align-greedy"
+                fallback_note = "NO_MATCH_FALLBACK_ALIGN_GREEDY"
+        if not fallback_keeps and fallback_policy in {"safe", "keep-all", "align-greedy"}:
+            fallback_keeps = _fallback_keep_all(words, audio_duration, lines)
+            fallback_engine = "fallback-keep-all"
+            fallback_note = "NO_MATCH_FALLBACK_KEEP_ALL"
+        if not fallback_keeps:
+            fallback_keeps = _fallback_keep_all(words, audio_duration, lines)
+            fallback_engine = "fallback-keep-all"
+            fallback_note = "NO_MATCH_FALLBACK_KEEP_ALL"
+
+        pause_intervals = list(pause_intervals_base)
+        active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
+            fallback_keeps,
+            audio_duration=audio_duration,
+            pause_intervals=pause_intervals,
+            pause_snap_limit=pause_snap_limit,
+            pad_before=pad_before,
+            pad_after=pad_after,
+            merge_gap_sec=merge_gap_sec,
+            min_segment_sec=min_segment_sec,
+            pause_align=pause_align,
+            debug_label=debug_label,
+        )
+        keeps = [fallback_keeps[idx] for idx in range(len(fallback_keeps)) if idx in active_indices]
+        keeps.sort(key=lambda item: item.start)
+        edl_keep_segments = final_segments or [(0.0, 0.0)]
+        drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)
+        drops, window_splits = _split_long_segments(drops, max_window_sec)
+        stats.update(refine_stats)
+        keep_duration = sum(max(0.0, end - start) for start, end in edl_keep_segments)
+        stats["keep_duration"] = keep_duration
+        if audio_duration > 0:
+            stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
+        else:
+            stats["cut_ratio"] = 0.0
+        stats["matched_lines"] = max(
+            stats.get("matched_lines", 0),
+            len({span.line_no for span in keeps if span.line_no > 0}),
+        )
+        match_engine = fallback_engine
+        LOGGER.warning(
+            "触发兜底策略(%s) -> %s", ",".join(fallback_reasons), fallback_engine
+        )
 
     stats["fallback_used"] = fallback_used
-    stats["fallback_reason"] = fallback_reason
+    if fallback_reasons:
+        stats["fallback_reason"] = fallback_reasons[0]
+        if len(fallback_reasons) > 1:
+            stats["fallback_reason_details"] = fallback_reasons
+    else:
+        stats["fallback_reason"] = ""
+    stats["timed_out"] = timed_out
+    stats["match_engine"] = match_engine
+    stats["params_snapshot"] = params_snapshot
+    stats["latency_ms"] = int((time.monotonic() - start_ts) * 1000)
+    stats["unmatched_examples"] = unmatched_examples[:10]
+    stats["kept_count"] = len(edl_keep_segments)
+    stats["deleted_count"] = len(drops)
+    stats["cut_seconds"] = max(0.0, audio_duration - stats.get("keep_duration", 0.0))
+    stats["max_window_splits"] = window_splits
 
     return RetakeResult(
         keeps=keeps,
@@ -839,7 +1212,7 @@ def compute_retake_keep_last(
         stats=stats,
         debug_rows=debug_rows,
         fallback_used=fallback_used,
-        fallback_reason=fallback_reason or None,
+        fallback_reason=stats.get("fallback_reason") or None,
         fallback_marker_note=fallback_note,
         audio_duration=audio_duration,
     )
@@ -1060,10 +1433,6 @@ def export_txt(keeps: list[KeepSpan], out_path: Path) -> Path:
     return out_path  # 返回输出路径
 
 
-def _format_marker_seconds(value: float) -> str:
-    return f"{max(0.0, value):.3f}"
-
-
 def _clean_marker_text(text: str, limit: int = 48) -> str:
     sanitized = re.sub(r"\s+", " ", text).strip()
     if len(sanitized) <= limit:
@@ -1077,31 +1446,38 @@ def export_audition_markers(
     *,
     note: str | None = None,
 ) -> Path:
-    """导出 Adobe Audition 标记 CSV。"""
+    """导出 Adobe Audition 标记 CSV，确保至少包含 1 行。"""
 
-    from .markers import ensure_csv_header  # 局部导入避免循环
-
-    header = ["Name", "Start", "Duration", "Type", "Description"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)  # 确保目录存在
-    with out_path.open("w", encoding="utf-8-sig", newline="") as csvfile:  # 打开 CSV 文件
-        writer = csv.writer(csvfile)  # 创建写入器
-        writer.writerow(header)  # 写入表头
-        for span in keeps:  # 遍历所有保留段
-            duration = max(0.0, span.end - span.start)  # 计算持续时间，确保非负
-            description = f"[keep] {_clean_marker_text(span.text)}".strip()
-            writer.writerow(
-                [
-                    f"L{span.line_no}",
-                    _format_marker_seconds(span.start),
-                    _format_marker_seconds(duration),
-                    "cue",
-                    description,
-                ]
-            )  # 写入一行
-        if note:
-            writer.writerow(["INFO", "0.000", "0.000", "cue", note])
-    ensure_csv_header(header)
-    return out_path  # 返回输出路径
+    rows: list[dict[str, object]] = []
+    total_duration = 0.0
+    for span in keeps:
+        duration = max(0.0, span.end - span.start)
+        total_duration = max(total_duration, span.end)
+        rows.append(
+            {
+                "name": f"L{span.line_no}",
+                "start": span.start,
+                "duration": duration,
+                "type": "cue",
+                "description": f"[keep] {_clean_marker_text(span.text)}".strip(),
+            }
+        )
+    if note and rows:
+        rows.append(
+            {
+                "name": "INFO",
+                "start": 0.0,
+                "duration": 0.0,
+                "type": "cue",
+                "description": note,
+            }
+        )
+    return write_audition_csv(
+        out_path,
+        rows,
+        total_duration=total_duration,
+        fallback_description=note,
+    )
 
 
 def export_edl_json(
@@ -1116,29 +1492,25 @@ def export_edl_json(
 ) -> Path:
     """导出仅包含 keep 动作的 EDL JSON。"""
 
-    segments = [  # 构造 EDL 片段列表
-        {"start": start, "end": end, "t0": start, "t1": end, "action": "keep"}
+    segments = [
+        {
+            "start": max(0.0, start),
+            "end": max(0.0, end),
+            "action": "keep",
+        }
         for start, end in edl_keep_segments
     ]
-    audio_name = Path(source_audio_rel).name if source_audio_rel else ""
-    actions = [
-        {"t0": start, "t1": end, "keep": True}
-        for start, end in edl_keep_segments
-    ]
-    payload = {
-        "version": 1,
-        "stem": stem,
-        "source_audio": audio_name,
-        "source_samplerate": source_samplerate,
-        "samplerate": samplerate,
-        "channels": channels,
-        "segments": segments,
-        "actions": actions,
-    }
-    out_path.parent.mkdir(parents=True, exist_ok=True)  # 确保输出目录存在
-    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"  # 序列化 JSON
-    out_path.write_text(content, encoding="utf-8")  # 写出文件
-    return out_path  # 返回输出路径
+    return write_edl(
+        out_path,
+        source_audio=source_audio_rel,
+        segments=segments,
+        schema_version=1,
+        sample_rate=samplerate,
+        channels=channels,
+        source_samplerate=source_samplerate,
+        stats={"segment_count": len(segments)},
+        stem=stem,
+    )
 
 
 def export_sentence_srt(hits: Sequence[MatchHit], out_path: Path) -> Path:
@@ -1172,45 +1544,39 @@ def export_sentence_markers(
     out_path: Path,
 ) -> Path:
     """导出句子级命中与审阅点的 Audition 标记。"""
-
-    from .markers import ensure_csv_header
-
-    header = ["Name", "Start", "Duration", "Type", "Description"]
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w", encoding="utf-8-sig", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(header)
-        for hit in sorted(hits, key=lambda item: (item.start_time, item.end_time)):
-            duration = max(0.0, hit.end_time - hit.start_time)
-            description = f"[keep] {_clean_marker_text(hit.sent_text, 64)}".strip()
-            writer.writerow(
-                [
-                    f"L{hit.sent_idx}",
-                    _format_marker_seconds(hit.start_time),
-                    _format_marker_seconds(duration),
-                    "cue",
-                    description,
-                ]
-            )
-        for point in review_points:
-            label = "[review-low]" if point.kind == "low_conf" else "[review]"
-            description = f"{label} {_clean_marker_text(point.sent_text, 64)}".strip()
-            start_time = point.at_time if point.at_time is not None else point.start_time or 0.0
-            duration = max(
-                0.0,
-                (point.end_time or start_time or 0.0) - (point.start_time or start_time or 0.0),
-            )
-            writer.writerow(
-                [
-                    f"R{point.sent_idx}",
-                    _format_marker_seconds(start_time or 0.0),
-                    _format_marker_seconds(duration),
-                    "cue",
-                    description,
-                ]
-            )
-    ensure_csv_header(header)
-    return out_path
+    rows: list[dict[str, object]] = []
+    total_duration = 0.0
+    for hit in sorted(hits, key=lambda item: (item.start_time, item.end_time)):
+        duration = max(0.0, hit.end_time - hit.start_time)
+        total_duration = max(total_duration, hit.end_time)
+        rows.append(
+            {
+                "name": f"L{hit.sent_idx}",
+                "start": hit.start_time,
+                "duration": duration,
+                "type": "cue",
+                "description": f"[keep] {_clean_marker_text(hit.sent_text, 64)}".strip(),
+            }
+        )
+    for point in review_points:
+        label = "[review-low]" if point.kind == "low_conf" else "[review]"
+        description = f"{label} {_clean_marker_text(point.sent_text, 64)}".strip()
+        start_time = point.at_time if point.at_time is not None else point.start_time or 0.0
+        duration = max(
+            0.0,
+            (point.end_time or start_time or 0.0) - (point.start_time or start_time or 0.0),
+        )
+        total_duration = max(total_duration, (start_time or 0.0) + duration)
+        rows.append(
+            {
+                "name": f"R{point.sent_idx}",
+                "start": start_time or 0.0,
+                "duration": duration,
+                "type": "cue",
+                "description": description,
+            }
+        )
+    return write_audition_csv(out_path, rows, total_duration=total_duration)
 
 
 def export_sentence_edl_json(
@@ -1228,7 +1594,6 @@ def export_sentence_edl_json(
 ) -> Path:
     """根据句子级命中导出专用 EDL JSON。"""
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     if review_only:
         segments = [{"start": audio_start, "end": audio_end, "action": "keep"}]
     else:
@@ -1236,19 +1601,17 @@ def export_sentence_edl_json(
             {"start": start, "end": end, "action": "keep"}
             for start, end in keep_segments
         ]
-    audio_name = Path(source_audio_rel).name if source_audio_rel else ""
-    payload = {
-        "version": 1,
-        "stem": stem,
-        "source_audio": audio_name,
-        "source_samplerate": source_samplerate,
-        "samplerate": samplerate,
-        "channels": channels,
-        "segments": segments,
-    }
-    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    out_path.write_text(content, encoding="utf-8")
-    return out_path
+    return write_edl(
+        out_path,
+        source_audio=source_audio_rel,
+        segments=segments,
+        schema_version=1,
+        sample_rate=samplerate,
+        channels=channels,
+        source_samplerate=source_samplerate,
+        stats={"segment_count": len(segments), "review_only": review_only},
+        stem=stem,
+    )
 
 
 def _format_timestamp(seconds: float) -> str:
