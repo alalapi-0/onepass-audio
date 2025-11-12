@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from .utils.lev import bounded_levenshtein
+
 from .asr_loader import Word
 from .edl_writer import EDLWriteResult, write_edl
 from .markers_writer import write_audition_csv
@@ -478,42 +480,9 @@ def _longest_common_substring(a: str, b: str) -> tuple[int, int, int]:
 
 
 def _bounded_levenshtein(a: str, b: str, limit: int) -> int:
-    """计算限定最大编辑距离的 Levenshtein 值，超过上限时返回 limit+1。"""
+    """兼容旧签名的包装函数。"""
 
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    if limit < 0:
-        return 0
-    if abs(len(a) - len(b)) > limit:
-        return limit + 1
-
-    prev = list(range(len(b) + 1))
-    for i, ch_a in enumerate(a, start=1):
-        current = [i]
-        row_min = current[0]
-        start = max(1, i - limit)
-        end = min(len(b), i + limit)
-        for j in range(1, len(b) + 1):
-            if j < start or j > end:
-                current.append(limit + 1)
-                continue
-            cost = 0 if ch_a == b[j - 1] else 1
-            deletion = prev[j] + 1
-            insertion = current[-1] + 1
-            substitution = prev[j - 1] + cost
-            value = min(deletion, insertion, substitution)
-            current.append(value)
-            if value < row_min:
-                row_min = value
-        prev = current
-        if row_min > limit:
-            return limit + 1
-    result = prev[len(b)]
-    return result if result <= limit else limit + 1
+    return bounded_levenshtein(a, b, limit)
 
 
 _HASH_BASE = 257
@@ -531,6 +500,55 @@ class _WindowMatch:
     candidates_evaluated: int
     alt_text: str
     alt_distance: int | None
+    coarse_total: int = 0
+    coarse_passed: int = 0
+    fine_evaluated: int = 0
+    pruned_candidates: int = 0
+    elapsed_sec: float = 0.0
+
+
+class _ProgressLogger:
+    """协助输出窗口搜索阶段的进度。"""
+
+    def __init__(self, stem: str, *, interval: float = 2.0) -> None:
+        self._stem = stem or "-"
+        self._interval = max(0.5, interval)
+        self._phase = "search"
+        self._total = 0
+        self._start_ts = 0.0
+        self._last_log_ts = 0.0
+
+    def start(self, phase: str, total: int) -> None:
+        self._phase = phase
+        self._total = max(int(total), 0)
+        now = time.monotonic()
+        self._start_ts = now
+        self._last_log_ts = now
+
+    def maybe_log(self, processed: int, pruned: int) -> None:
+        if self._total <= 0:
+            return
+        processed = max(0, min(int(processed), self._total))
+        now = time.monotonic()
+        should_log = processed == self._total or (now - self._last_log_ts) >= self._interval
+        if not should_log:
+            return
+        elapsed = max(now - self._start_ts, 0.0)
+        remaining = max(self._total - processed, 0)
+        eta = (elapsed / processed * remaining) if processed > 0 else 0.0
+        prune_pct = 0.0
+        if processed > 0:
+            prune_pct = max(0.0, min(100.0, (pruned / processed) * 100.0))
+        LOGGER.info(
+            "progress: stem=%s phase=%s window=%s/%s pruned=%.1f%% eta=%.1fs",
+            self._stem,
+            self._phase,
+            processed,
+            self._total,
+            prune_pct,
+            max(0.0, eta),
+        )
+        self._last_log_ts = now
 
 
 def _rolling_hash_power(base: int, exp: int) -> int:
@@ -588,59 +606,62 @@ def _fast_candidates(words_chars: str, line_chars: str, k: int, limit: int) -> l
     return [pos for pos, _ in ordered[:limit]]
 
 
+def _coarse_features(text: str) -> Counter[str]:
+    """提取用于粗筛的 n-gram 计数特征。"""
+
+    if not text:
+        return Counter()
+    features: Counter[str] = Counter()
+    length = len(text)
+    if length >= 3:
+        for idx in range(length - 2):
+            features[text[idx : idx + 3]] += 1
+    if not features and length >= 2:
+        for idx in range(length - 1):
+            features[text[idx : idx + 2]] += 1
+    if not features:
+        for ch in text:
+            features[ch] += 1
+    return features
+
+
+def _coarse_similarity(
+    candidate: str,
+    target_features: Counter[str],
+    cache: dict[str, Counter[str]],
+) -> float:
+    """返回候选窗口与目标文本的粗匹配得分。"""
+
+    if not candidate:
+        return 0.0
+    feats = cache.get(candidate)
+    if feats is None:
+        feats = _coarse_features(candidate)
+        cache[candidate] = feats
+    if not feats and not target_features:
+        return 1.0
+    intersection = 0
+    for key, value in feats.items():
+        target_val = target_features.get(key)
+        if target_val:
+            intersection += min(value, target_val)
+    total_a = sum(feats.values())
+    total_b = sum(target_features.values())
+    union = total_a + total_b - intersection
+    if union <= 0:
+        return 1.0
+    return intersection / union
+
+
 def _bounded_levenshtein_banded(
     a: str,
     b: str,
     max_dist: int,
     deadline: float | None = None,
 ) -> int:
-    """使用带宽限制的动态规划计算编辑距离。"""
+    """对外保留的带宽受限编辑距离实现。"""
 
-    if a == b:
-        return 0
-    if not a:
-        return len(b)
-    if not b:
-        return len(a)
-    if max_dist < 0:
-        return 0
-    if abs(len(a) - len(b)) > max_dist:
-        return max_dist + 1
-    width = max_dist
-    size = width * 2 + 1
-    inf = max_dist + 1
-    prev = [inf] * size
-    cur = [inf] * size
-    for i in range(0, len(a) + 1):
-        if deadline and time.monotonic() > deadline:
-            raise TimeoutError("banded distance deadline reached")
-        low = max(0, i - width)
-        high = min(len(b), i + width)
-        if not (low <= high):
-            return max_dist + 1
-        row_min = inf
-        for j in range(low, high + 1):
-            band_idx = j - i + width
-            if i == 0:
-                cur[band_idx] = j
-            elif j == 0:
-                cur[band_idx] = i
-            else:
-                cost = 0 if a[i - 1] == b[j - 1] else 1
-                deletion = prev[band_idx + 1] + 1 if band_idx + 1 < size else inf
-                insertion = cur[band_idx - 1] + 1 if band_idx - 1 >= 0 else inf
-                substitution = prev[band_idx] + cost
-                cur[band_idx] = min(deletion, insertion, substitution)
-            if cur[band_idx] < row_min:
-                row_min = cur[band_idx]
-        if row_min > max_dist:
-            return max_dist + 1
-        prev, cur = cur, [inf] * size
-    result_idx = len(b) - len(a) + width
-    if not (0 <= result_idx < len(prev)):
-        return max_dist + 1
-    result = prev[result_idx]
-    return result if result <= max_dist else max_dist + 1
+    return bounded_levenshtein(a, b, max_dist, deadline=deadline)
 
 
 def _search_fuzzy_window(
@@ -651,6 +672,9 @@ def _search_fuzzy_window(
     max_windows: int,
     min_anchor_ngram: int,
     deadline: float | None,
+    coarse_threshold: float,
+    coarse_len_tolerance: float,
+    progress: _ProgressLogger | None,
 ) -> _WindowMatch:
     """在规范化词串中查找与目标文本最接近的窗口。"""
 
@@ -665,10 +689,20 @@ def _search_fuzzy_window(
     alt_text = ""
     alt_distance: int | None = None
     target_len = len(line_chars)
-    evaluated = 0
     widen = max(1, int(target_len * max_distance_ratio))
+    feature_cache: dict[str, Counter[str]] = {}
+    target_features = _coarse_features(line_chars)
+    coarse_total = 0
+    coarse_passed = 0
+    fine_evaluated = 0
+    pruned_candidates = 0
+    best_pruned_text = ""
+    best_pruned_score = -1.0
+    total_windows_est = max(1, len(candidates) * ((widen * 2) + 1))
+    if progress:
+        progress.start("search", total_windows_est)
+    search_start = time.monotonic()
     for start_char in candidates:
-        evaluated += 1
         if deadline and time.monotonic() > deadline:
             raise TimeoutError("match deadline reached")
         candidate_choice: tuple[int, float, tuple[int, int], str] | None = None
@@ -678,9 +712,29 @@ def _search_fuzzy_window(
             if local_end <= local_start:
                 continue
             candidate_text = words_chars[local_start:local_end]
+            coarse_total += 1
+            similarity = _coarse_similarity(candidate_text, target_features, feature_cache)
+            if similarity > best_pruned_score:
+                best_pruned_score = similarity
+                best_pruned_text = candidate_text
+            length_ratio = 0.0
+            if target_len > 0:
+                length_ratio = abs(len(candidate_text) - target_len) / max(target_len, 1)
+            if coarse_len_tolerance > 0 and length_ratio > coarse_len_tolerance:
+                pruned_candidates += 1
+                if progress:
+                    progress.maybe_log(coarse_total, pruned_candidates)
+                continue
+            if similarity < coarse_threshold:
+                pruned_candidates += 1
+                if progress:
+                    progress.maybe_log(coarse_total, pruned_candidates)
+                continue
+            coarse_passed += 1
             for ratio in (0.10, 0.15, max_distance_ratio):
                 bound = max(1, int(target_len * ratio))
                 distance = _bounded_levenshtein_banded(candidate_text, line_chars, bound, deadline)
+                fine_evaluated += 1
                 if distance <= bound:
                     score = 1.0 - distance / max(len(line_chars), len(candidate_text))
                     if candidate_choice is None or distance < candidate_choice[0] or (
@@ -693,24 +747,78 @@ def _search_fuzzy_window(
                         best_range = (local_start, local_end)
                         best_text = candidate_text
                         LOGGER.info("早停: dist=%s ratio=%.3f", distance, score)
-                        return _WindowMatch(best_range, best_distance, best_score, best_text, evaluated, alt_text, alt_distance)
+                        elapsed = time.monotonic() - search_start
+                        if progress:
+                            progress.maybe_log(coarse_total, pruned_candidates)
+                        return _WindowMatch(
+                            best_range,
+                            best_distance,
+                            best_score,
+                            best_text,
+                            fine_evaluated,
+                            alt_text,
+                            alt_distance,
+                            coarse_total=coarse_total,
+                            coarse_passed=coarse_passed,
+                            fine_evaluated=fine_evaluated,
+                            pruned_candidates=pruned_candidates,
+                            elapsed_sec=elapsed,
+                        )
                     break
                 if alt_distance is None or distance < alt_distance:
                     alt_distance = distance
                     alt_text = candidate_text
+            if progress:
+                progress.maybe_log(coarse_total, pruned_candidates)
         if candidate_choice is None:
             continue
         distance, score, match_range, candidate_text = candidate_choice
         if (
             best_range is None
             or score > best_score
-            or (math.isclose(score, best_score, rel_tol=1e-6) and (match_range[1] - match_range[0]) < (best_range[1] - best_range[0]))
+            or (
+                math.isclose(score, best_score, rel_tol=1e-6)
+                and (match_range[1] - match_range[0]) < (best_range[1] - best_range[0])
+            )
         ):
             best_range = match_range
             best_distance = distance
             best_score = score
             best_text = candidate_text
-    return _WindowMatch(best_range, best_distance, best_score, best_text, evaluated, alt_text, alt_distance)
+    elapsed = time.monotonic() - search_start
+    if progress:
+        progress.maybe_log(min(coarse_total, total_windows_est), pruned_candidates)
+    if coarse_total:
+        LOGGER.info(
+            "粗筛通过/总候选=%s/%s (%.1f%%) 阈值=%.2f",
+            coarse_passed,
+            coarse_total,
+            (coarse_passed / coarse_total) * 100.0,
+            coarse_threshold,
+        )
+    else:
+        LOGGER.info("粗筛通过/总候选=0/0 阈值=%.2f", coarse_threshold)
+    if alt_distance is None and best_pruned_text:
+        try:
+            bound = max(len(best_pruned_text), target_len)
+            alt_distance = _bounded_levenshtein_banded(best_pruned_text, line_chars, bound, deadline)
+            alt_text = best_pruned_text
+        except TimeoutError:
+            pass
+    return _WindowMatch(
+        best_range,
+        best_distance,
+        best_score,
+        best_text,
+        fine_evaluated,
+        alt_text,
+        alt_distance,
+        coarse_total=coarse_total,
+        coarse_passed=coarse_passed,
+        fine_evaluated=fine_evaluated,
+        pruned_candidates=pruned_candidates,
+        elapsed_sec=elapsed,
+    )
 
 
 def _preview_text(text: str, limit: int = 120) -> str:
@@ -839,6 +947,9 @@ def compute_retake_keep_last(
     max_distance_ratio: float = 0.25,
     min_anchor_ngram: int = 8,
     fallback_policy: str = "safe",
+    compute_timeout_sec: float = 120.0,
+    coarse_threshold: float = 0.30,
+    coarse_len_tolerance: float = 0.35,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -866,13 +977,24 @@ def compute_retake_keep_last(
         "fallback_policy": str(fallback_policy),
         "min_sent_chars": int(min_sent_chars),
         "max_dup_gap_sec": float(max_dup_gap_sec),
+        "compute_timeout_sec": float(compute_timeout_sec),
+        "coarse_threshold": float(coarse_threshold),
+        "coarse_len_tolerance": float(coarse_len_tolerance),
     }
     LOGGER.info("参数快照: %s", json.dumps(params_snapshot, ensure_ascii=False, sort_keys=True))
 
     start_ts = time.monotonic()
-    deadline = None
+    compute_deadline: float | None = None
+    if compute_timeout_sec and compute_timeout_sec > 0:
+        compute_deadline = start_ts + compute_timeout_sec
+    search_timeout: float | None = None
     if match_timeout and match_timeout > 0:
-        deadline = time.monotonic() + match_timeout
+        search_timeout = float(match_timeout)
+    progress_logger = _ProgressLogger(debug_label or "-")
+    current_distance_ratio = float(max_distance_ratio)
+    current_anchor_ngram = max(1, int(min_anchor_ngram))
+    current_coarse_threshold = max(0.0, min(1.0, float(coarse_threshold)))
+    current_coarse_len_tol = max(0.0, float(coarse_len_tolerance))
 
     audio_duration = _resolve_audio_duration(words, audio_path)
     pause_intervals_base: list[tuple[float, float]] = []
@@ -892,6 +1014,8 @@ def compute_retake_keep_last(
             pause_intervals_base.extend(clamped_silence)
         pause_intervals_base = _merge_ranges(pause_intervals_base)
 
+    active_deadline = compute_deadline
+
     def _align_once(min_sent_cutoff: int, dup_gap: float) -> dict[str, object]:
         local_keeps: list[KeepSpan] = []
         strict_count = 0
@@ -901,8 +1025,13 @@ def compute_retake_keep_last(
         neighbor_skip = 0
         mismatch_details: list[dict[str, object]] = []
         unmatched_details: list[dict[str, object]] = []
+        coarse_total = 0
+        coarse_passed = 0
+        fine_evaluated = 0
+        pruned_candidates = 0
+        search_elapsed = 0.0
         for index, line in enumerate(lines, start=1):
-            if deadline and time.monotonic() > deadline:
+            if active_deadline and time.monotonic() > active_deadline:
                 raise TimeoutError("match deadline")
             norm_line = normalize_for_align(line)
             units = _line_to_units(norm_line)
@@ -919,14 +1048,29 @@ def compute_retake_keep_last(
                     spans.append(_word_range_to_time(word_range, words))
             else:
                 window_limit = max_windows if fast_match else max(len(asr_norm_str), len(units))
+                local_deadline = active_deadline
+                if search_timeout and search_timeout > 0:
+                    candidate_deadline = time.monotonic() + search_timeout
+                    if local_deadline is None:
+                        local_deadline = candidate_deadline
+                    else:
+                        local_deadline = min(local_deadline, candidate_deadline)
                 window_match = _search_fuzzy_window(
                     asr_norm_str,
                     units,
-                    max_distance_ratio=max_distance_ratio,
+                    max_distance_ratio=current_distance_ratio,
                     max_windows=max(1, window_limit),
-                    min_anchor_ngram=min_anchor_ngram,
-                    deadline=deadline,
+                    min_anchor_ngram=current_anchor_ngram,
+                    deadline=local_deadline,
+                    coarse_threshold=current_coarse_threshold,
+                    coarse_len_tolerance=current_coarse_len_tol,
+                    progress=progress_logger,
                 )
+                coarse_total += window_match.coarse_total
+                coarse_passed += window_match.coarse_passed
+                fine_evaluated += window_match.fine_evaluated
+                pruned_candidates += window_match.pruned_candidates
+                search_elapsed += window_match.elapsed_sec
                 if window_match.match_range is not None and window_match.match_distance is not None:
                     word_range = _char_range_to_word_range(window_match.match_range, char_map)
                     if word_range is not None:
@@ -995,6 +1139,11 @@ def compute_retake_keep_last(
             "neighbor_gap_skipped": neighbor_skip,
             "mismatch_samples": mismatch_details,
             "unmatched_examples": unmatched_details,
+            "coarse_total": coarse_total,
+            "coarse_passed": coarse_passed,
+            "fine_evaluated": fine_evaluated,
+            "pruned_candidates": pruned_candidates,
+            "search_elapsed_sec": search_elapsed,
         }
 
     keeps: list[KeepSpan] = []
@@ -1016,13 +1165,71 @@ def compute_retake_keep_last(
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
     recomputed = False
+    coarse_total = 0
+    coarse_passed = 0
+    fine_evaluated_total = 0
+    pruned_candidates_total = 0
+    search_elapsed_total = 0.0
+
+    degrade_attempted = False
+    degrade_reason: str | None = None
 
     while True:
         try:
             alignment = _align_once(current_min_sent, current_dup_gap)
         except TimeoutError:
             timed_out = True
-            LOGGER.warning("对齐超时，进入回退策略：%s", fallback_policy)
+            if not degrade_attempted:
+                degrade_attempted = True
+                degrade_reason = "timeout"
+                LOGGER.warning(
+                    "降级: stem=%s reason=timeout -> 放宽阈值重新尝试",
+                    debug_label or "-",
+                )
+                current_distance_ratio = min(0.6, current_distance_ratio * 1.5)
+                current_coarse_threshold = max(0.05, current_coarse_threshold * 0.6)
+                current_coarse_len_tol = min(0.9, current_coarse_len_tol + 0.2)
+                current_anchor_ngram = max(3, max(1, current_anchor_ngram // 2))
+                if compute_timeout_sec and compute_timeout_sec > 0:
+                    compute_deadline = time.monotonic() + compute_timeout_sec
+                else:
+                    compute_deadline = None
+                active_deadline = compute_deadline
+                LOGGER.info(
+                    "降级后参数: distance_ratio=%.3f anchor=%s coarse_threshold=%.2f len_tol=%.2f",
+                    current_distance_ratio,
+                    current_anchor_ngram,
+                    current_coarse_threshold,
+                    current_coarse_len_tol,
+                )
+                continue
+            LOGGER.warning(
+                "降级失败: stem=%s reason=timeout -> 启用回退策略 %s",
+                debug_label or "-",
+                fallback_policy,
+            )
+            break
+        except KeyboardInterrupt:
+            timed_out = True
+            if not degrade_attempted:
+                degrade_attempted = True
+                degrade_reason = "interrupt"
+                LOGGER.warning("捕获 KeyboardInterrupt，降级重试。")
+                current_distance_ratio = min(0.6, current_distance_ratio * 1.5)
+                current_coarse_threshold = max(0.05, current_coarse_threshold * 0.6)
+                current_coarse_len_tol = min(0.9, current_coarse_len_tol + 0.2)
+                current_anchor_ngram = max(3, max(1, current_anchor_ngram // 2))
+                if compute_timeout_sec and compute_timeout_sec > 0:
+                    compute_deadline = time.monotonic() + compute_timeout_sec
+                else:
+                    compute_deadline = None
+                active_deadline = compute_deadline
+                continue
+            LOGGER.warning(
+                "降级失败: stem=%s reason=interrupt -> 启用回退策略 %s",
+                debug_label or "-",
+                fallback_policy,
+            )
             break
         raw_keeps = list(alignment.get("keeps", []))
         strict_matches = int(alignment.get("strict_matches", 0))
@@ -1032,6 +1239,11 @@ def compute_retake_keep_last(
         neighbor_gap_skipped = int(alignment.get("neighbor_gap_skipped", 0))
         mismatch_samples = list(alignment.get("mismatch_samples", []))
         unmatched_examples = list(alignment.get("unmatched_examples", []))
+        coarse_total = int(alignment.get("coarse_total", 0))
+        coarse_passed = int(alignment.get("coarse_passed", 0))
+        fine_evaluated_total = int(alignment.get("fine_evaluated", 0))
+        pruned_candidates_total = int(alignment.get("pruned_candidates", 0))
+        search_elapsed_total = float(alignment.get("search_elapsed_sec", 0.0))
 
         pause_intervals = list(pause_intervals_base)
         active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
@@ -1068,6 +1280,11 @@ def compute_retake_keep_last(
             "keep_duration": keep_duration,
             "silence_regions": silence_count,
             "mismatch_examples": mismatch_samples[:3],
+            "coarse_total": coarse_total,
+            "coarse_passed": coarse_passed,
+            "fine_evaluated": fine_evaluated_total,
+            "pruned_candidates": pruned_candidates_total,
+            "search_elapsed_sec": search_elapsed_total,
         }
         stats.update(refine_stats)
         if unmatched >= 3 and mismatch_samples:
@@ -1083,18 +1300,27 @@ def compute_retake_keep_last(
             stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
         else:
             stats["cut_ratio"] = 0.0
+        if stats.get("coarse_total", 0):
+            stats["prune_rate"] = max(
+                0.0,
+                min(1.0, 1.0 - (stats.get("coarse_passed", 0) / max(stats.get("coarse_total", 1), 1))),
+            )
+        else:
+            stats["prune_rate"] = 0.0
 
         if not recomputed and stats["cut_ratio"] > 0.6 and raw_keeps:
             new_min_sent = max(current_min_sent + 4, int(math.ceil(current_min_sent * 1.2)))
             new_dup_gap = max(0.5, current_dup_gap * 0.6) if current_dup_gap > 0 else current_dup_gap
             if new_min_sent != current_min_sent or not math.isclose(new_dup_gap, current_dup_gap, rel_tol=1e-2):
                 LOGGER.warning(
-                    "过裁剪保护触发 -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
+                    "降级: stem=%s reason=cut_ratio_guard -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
+                    debug_label or "-",
                     current_min_sent,
                     new_min_sent,
                     current_dup_gap,
                     new_dup_gap,
                 )
+                degrade_reason = degrade_reason or "cut_ratio_guard"
                 current_min_sent = new_min_sent
                 current_dup_gap = new_dup_gap
                 recomputed = True
@@ -1116,6 +1342,12 @@ def compute_retake_keep_last(
             "keep_duration": 0.0,
             "silence_regions": silence_count,
             "mismatch_examples": [],
+            "coarse_total": 0,
+            "coarse_passed": 0,
+            "fine_evaluated": 0,
+            "pruned_candidates": 0,
+            "search_elapsed_sec": 0.0,
+            "prune_rate": 0.0,
         }
         keeps = []
         edl_keep_segments = []
@@ -1137,6 +1369,13 @@ def compute_retake_keep_last(
         fallback_used = True
         fallback_keeps: list[KeepSpan] | None = None
         fallback_engine = match_engine
+        if "no-match" in fallback_reasons and degrade_reason is None:
+            degrade_reason = "low_match"
+            LOGGER.warning(
+                "降级: stem=%s reason=low_match -> 启用回退策略 %s",
+                debug_label or "-",
+                fallback_policy,
+            )
         if fallback_policy in {"safe", "align-greedy"}:
             fallback_keeps = _fallback_align_greedy(
                 words,
@@ -1251,9 +1490,20 @@ def compute_retake_keep_last(
     else:
         stats.setdefault("fallback_reason", "")
     stats["timed_out"] = timed_out
+    stats["timeout_fallback"] = bool(timed_out and fallback_used)
     stats["match_engine"] = match_engine
     stats["params_snapshot"] = params_snapshot
-    stats["latency_ms"] = int((time.monotonic() - start_ts) * 1000)
+    total_elapsed = time.monotonic() - start_ts
+    stats["latency_ms"] = int(total_elapsed * 1000)
+    stats["elapsed_sec"] = total_elapsed
+    if degrade_reason:
+        stats["degrade_reason"] = degrade_reason
+    else:
+        stats.setdefault("degrade_reason", "")
+    stats["distance_ratio_final"] = current_distance_ratio
+    stats["coarse_threshold_final"] = current_coarse_threshold
+    stats["coarse_len_tol_final"] = current_coarse_len_tol
+    stats["anchor_ngram_final"] = current_anchor_ngram
     stats["unmatched_examples"] = unmatched_examples[:10]
     stats["kept_count"] = len(edl_keep_segments)
     stats["deleted_count"] = len(drops)

@@ -11,7 +11,7 @@ import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
 import time  # 统计耗时
 from dataclasses import asdict, dataclass  # 复用数据类结构化统计
-from concurrent.futures import ThreadPoolExecutor, as_completed  # 批处理并发执行
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed  # 并发执行
 from pathlib import Path  # 跨平台路径处理
 from typing import Iterable, Optional, Sequence, Tuple
 
@@ -631,6 +631,9 @@ def _process_retake_item(
     max_distance_ratio: float,
     min_anchor_ngram: int,
     fallback_policy: str,
+    compute_timeout_sec: float,
+    coarse_threshold: float,
+    coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
     *,
@@ -731,6 +734,9 @@ def _process_retake_item(
                 max_distance_ratio=max_distance_ratio,
                 min_anchor_ngram=min_anchor_ngram,
                 fallback_policy=fallback_policy,
+                compute_timeout_sec=compute_timeout_sec,
+                coarse_threshold=coarse_threshold,
+                coarse_len_tolerance=coarse_len_tolerance,
             )
 
         def _load_context_preview() -> str:
@@ -974,6 +980,9 @@ def _run_retake_batch(
     max_distance_ratio: float,
     min_anchor_ngram: int,
     fallback_policy: str,
+    compute_timeout_sec: float,
+    coarse_threshold: float,
+    coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
     pause_align: bool,
@@ -1002,14 +1011,14 @@ def _run_retake_batch(
     start = time.perf_counter()  # 记录耗时
     items: list[dict] = []  # 存储处理结果
     failed = 0  # 统计失败数
-    executor: ThreadPoolExecutor | None = None  # 线程池引用
+    executor: ProcessPoolExecutor | None = None  # 进程池引用
     futures = []  # 并发任务列表
     processed = 0
     last_progress = start
     audio_root_effective = audio_root or materials_dir
     try:
         if workers and workers > 1:  # 并发模式
-            executor = ThreadPoolExecutor(max_workers=workers)  # 构建线程池
+            executor = ProcessPoolExecutor(max_workers=workers)  # 构建进程池
             for words_path in words_files:  # 遍历每个 JSON
                 text_path = find_text_for_stem(materials_dir, stem_from_words_json(words_path), text_patterns)  # 查找文本
                 if text_path is None:  # 未匹配到文本
@@ -1056,6 +1065,9 @@ def _run_retake_batch(
                         max_distance_ratio,
                         min_anchor_ngram,
                         fallback_policy,
+                        compute_timeout_sec,
+                        coarse_threshold,
+                        coarse_len_tolerance,
                         prefer_relative_audio,
                         path_style,
                         pause_align=pause_align,
@@ -1128,6 +1140,9 @@ def _run_retake_batch(
                     max_distance_ratio,
                     min_anchor_ngram,
                     fallback_policy,
+                    compute_timeout_sec,
+                    coarse_threshold,
+                    coarse_len_tolerance,
                     prefer_relative_audio,
                     path_style,
                     pause_align=pause_align,
@@ -1193,8 +1208,11 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     fast_match = bool(args.fast_match)
     max_windows = int(args.max_windows)
     match_timeout = float(args.match_timeout)
+    compute_timeout_sec = float(args.compute_timeout_sec)
     max_distance_ratio = float(args.max_distance_ratio)
     min_anchor_ngram = int(args.min_anchor_ngram)
+    coarse_threshold = float(args.coarse_threshold)
+    coarse_len_tolerance = float(args.coarse_len_tol)
     fallback_policy = args.fallback_policy
     debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
     if debug_csv and args.workers and args.workers > 1:
@@ -1241,6 +1259,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            compute_timeout_sec,
+            coarse_threshold,
+            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             pause_align=pause_align,
@@ -1292,6 +1313,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            compute_timeout_sec,
+            coarse_threshold,
+            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             pause_align,
@@ -1343,8 +1367,15 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "kept_count",
         "deleted_count",
         "cut_seconds",
+        "coarse_total",
+        "coarse_passed",
+        "fine_evaluated",
+        "pruned_candidates",
+        "search_elapsed_sec",
+        "timeout_fallback",
+        "elapsed_sec",
     ]  # 汇总字段
-    float_keys = {"cut_seconds"}
+    float_keys = {"cut_seconds", "search_elapsed_sec", "elapsed_sec"}
     aggregated = {}
     for key in stat_keys:
         if key in float_keys:
@@ -1455,8 +1486,11 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
+    parts.extend(["--compute-timeout-sec", str(args.compute_timeout_sec)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
+    parts.extend(["--coarse-threshold", str(args.coarse_threshold)])
+    parts.extend(["--coarse-len-tol", str(args.coarse_len_tol)])
     parts.extend(["--fallback-policy", args.fallback_policy])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
@@ -1476,7 +1510,10 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         "workers": args.workers,
         "max_windows": args.max_windows,
         "match_timeout": args.match_timeout,
+        "compute_timeout_sec": args.compute_timeout_sec,
         "fallback_policy": args.fallback_policy,
+        "coarse_threshold": args.coarse_threshold,
+        "coarse_len_tol": args.coarse_len_tol,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2379,6 +2416,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个条目的匹配时间预算（秒，默认 20.0）",
     )
     retake.add_argument(
+        "--compute-timeout-sec",
+        type=float,
+        default=120.0,
+        help="单个条目的整体对齐超时，秒（默认 120）",
+    )
+    retake.add_argument(
         "--max-distance-ratio",
         type=float,
         default=0.25,
@@ -2389,6 +2432,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="候选预筛锚点 n-gram 长度（默认 8）",
+    )
+    retake.add_argument(
+        "--coarse-threshold",
+        type=float,
+        default=0.30,
+        help="粗筛相似度通过阈值（0-1，默认 0.30）",
+    )
+    retake.add_argument(
+        "--coarse-len-tol",
+        type=float,
+        default=0.35,
+        help="粗筛允许的窗口长度差占比（默认 0.35）",
     )
     retake.add_argument(
         "--fallback-policy",
