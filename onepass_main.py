@@ -31,6 +31,7 @@ from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需�
     export_srt,
     export_txt,
 )
+from onepass.text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir  # 引入统一日志目录工具
 from onepass.ux import (  # 引入命令行交互的工具函数
     print_error,  # 打印错误信息的工具
@@ -51,6 +52,7 @@ DEFAULT_MATERIALS_DIR = ROOT_DIR / "materials"  # 默认素材目录，存放 JS
 DEFAULT_OUT_DIR = ROOT_DIR / "out"  # 默认输出目录，统一存放产出文件
 DEFAULT_NORMALIZED_DIR = ROOT_DIR / "out" / "norm"  # 默认的规范文本目录
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化脚本的默认报告路径
+DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
 DEFAULT_SCORE_THRESHOLD = 80  # 对齐得分的默认阈值，低于则提示人工确认
 AUDIO_PRIORITY = {  # 音频格式优先级映射，数值越小优先级越高
     ".wav": 0,  # 无损 WAV 优先
@@ -1412,7 +1414,8 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
         return
 
     try:
-        result = compute_retake_keep_last(list(doc), txt_path)  # 计算保留最后一遍
+        alias_map = load_alias_map(DEFAULT_ALIAS_MAP)
+        result = compute_retake_keep_last(list(doc), txt_path, alias_map=alias_map)  # 计算保留最后一遍
     except Exception as exc:  # pragma: no cover - 交互流程
         print_error(f"计算保留最后一遍失败: {exc}")
         return

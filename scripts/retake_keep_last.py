@@ -4,6 +4,7 @@
     python scripts/retake_keep_last.py \
       --words-json materials/example/demo.words.json \
       --text materials/example/demo.txt \
+      --alias-map config/default_alias_map.json \
       --out out
 """
 from __future__ import annotations
@@ -16,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+DEFAULT_ALIAS_MAP = ROOT / "config" / "default_alias_map.json"
+
 from onepass.asr_loader import load_words
 from onepass.retake_keep_last import (
     compute_retake_keep_last,
@@ -24,6 +27,7 @@ from onepass.retake_keep_last import (
     export_srt,
     export_txt,
 )
+from onepass.text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir, setup_logger
 
 
@@ -50,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--text", required=True, help="原文 TXT 路径 (一行一段)")
     # 输出目录默认使用 out
     parser.add_argument("--out", default="out", help="输出目录 (默认 out)")
+    parser.add_argument("--alias-map", default=str(DEFAULT_ALIAS_MAP), help="词别名映射 JSON (默认 config/default_alias_map.json)")
     # 额外参数用于在 EDL 中记录音频元信息
     parser.add_argument("--source-audio", help="可选：EDL 中填充的源音频相对路径")
     parser.add_argument("--samplerate", type=int, help="可选：EDL 建议采样率")
@@ -60,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     words_json = Path(args.words_json)
     text_path = Path(args.text)
     out_dir = Path(args.out)
+
+    alias_map = load_alias_map(Path(args.alias_map))
 
     logger.info(
         "启动保留最后一遍导出",
@@ -76,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # 调用核心策略，传入词序列与原文路径
-        result = compute_retake_keep_last(list(doc), text_path)
+        result = compute_retake_keep_last(list(doc), text_path, alias_map=alias_map)
     except Exception as exc:  # pragma: no cover - CLI 交互路径
         logger.exception("保留最后一遍计算失败")
         print(f"保留最后一遍计算失败: {exc}", file=sys.stderr)

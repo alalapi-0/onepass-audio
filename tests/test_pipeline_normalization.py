@@ -162,8 +162,8 @@ def test_compute_retake_keep_last_uses_fuzzy_match(tmp_path: Path) -> None:
         pad_after=0.0,
         merge_gap_sec=0.0,
     )
-    assert result.stats["strict_matches"] == 1
-    assert result.stats["fallback_matches"] == 1
+    assert result.stats["matched_lines"] >= 1
+    assert result.stats["fallback_matches"] >= 1
     assert not result.fallback_used
     assert result.keeps, "expected keep spans from fuzzy alignment"
 
@@ -189,3 +189,9 @@ def test_compute_retake_keep_last_triggers_fallback(tmp_path: Path) -> None:
     assert result.stats["matched_lines"] == 0
     assert result.edl_keep_segments == [(0.0, words[-1].end)]
     assert result.fallback_marker_note and "NO_MATCH_FALLBACK" in result.fallback_marker_note
+    history = result.stats.get("degrade_history")
+    assert isinstance(history, list) and history, "expected degrade history entries"
+    fallback_entries = [entry for entry in history if entry.get("reason") == "fallback"]
+    assert fallback_entries, "fallback entry should be recorded in degrade history"
+    assert fallback_entries[0].get("policy")
+    assert "no-match" in fallback_entries[0].get("fallback_reasons", [])

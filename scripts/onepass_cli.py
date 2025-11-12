@@ -13,7 +13,7 @@ import time  # 统计耗时
 from dataclasses import asdict, dataclass  # 复用数据类结构化统计
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed  # 并发执行
 from pathlib import Path  # 跨平台路径处理
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 # 计算项目根目录，确保脚本可直接运行
 ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
@@ -62,6 +62,7 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
 )
 from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.text_norm import (  # 规范化工具
+    load_alias_map,
     load_char_map,
     normalize_chinese_text,
     normalize_pipeline,
@@ -78,11 +79,25 @@ from onepass.sent_align import (
     MERGE_ADJ_GAP_SEC,
 )
 from onepass.logging_utils import default_log_dir, setup_logger
-from onepass.web import ensure_server_running, run_server as run_ui_server, spawn_server as spawn_ui_server, wait_for_server
+try:  # Web UI 功能依赖 fastapi，缺失时允许其它功能继续使用
+    from onepass.web import (
+        ensure_server_running,
+        run_server as run_ui_server,
+        spawn_server as spawn_ui_server,
+        wait_for_server,
+    )
+    _WEB_IMPORT_ERROR: ModuleNotFoundError | None = None
+except ModuleNotFoundError as web_exc:  # pragma: no cover - 测试环境可能缺少 fastapi
+    ensure_server_running = None  # type: ignore[assignment]
+    run_ui_server = None  # type: ignore[assignment]
+    spawn_ui_server = None  # type: ignore[assignment]
+    wait_for_server = None  # type: ignore[assignment]
+    _WEB_IMPORT_ERROR = web_exc
 
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
+DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 
@@ -110,6 +125,15 @@ def _build_cli_example(subcommand: str, parts: Sequence[str]) -> str:
 
     args = [sys.executable, str(Path(__file__).resolve()), subcommand, *parts]  # 拼接完整命令
     return shlex.join(args)  # 返回 shell 风格字符串
+
+
+def _ensure_web_available() -> None:
+    """若 Web UI 依赖缺失，则抛出更加友好的错误。"""
+
+    if _WEB_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "Web UI 功能需要 fastapi 依赖，请运行 `pip install -r requirements.txt` 后重试"
+        ) from _WEB_IMPORT_ERROR
 
 
 def _summarize_context(text: str, width: int = 20) -> str:
@@ -637,6 +661,7 @@ def _process_retake_item(
     coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
+    alias_map: Mapping[str, Sequence[str]] | None,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -728,6 +753,7 @@ def _process_retake_item(
                 merge_gap_sec=merge_gap_sec,
                 silence_ranges=effective_silence,
                 audio_path=audio_path,
+                alias_map=alias_map,
                 debug_label=stem,
                 fast_match=fast_match,
                 max_windows=max_windows,
@@ -880,6 +906,7 @@ def _process_retake_item(
             _append_debug_rows(debug_csv, result.debug_rows, mode)
 
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
+        stats["alias_map_used"] = bool(alias_map)
         if result.fallback_used:
             stats["fallback_message"] = result.fallback_reason or "keep_full_audio"
         if result.unmatched_samples:
@@ -986,6 +1013,7 @@ def _run_retake_batch(
     coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
+    alias_map: Mapping[str, Sequence[str]] | None,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -1071,6 +1099,7 @@ def _run_retake_batch(
                         coarse_len_tolerance,
                         prefer_relative_audio,
                         path_style,
+                        alias_map,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1224,6 +1253,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     path_style = str(getattr(args, "path_style", "auto")).lower()
     if path_style not in {"auto", "posix", "windows"}:
         raise ValueError("--path-style 仅支持 auto/posix/windows")
+    alias_map = load_alias_map(Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)))
     if args.audio_root:
         audio_root_path = Path(args.audio_root).expanduser().resolve()
     elif args.words_json:
@@ -1265,6 +1295,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
+            alias_map,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1319,6 +1350,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
+            alias_map,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1427,6 +1459,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         if args.workers:
             parts.extend(["--workers", str(args.workers)])
     parts.extend(["--out", str(Path(args.out))])
+    parts.extend(["--alias-map", str(Path(args.alias_map))])
     if args.audio_root:
         parts.extend(["--audio-root", str(Path(args.audio_root))])
     if not args.prefer_relative_audio:
@@ -1507,6 +1540,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         "audio_root": snapshot_audio_root,
         "prefer_relative_audio": args.prefer_relative_audio,
         "path_style": args.path_style,
+        "alias_map": str(args.alias_map),
         "fast_match": args.fast_match,
         "workers": args.workers,
         "max_windows": args.max_windows,
@@ -1769,6 +1803,7 @@ def handle_render_audio(args: argparse.Namespace) -> int:
 def handle_serve_web(args: argparse.Namespace) -> int:
     """处理 serve-web 子命令，启动本地可视化控制台。"""
 
+    _ensure_web_available()
     out_dir = Path(args.out).expanduser().resolve()
     audio_root = Path(args.audio_root).expanduser().resolve() if args.audio_root else None
     LOGGER.info(
@@ -1817,6 +1852,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     path_style = str(getattr(args, "path_style", "auto")).lower()
     if path_style not in {"auto", "posix", "windows"}:
         raise ValueError("--path-style 仅支持 auto/posix/windows")
+
+    alias_map_path = Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)).expanduser()
+    alias_map = load_alias_map(alias_map_path)
+    report["alias_map"] = str(alias_map_path)
 
     norm_pattern = _casefold_pattern(args.norm_glob)
     norm_out_dir = out_dir / "norm"
@@ -1879,8 +1918,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     match_timeout = float(getattr(args, "match_timeout", 20.0))
     max_distance_ratio = float(getattr(args, "max_distance_ratio", 0.25))
     min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
-    fallback_policy = getattr(args, "fallback_policy", "safe")
-    compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 120.0))
+    fallback_policy = getattr(args, "fallback_policy", "greedy")
+    compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
     coarse_threshold = float(getattr(args, "coarse_threshold", 0.30))
     coarse_len_tolerance = float(
         getattr(args, "coarse_len_tol", getattr(args, "coarse_len_tolerance", 0.35))
@@ -1956,6 +1995,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
+            alias_map,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -2200,6 +2240,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         str(Path(args.output_dir)),
         "--char-map",
         str(Path(args.char_map)),
+        "--alias-map",
+        str(Path(args.alias_map)),
         "--opencc",
         args.opencc,
         "--glob-text",
@@ -2256,6 +2298,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     snapshot = {
         "emit_align": args.emit_align,
         "char_map": str(args.char_map),
+        "alias_map": str(args.alias_map),
         "opencc": args.opencc,
         "norm_glob": args.norm_glob,
         "glob_words": args.glob_words,
@@ -2308,6 +2351,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     first_success_stem = success_stems[0] if success_stems else None
 
     if args.serve:
+        _ensure_web_available()
         out_dir = Path(args.output_dir).expanduser().resolve()
         if args.audio_root:
             audio_root = Path(args.audio_root).expanduser().resolve()
@@ -2344,6 +2388,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         return 0
 
     if args.open_ui:
+        _ensure_web_available()
         out_dir = Path(args.output_dir).expanduser().resolve()
         if args.audio_root:
             audio_root = Path(args.audio_root).expanduser().resolve()
@@ -2417,6 +2462,7 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument("--text", help="单文件模式：原文 TXT")
     retake.add_argument("--out", required=True, help="输出目录")
     retake.add_argument("--audio-root", help="源音频搜索根目录（默认=素材根或词级 JSON 所在目录）")
+    retake.add_argument("--alias-map", default=str(DEFAULT_ALIAS_MAP), help="词别名映射 JSON (默认 config/default_alias_map.json)")
     retake.add_argument(
         "--prefer-relative-audio",
         dest="prefer_relative_audio",
@@ -2544,50 +2590,50 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--max-windows",
         type=int,
-        default=50,
-        help="每行最多尝试的候选窗口数（默认 50）",
+        default=200,
+        help="每行最多尝试的候选窗口数（默认 200）",
     )
     retake.add_argument(
         "--match-timeout",
         type=float,
-        default=20.0,
-        help="每个条目的匹配时间预算（秒，默认 20.0）",
+        default=60.0,
+        help="每个条目的匹配时间预算（秒，默认 60.0）",
     )
     retake.add_argument(
         "--compute-timeout-sec",
         type=float,
-        default=120.0,
-        help="单个条目的整体对齐超时，秒（默认 120）",
+        default=300.0,
+        help="单个条目的整体对齐超时，秒（默认 300）",
     )
     retake.add_argument(
         "--max-distance-ratio",
         type=float,
-        default=0.25,
-        help="允许的编辑距离占比上限（默认 0.25）",
+        default=0.35,
+        help="允许的编辑距离占比上限（默认 0.35）",
     )
     retake.add_argument(
         "--min-anchor-ngram",
         type=int,
-        default=8,
-        help="候选预筛锚点 n-gram 长度（默认 8）",
+        default=6,
+        help="候选预筛锚点 n-gram 长度（默认 6）",
     )
     retake.add_argument(
         "--coarse-threshold",
         type=float,
-        default=0.30,
-        help="粗筛相似度通过阈值（0-1，默认 0.30）",
+        default=0.20,
+        help="粗筛相似度通过阈值（0-1，默认 0.20）",
     )
     retake.add_argument(
         "--coarse-len-tol",
         type=float,
-        default=0.35,
-        help="粗筛允许的窗口长度差占比（默认 0.35）",
+        default=0.45,
+        help="粗筛允许的窗口长度差占比（默认 0.45）",
     )
     retake.add_argument(
         "--fallback-policy",
-        choices=["safe", "keep-all", "align-greedy"],
-        default="safe",
-        help="对齐失败时的回退策略（默认 safe）",
+        choices=["safe", "keep-all", "align-greedy", "greedy"],
+        default="greedy",
+        help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
@@ -2698,6 +2744,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="字符映射配置 JSON (默认 config/default_char_map.json)",
     )
     pipeline.add_argument(
+        "--alias-map",
+        dest="alias_map",
+        default=str(DEFAULT_ALIAS_MAP),
+        help="词别名映射 JSON (默认 config/default_alias_map.json)",
+    )
+    pipeline.add_argument(
         "--opencc",
         choices=["none", "t2s", "s2t"],
         default="none",
@@ -2768,32 +2820,32 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--max-windows",
         type=int,
-        default=50,
-        help="每行最多尝试的候选窗口数（默认 50）",
+        default=200,
+        help="每行最多尝试的候选窗口数（默认 200）",
     )
     pipeline.add_argument(
         "--match-timeout",
         type=float,
-        default=20.0,
-        help="每个条目的匹配时间预算（秒，默认 20.0）",
+        default=60.0,
+        help="每个条目的匹配时间预算（秒，默认 60.0）",
     )
     pipeline.add_argument(
         "--max-distance-ratio",
         type=float,
-        default=0.25,
-        help="允许的编辑距离占比上限（默认 0.25）",
+        default=0.35,
+        help="允许的编辑距离占比上限（默认 0.35）",
     )
     pipeline.add_argument(
         "--min-anchor-ngram",
         type=int,
-        default=8,
-        help="候选预筛锚点 n-gram 长度（默认 8）",
+        default=6,
+        help="候选预筛锚点 n-gram 长度（默认 6）",
     )
     pipeline.add_argument(
         "--fallback-policy",
-        choices=["safe", "keep-all", "align-greedy"],
-        default="safe",
-        help="对齐失败时的回退策略（默认 safe）",
+        choices=["safe", "keep-all", "align-greedy", "greedy"],
+        default="greedy",
+        help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
     )
     pipeline.set_defaults(func=handle_all_in_one)
 

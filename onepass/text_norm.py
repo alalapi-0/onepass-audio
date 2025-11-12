@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import json  # 读取字符映射配置
+import logging
 import re  # 处理空白归一
 import shutil  # 检测可执行文件是否存在
 import subprocess  # 调用外部 opencc
 import unicodedata  # 进行 Unicode 归一化
 from pathlib import Path  # 使用 Path 处理路径
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Mapping, Sequence
 
 try:  # 优先复用脚本目录实现的折行规则，便于单独调试
     from scripts.text_normalize import collapse_lines_preserve_spacing_rules
@@ -30,6 +31,9 @@ except ModuleNotFoundError:  # pragma: no cover - fallback when脚本不可用
         return collapsed.strip()
 
 __all__ = [
+    "load_alias_map",
+    "normalize_text",
+    "apply_alias_map",
     "load_char_map",
     "fullwidth_halfwidth_normalize",
     "apply_char_map",
@@ -48,6 +52,8 @@ __all__ = [
     "normalize_chinese_text",
     "collapse_and_resplit",
 ]
+
+LOGGER = logging.getLogger("onepass.text_norm")
 
 _ZERO_WIDTH_AND_CONTROL = {
     ord(ch)
@@ -151,6 +157,9 @@ _RE_CJK_PUNCT_LEFT = re.compile(rf"\s+(?=[{_CJK_PUNCT_CHARS}])")
 _RE_CJK_PUNCT_RIGHT = re.compile(rf"(?<=[{_CJK_PUNCT_CHARS}])\s+")
 _RE_LATIN_GAPS_LEFT = re.compile(rf"([{_CJK_CHAR_CLASS}])\s{{2,}}([0-9A-Za-z])")
 _RE_LATIN_GAPS_RIGHT = re.compile(rf"([0-9A-Za-z])\s{{2,}}([{_CJK_CHAR_CLASS}])")
+_RE_CJK_ASCII_GAP_LEFT = re.compile(rf"(?<=[{_CJK_CHAR_CLASS}])[ \t]+(?=[0-9A-Za-z])")
+_RE_CJK_ASCII_GAP_RIGHT = re.compile(rf"(?<=[0-9A-Za-z])[ \t]+(?=[{_CJK_CHAR_CLASS}])")
+_RE_NEWLINE_TRIM = re.compile(r"[ \t]*\n[ \t]*")
 _RE_PAREN_INNER_LEFT = re.compile(r"（\s+")
 _RE_PAREN_INNER_RIGHT = re.compile(r"\s+）")
 _RE_PAREN_OUTER_LEFT = re.compile(rf"(?<=[{_CJK_CHAR_CLASS}])\s+（")
@@ -180,6 +189,100 @@ _ASCII_TO_CJK_PUNCT = {
     "[": "【",
     "]": "】",
 }
+
+
+def load_alias_map(path: Path | str | None) -> dict[str, list[str]]:
+    """加载词别名映射 JSON，失败时返回空映射。"""
+
+    if not path:
+        return {}
+    candidate = Path(path).expanduser()
+    try:
+        if not candidate.exists():
+            LOGGER.debug("alias map not found: %s", candidate)
+            return {}
+        data = json.loads(candidate.read_text(encoding="utf-8-sig", errors="replace"))
+    except Exception as exc:  # pragma: no cover - 容忍配置异常
+        LOGGER.warning("加载 alias map 失败: path=%s error=%s", candidate, exc)
+        return {}
+    mapping: dict[str, list[str]] = {}
+    if isinstance(data, dict):
+        for key, values in data.items():
+            canonical = str(key or "").strip()
+            if not canonical:
+                continue
+            variants: list[str] = []
+            if isinstance(values, str):
+                values = [values]
+            if isinstance(values, Sequence):
+                for item in values:
+                    text_value = str(item or "").strip()
+                    if text_value and text_value != canonical:
+                        variants.append(text_value)
+            mapping[canonical] = variants
+    return mapping
+
+
+def apply_alias_map(text: str, alias_map: Mapping[str, Sequence[str]] | None) -> str:
+    """使用别名映射表将变体替换为主形。"""
+
+    if not alias_map or not text:
+        return text
+    result = text
+    for canonical, variants in alias_map.items():
+        canonical_str = str(canonical or "").strip()
+        if not canonical_str:
+            continue
+        for variant in variants:
+            variant_str = str(variant or "").strip()
+            if not variant_str or variant_str == canonical_str:
+                continue
+            result = result.replace(variant_str, canonical_str)
+    return result
+
+
+def normalize_text(
+    text: str,
+    *,
+    collapse_lines: bool = True,
+    drop_foreign_brackets: bool = False,
+    alias_map: Mapping[str, Sequence[str]] | None = None,
+) -> str:
+    """对原始文本做轻量规范化，兼顾中英文间距与别名归一。"""
+
+    if not text:
+        return ""
+    value = text.replace("\r\n", "\n").replace("\r", "\n")
+    value = value.translate(_REMOVE_ZERO_WIDTH)
+    value = unicodedata.normalize("NFKC", value)
+    value = value.replace(_FULLWIDTH_SPACE, " ")
+    value = value.translate(_PUNCT_TRANSLATION)
+    value = _RE_ASCII_ELLIPSIS.sub("…", value)
+    value = _RE_CJK_ELLIPSIS.sub("…", value)
+    value = _RE_DASH_VARIANTS.sub("—", value)
+    value = _RE_MIDDLE_DOT_RUN.sub("·", value)
+    if collapse_lines:
+        value = collapse_lines_preserve_spacing_rules(value)
+    else:
+        value = value.replace("	", " ")
+        value = _RE_NEWLINE_TRIM.sub("\n", value)
+        value = re.sub(r" {2,}", " ", value)
+    value = _RE_CJK_GAPS.sub("", value)
+    value = _RE_CJK_PUNCT_LEFT.sub("", value)
+    value = _RE_CJK_PUNCT_RIGHT.sub("", value)
+    value = _RE_CJK_ASCII_GAP_LEFT.sub("", value)
+    value = _RE_CJK_ASCII_GAP_RIGHT.sub("", value)
+    value = _RE_LATIN_GAPS_LEFT.sub(r"\1 \2", value)
+    value = _RE_LATIN_GAPS_RIGHT.sub(r"\1 \2", value)
+    if drop_foreign_brackets:
+        value = re.sub(r"（[^）]*[A-Za-z][^）]*）", "", value)
+    if alias_map:
+        value = apply_alias_map(value, alias_map)
+    if collapse_lines:
+        return value.strip()
+    lines = [line.strip() for line in value.split("\n")]
+    return "\n".join(lines)
+
 
 _SENTENCE_ENDINGS = set("。！？!?…」』”’）】》")
 _WORD_CHAR_PATTERN = re.compile(r"[\w\u4e00-\u9fff]")

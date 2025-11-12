@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import shlex  # 美化 dry-run 输出
-import subprocess  # 调用 ffmpeg/ffprobe
+from .utils_subproc import run_cmd  # 统一子进程调用
 from collections import deque
 from dataclasses import dataclass  # 构建结构化数据模型
 from pathlib import Path, PurePosixPath
@@ -184,7 +184,7 @@ def load_edl(edl_path: Path) -> EDLDoc:
 
     original_segment_count = len(raw_segments)
     if not raw_segments:
-        LOGGER.warning("EDL 未包含任何 segments，后续渲染将跳过。")
+        raise ValueError("EDL 缺少有效 segments")
 
     segments: list[EDLSegment] = []  # 存放转换后的片段
     for item in raw_segments:  # 遍历每个片段定义
@@ -396,8 +396,9 @@ def resolve_source_audio(
         details = (
             f"source_audio={raw_value or '(空)'} stem={(edl.stem or _derive_stem_from_path(edl_path)) or '-'}"
         )
+        attempt_hint = "; ".join(attempts) if attempts else "无候选路径"
         raise FileNotFoundError(
-            f"无法定位源音频（{details}）。请确认 EDL 中的 source_audio 字段填写正确，或调整 --audio-root 指向包含音频的目录。"
+            f"无法定位源音频（{details}）。已尝试: {attempt_hint}. 请确认 EDL 中的 source_audio 字段填写正确，或调整 --audio-root 指向包含音频的目录。"
         )
     return None
 
@@ -416,26 +417,21 @@ def probe_duration(audio_path: Path) -> float:
         str(audio_path),
     ]
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
+        returncode, stdout, stderr = run_cmd(cmd, capture=True)
     except FileNotFoundError as exc:  # 未安装 ffprobe
         raise RuntimeError(
             "未找到 ffprobe，可通过安装 ffmpeg 并将其加入 PATH 解决。"
         ) from exc
 
-    if result.returncode != 0:
+    if returncode != 0:
+        message = (stderr.strip() or stdout.strip()).splitlines()[:3]
         raise RuntimeError(
-            "ffprobe 调用失败，无法获取音频时长。请确认音频文件可访问且 ffmpeg 正常工作。"
+            "ffprobe 调用失败，无法获取音频时长。stderr=" + " | ".join(message)
         )
 
+    output = stdout.strip() or stderr.strip()
     try:
-        duration = float(result.stdout.strip())
+        duration = float(output)
     except ValueError as exc:  # 输出解析失败
         raise RuntimeError("无法解析 ffprobe 输出的时长，请检查音频文件是否损坏。") from exc
 
@@ -632,19 +628,14 @@ def render_audio(
         return output_path
 
     try:
-        result = subprocess.run(
-            cmd,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        returncode, stdout, stderr = run_cmd(cmd, capture=True)
     except FileNotFoundError as exc:  # ffmpeg 不存在
         raise RuntimeError("未找到 ffmpeg，请安装后再试或将其加入 PATH。") from exc
 
-    if result.returncode != 0:
+    if returncode != 0:
+        snippet = (stderr.strip() or stdout.strip()).splitlines()[:5]
         raise RuntimeError(
-            f"ffmpeg 渲染失败（退出码 {result.returncode}）。请检查命令行输出定位问题。"
+            f"ffmpeg 渲染失败（退出码 {returncode}）。stderr=" + " | ".join(snippet)
         )
 
     if not output_path.exists():
