@@ -12,17 +12,25 @@
     <div class="app-shell">
       <aside class="sidebar">
         <header class="sidebar__header">
-          <h1>OnePass 控制台</h1>
-          <p class="sidebar__desc">选择音频与标记，拖放即可本地预览、编辑与导出。</p>
+          <div>
+            <h1>OnePass 控制台</h1>
+            <p class="sidebar__desc">浏览 out/ 目录成果，预览音频并导出最新 EDL/CSV。</p>
+          </div>
+          <button id="refresh-stems" type="button" class="sidebar__refresh">刷新列表</button>
         </header>
+        <section class="sidebar__section" aria-labelledby="stem-list-title">
+          <h2 id="stem-list-title">批处理成果</h2>
+          <ul id="stem-list" class="stem-list" aria-live="polite"></ul>
+          <p id="stem-empty" class="stem-empty">未在 out/ 目录发现剪辑成果，可先运行 all-in-one。</p>
+        </section>
         <section class="import-panel" aria-labelledby="import-title">
-          <h2 id="import-title">导入</h2>
-          <p class="import-panel__hint">支持选择或拖放音频与标记文件。</p>
+          <h2 id="import-title">手动导入</h2>
+          <p class="import-panel__hint">从磁盘选择或直接拖放音频、EDL/CSV/SRT 文件。</p>
           <input id="pick-audio" type="file" accept="audio/*" hidden />
           <button id="btn-pick-audio" type="button" class="import-panel__button">选择音频</button>
           <input id="pick-markers" type="file" accept=".csv,.json,.srt" hidden />
-          <button id="btn-pick-markers" type="button" class="import-panel__button">选择标记(CSV/EDL/SRT)</button>
-          <p class="import-panel__note">音频支持 .wav/.m4a/.mp3/.flac，标记支持 Audition CSV、EDL JSON、SRT。</p>
+          <button id="btn-pick-markers" type="button" class="import-panel__button">选择标记 (CSV/EDL/SRT)</button>
+          <p class="import-panel__note">音频支持 .wav/.m4a/.mp3/.flac；标记支持 Audition CSV、EDL JSON、SRT。</p>
         </section>
         <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="拖放文件区域">
           将音频与标记拖放到这里
@@ -32,26 +40,41 @@
           <ul>
             <li>Alt+拖拽新建区域，Delete 删除</li>
             <li>D 切换 keep / delete / undecided</li>
-            <li>Ctrl+S 导出 EDL，底部按钮可导出 CSV</li>
+            <li>Ctrl+S 导出 EDL，右侧按钮可导出 CSV</li>
           </ul>
         </section>
       </aside>
       <main class="main">
-        <section class="selection-bar">
-          <div class="selection-bar__item">
-            <span class="label">当前音频</span>
-            <span id="current-audio" class="selection-bar__value">未选择</span>
+        <section class="main__header">
+          <div class="main__title">
+            <h2 id="current-stem-title">请选择 Stem</h2>
+            <div class="main__meta">
+              <span>Stem：<strong id="current-stem">-</strong></span>
+              <span>音频：<strong id="current-audio">未选择</strong></span>
+              <span>标记：<strong id="current-marker">未选择</strong></span>
+            </div>
           </div>
-          <div class="selection-bar__item">
-            <span class="label">当前标记</span>
-            <span id="current-marker" class="selection-bar__value">未选择</span>
-          </div>
-          <div class="selection-bar__item">
-            <span class="label">Stem</span>
-            <span id="current-stem" class="selection-bar__value">-</span>
+          <div class="main__actions">
+            <button id="export-edl" type="button" class="ghost">导出 EDL (Ctrl+S)</button>
+            <button id="export-markers" type="button" class="ghost">导出 Audition CSV</button>
+            <button id="render-audio" type="button" class="primary">生成剪辑音频</button>
           </div>
         </section>
-
+        <section class="player-panel">
+          <div class="player-panel__top">
+            <div class="player-tabs" role="tablist" aria-label="音频模式">
+              <button type="button" class="player-tab active" data-playback="preview" role="tab" aria-selected="true">剪辑预览</button>
+              <button type="button" class="player-tab" data-playback="original" role="tab" aria-selected="false">原始音频</button>
+              <button type="button" class="player-tab" data-playback="rendered" role="tab" aria-selected="false">剪辑音频文件</button>
+            </div>
+            <div class="player-status">
+              <span id="playback-label">未加载音频</span>
+            </div>
+          </div>
+          <div class="waveform-section">
+            <div id="waveform" class="waveform" aria-label="波形预览"></div>
+          </div>
+        </section>
         <section class="controls">
           <div class="controls__group">
             <button id="play-toggle" type="button">播放 / 暂停 (Space)</button>
@@ -64,26 +87,19 @@
             <input id="zoom-range" type="range" min="20" max="400" step="10" value="120" />
           </div>
           <div class="controls__group controls__group--bulk">
-            <button data-bulk="delete" type="button">全部设为删除</button>
             <button data-bulk="keep" type="button">全部设为保留</button>
+            <button data-bulk="delete" type="button">全部设为删除</button>
             <button data-bulk="undecided" type="button">全部设为未决</button>
           </div>
         </section>
-
-        <section class="waveform-section">
-          <div id="waveform" class="waveform"></div>
-        </section>
-
         <section class="region-toolbar">
           <div class="region-toolbar__left">
-            <span>Alt+拖拽创建区域，Delete 删除，D 切换状态，←/→ 选择邻近区域。</span>
+            Alt+拖拽新建区域，Delete 删除，D 切换状态，←/→ 选择邻近区域。
           </div>
           <div class="region-toolbar__right">
-            <button id="export-edl" type="button">导出 EDL (Ctrl+S)</button>
-            <button id="export-markers" type="button">导出 Audition CSV</button>
+            <span id="region-summary"></span>
           </div>
         </section>
-
         <section class="region-list-section">
           <table class="region-table">
             <thead>
@@ -98,6 +114,10 @@
             </thead>
             <tbody id="region-tbody"></tbody>
           </table>
+        </section>
+        <section class="srt-panel" aria-labelledby="srt-title">
+          <h3 id="srt-title">字幕预览</h3>
+          <ul id="srt-list" class="srt-list"></ul>
         </section>
       </main>
     </div>
