@@ -1,0 +1,26 @@
+body {
+  font-family: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  margin: 0;
+  padding: 2rem;
+  background: #111;
+  color: #f5f5f5;
+}
+
+main {
+  max-width: 720px;
+  margin: 0 auto;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 2rem;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+}
+
+h1 {
+  margin-top: 0;
+  font-weight: 600;
+}
+
+p {
+  line-height: 1.6;
+  margin-bottom: 0;
+}
