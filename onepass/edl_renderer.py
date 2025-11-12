@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json  # 读取 EDL JSON
+import logging
+import os
+import re
 import shlex  # 美化 dry-run 输出
 import subprocess  # 调用 ffmpeg/ffprobe
+from collections import deque
 from dataclasses import dataclass  # 构建结构化数据模型
-from pathlib import Path  # 统一路径处理
-from typing import Iterable, Literal  # 提供类型注解
+from pathlib import Path, PurePosixPath
+from typing import Iterable, Literal
 
 __all__ = [
     "EDLSegment",
@@ -40,10 +44,17 @@ class EDLDoc:
     stem: str | None = None
     version: int | None = None
     source_samplerate: int | None = None
+    source_audio_basename: str | None = None
+    path_style: str | None = None
 
+
+LOGGER = logging.getLogger("onepass.edl_renderer")
 
 _EPSILON = 1e-6  # 用于浮点比较的容差
 _AUDIO_SUFFIXES: tuple[str, ...] = (".wav", ".flac", ".m4a", ".aac", ".mp3", ".ogg", ".wma")
+_WINDOWS_DRIVE = re.compile(r"^[a-zA-Z]:[/\\]")
+_MAX_SCAN_DEPTH = 2
+_MAX_LOG_CANDIDATES = 5
 
 
 def _derive_stem_from_path(edl_path: Path) -> str:
@@ -119,7 +130,7 @@ def load_edl(edl_path: Path) -> EDLDoc:
     if not edl_path.exists():  # 若文件不存在提前报错
         raise FileNotFoundError(f"未找到 EDL 文件: {edl_path}")
 
-    data = json.loads(edl_path.read_text(encoding="utf-8"))  # 读取 JSON 文本
+    data = json.loads(edl_path.read_text(encoding="utf-8", errors="replace"))  # 读取 JSON 文本
 
     # 兼容新旧字段名 source_audio/audio
     source_audio_raw = (
@@ -146,6 +157,14 @@ def load_edl(edl_path: Path) -> EDLDoc:
     stem_value = stem_field.strip() if isinstance(stem_field, str) else ""
     if not stem_value:
         stem_value = _derive_stem_from_path(edl_path)
+
+    path_style_raw = data.get("path_style")
+    path_style_value = path_style_raw.strip().lower() if isinstance(path_style_raw, str) else ""
+    if path_style_value not in {"posix", "windows"}:
+        path_style_value = "posix"
+
+    basename_raw = data.get("source_audio_basename")
+    basename_value = basename_raw.strip() if isinstance(basename_raw, str) and basename_raw.strip() else None
 
     raw_segments = data.get("segments")  # 尝试读取新式片段列表
     if not isinstance(raw_segments, list):  # 当缺失时兼容旧式 actions
@@ -186,67 +205,198 @@ def load_edl(edl_path: Path) -> EDLDoc:
         stem=stem_value,
         version=version_int,
         source_samplerate=source_samplerate_int,
+        source_audio_basename=basename_value,
+        path_style=path_style_value,
     )
 
 
-def _scan_audio_root(audio_root: Path, *, name_hint: str, stem_hint: str) -> list[Path]:
-    """在音频根目录内按文件名或 stem 查找候选音频。"""
+def _scan_audio_root(audio_root: Path, *, target_names: set[str]) -> list[Path]:
+    """在限定深度内扫描音频根目录以匹配给定文件名集合。"""
 
-    if not audio_root.exists():
+    if not audio_root or not audio_root.exists():
         return []
-    name_lower = name_hint.lower()
-    stem_lower = stem_hint.lower()
-    direct_hits: list[Path] = []
-    stem_hits: list[Path] = []
-    for path in audio_root.rglob("*"):
-        if not path.is_file():
+
+    queue: deque[tuple[Path, int]] = deque([(audio_root.resolve(), 0)])
+    results: list[Path] = []
+    seen: set[Path] = set()
+
+    while queue:
+        current, depth = queue.popleft()
+        if current in seen:
             continue
-        if path.suffix.lower() not in _AUDIO_SUFFIXES:
+        seen.add(current)
+        try:
+            entries = list(current.iterdir())
+        except OSError:
             continue
-        lower_name = path.name.lower()
-        if name_lower and lower_name == name_lower:
-            direct_hits.append(path.resolve())
-            continue
-        if stem_lower and path.stem.lower() == stem_lower:
-            stem_hits.append(path.resolve())
-    return direct_hits or stem_hits
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    if depth < _MAX_SCAN_DEPTH:
+                        queue.append((entry, depth + 1))
+                    continue
+                if not entry.is_file():
+                    continue
+            except OSError:
+                continue
+            if entry.suffix.lower() not in _AUDIO_SUFFIXES:
+                continue
+            if entry.name.lower() in target_names:
+                results.append(entry.resolve())
+    return results
 
 
-def resolve_source_audio(edl: EDLDoc, edl_path: Path, audio_root: Path) -> Path:
+def _normalise_source_value(raw: str, style: str) -> str:
+    """根据路径风格规范化原始 source_audio 为 POSIX 表示。"""
+
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if style == "windows":
+        value = value.replace("\\", "/")
+    else:
+        value = value.replace("\\", "/")
+    return value
+
+
+def _is_probably_absolute(path_str: str) -> bool:
+    """兼容 Windows/Posix 判断路径是否形似绝对路径。"""
+
+    if not path_str:
+        return False
+    if Path(path_str).is_absolute():
+        return True
+    if _WINDOWS_DRIVE.match(path_str):
+        return True
+    if path_str.startswith("\\\\") or path_str.startswith("//"):
+        return True
+    return False
+
+
+def _candidate_basenames(name: str) -> list[str]:
+    """基于文件名生成大小写无关的匹配集合。"""
+
+    if not name:
+        return []
+    lowered = name.lower()
+    root = Path(name).stem.lower()
+    results: list[str] = [lowered]
+    for suffix in _AUDIO_SUFFIXES:
+        candidate = f"{root}{suffix}".lower()
+        if candidate not in results:
+            results.append(candidate)
+    return results
+
+
+def resolve_source_audio(
+    edl: EDLDoc,
+    edl_path: Path,
+    audio_root: Path | None,
+    *,
+    strict: bool = True,
+) -> Path | None:
     """根据 EDL 描述解析源音频的实际路径。"""
 
     raw_value = edl.source_audio.strip() if edl.source_audio else ""
-    raw_path = Path(raw_value) if raw_value else Path()
-    candidates: list[Path] = []
+    style = (edl.path_style or "posix").lower()
+    if style not in {"posix", "windows"}:
+        style = "posix"
+    posix_value = _normalise_source_value(raw_value, style)
+    if not posix_value:
+        LOGGER.warning("EDL 未提供有效的 source_audio 字段。")
+        return None
 
-    if raw_path and raw_path.is_absolute():
-        candidates.append(raw_path.expanduser().resolve())
-    elif raw_path:
-        bases = [audio_root, edl_path.parent]
-        seen: set[Path] = set()
-        for base in bases:
-            if not base:
-                continue
-            resolved_base = base.expanduser().resolve()
-            if resolved_base in seen:
-                continue
-            seen.add(resolved_base)
-            candidates.append((resolved_base / raw_path).resolve())
+    if os.sep == "\\":
+        platform_value = posix_value.replace("/", "\\")
+    else:
+        platform_value = posix_value.replace("\\", "/")
+    platform_value = os.path.normpath(platform_value)
 
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
+    audio_root_path: Path | None = None
+    if audio_root:
+        root_candidate = Path(audio_root).expanduser()
+        try:
+            audio_root_path = root_candidate.resolve(strict=False)
+        except OSError:
+            audio_root_path = root_candidate
 
-    stem_hint = edl.stem or _derive_stem_from_path(edl_path)
-    name_hint = raw_path.name if raw_path.name else ""
-    matches = _scan_audio_root(audio_root.expanduser().resolve(), name_hint=name_hint, stem_hint=stem_hint)
-    if matches:
-        return matches[0]
+    edl_parent = edl_path.parent
+    try:
+        edl_parent = edl_parent.resolve(strict=False)
+    except OSError:
+        edl_parent = edl_parent.expanduser()
 
-    details = f"source_audio={raw_value or '(空)'} stem={stem_hint or '-'}"
-    raise FileNotFoundError(
-        f"无法定位源音频（{details}）。请确认 EDL 中的 source_audio 字段填写正确，或在命令行中调整 --audio-root 指向包含音频的目录。"
-    )
+    attempts: list[str] = []
+    candidates: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+
+    def _register_candidate(path: Path, reason: str) -> None:
+        try:
+            resolved = path.expanduser().resolve(strict=False)
+        except OSError:
+            resolved = path.expanduser()
+        normalised_text = os.path.normpath(str(resolved))
+        if normalised_text in seen:
+            return
+        seen.add(normalised_text)
+        candidate_path = Path(normalised_text)
+        candidates.append((candidate_path, reason))
+        if len(attempts) < _MAX_LOG_CANDIDATES:
+            attempts.append(f"{reason}: {candidate_path}")
+
+    if _is_probably_absolute(platform_value) or _is_probably_absolute(posix_value) or Path(platform_value).is_absolute():
+        _register_candidate(Path(platform_value), "absolute")
+    else:
+        if audio_root_path is not None:
+            _register_candidate(audio_root_path / platform_value, "audio_root")
+        _register_candidate(edl_parent / platform_value, "edl_dir")
+
+    for candidate, reason in candidates:
+        try:
+            if candidate.exists():
+                LOGGER.info("[resolve] %s hit: %s", reason, candidate)
+                return candidate
+        except OSError:
+            continue
+
+    basename_hint = edl.source_audio_basename
+    if not basename_hint and posix_value:
+        basename_hint = PurePosixPath(posix_value).name
+    search_names = set(_candidate_basenames(basename_hint or "")) if basename_hint else set()
+    extra_matches: list[Path] = []
+    if search_names:
+        if audio_root_path is not None:
+            extra_matches.extend(
+                _scan_audio_root(audio_root_path, target_names=search_names)
+            )
+        extra_matches.extend(
+            _scan_audio_root(edl_parent, target_names=search_names)
+        )
+
+    for match in extra_matches:
+        normalised_text = os.path.normpath(str(match))
+        if normalised_text in seen:
+            continue
+        seen.add(normalised_text)
+        if len(attempts) < _MAX_LOG_CANDIDATES:
+            attempts.append(f"basename: {normalised_text}")
+        try:
+            if match.exists():
+                LOGGER.info("[resolve] basename hit: %s", match)
+                return match
+        except OSError:
+            continue
+
+    if attempts:
+        LOGGER.warning("未能解析源音频，已尝试路径: %s", attempts)
+    if strict:
+        details = (
+            f"source_audio={raw_value or '(空)'} stem={(edl.stem or _derive_stem_from_path(edl_path)) or '-'}"
+        )
+        raise FileNotFoundError(
+            f"无法定位源音频（{details}）。请确认 EDL 中的 source_audio 字段填写正确，或调整 --audio-root 指向包含音频的目录。"
+        )
+    return None
 
 
 def probe_duration(audio_path: Path) -> float:
@@ -263,7 +413,14 @@ def probe_duration(audio_path: Path) -> float:
         str(audio_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+        )
     except FileNotFoundError as exc:  # 未安装 ffprobe
         raise RuntimeError(
             "未找到 ffprobe，可通过安装 ffmpeg 并将其加入 PATH 解决。"
@@ -370,16 +527,20 @@ def render_audio(
     channels: int | None,
     *,
     dry_run: bool = False,
+    edl_doc: EDLDoc | None = None,
+    source_audio_path: Path | None = None,
 ) -> Path:
     """综合以上步骤执行音频裁剪与拼接，返回输出文件路径。"""
 
-    edl = load_edl(edl_path)  # 读取并校验 EDL
+    edl = edl_doc or load_edl(edl_path)  # 读取并校验 EDL
 
     # 计算最终滤镜使用的采样率与声道设置，优先采用用户显式指定的值
     target_samplerate = samplerate if samplerate is not None else edl.samplerate  # 得到滤镜中使用的采样率
     target_channels = channels if channels is not None else edl.channels  # 得到滤镜中使用的声道数
 
-    source_audio = resolve_source_audio(edl, edl_path, audio_root)  # 定位原始音频
+    source_audio = source_audio_path or resolve_source_audio(edl, edl_path, audio_root)
+    if source_audio is None:
+        raise FileNotFoundError("无法定位源音频，无法执行渲染。")
     duration = probe_duration(source_audio)  # 获取音频总时长
     keeps = normalize_segments(edl.segments, duration)  # 归一化保留片段
 
@@ -414,7 +575,13 @@ def render_audio(
         return output_path
 
     try:
-        result = subprocess.run(cmd, check=False)
+        result = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
     except FileNotFoundError as exc:  # ffmpeg 不存在
         raise RuntimeError("未找到 ffmpeg，请安装后再试或将其加入 PATH。") from exc
 

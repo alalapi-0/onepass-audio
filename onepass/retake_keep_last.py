@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .asr_loader import Word
-from .edl_writer import write_edl
+from .edl_writer import EDLWriteResult, write_edl
 from .markers_writer import write_audition_csv
 from .sent_align import (
     LOW_CONF as SENT_LOW_CONF,
@@ -30,6 +30,7 @@ from .text_norm import build_char_index_map, cjk_or_latin_seq, normalize_for_ali
 LOGGER = logging.getLogger(__name__)
 
 __all__ = [
+    "EDLWriteResult",
     "KeepSpan",
     "RetakeResult",
     "SentenceReviewResult",
@@ -1482,14 +1483,17 @@ def export_audition_markers(
 
 def export_edl_json(
     edl_keep_segments: list[tuple[float, float]],
-    source_audio_rel: str | None,
+    source_audio_abs: str | None,
     out_path: Path,
     *,
     stem: str,
     samplerate: int | None = None,
     channels: int | None = None,
     source_samplerate: int | None = None,
-) -> Path:
+    audio_root: str | None = None,
+    prefer_relative_audio: bool = True,
+    path_style: str = "auto",
+) -> EDLWriteResult:
     """导出仅包含 keep 动作的 EDL JSON。"""
 
     segments = [
@@ -1502,7 +1506,7 @@ def export_edl_json(
     ]
     return write_edl(
         out_path,
-        source_audio=source_audio_rel,
+        source_audio=source_audio_abs,
         segments=segments,
         schema_version=1,
         sample_rate=samplerate,
@@ -1510,6 +1514,9 @@ def export_edl_json(
         source_samplerate=source_samplerate,
         stats={"segment_count": len(segments)},
         stem=stem,
+        audio_root=audio_root,
+        prefer_relative_audio=prefer_relative_audio,
+        path_style=path_style,
     )
 
 
@@ -1586,12 +1593,15 @@ def export_sentence_edl_json(
     out_path: Path,
     *,
     review_only: bool,
-    source_audio_rel: str | None = None,
+    source_audio_abs: str | None = None,
     samplerate: int | None = None,
     channels: int | None = None,
     stem: str,
     source_samplerate: int | None = None,
-) -> Path:
+    audio_root: str | None = None,
+    prefer_relative_audio: bool = True,
+    path_style: str = "auto",
+) -> EDLWriteResult:
     """根据句子级命中导出专用 EDL JSON。"""
 
     if review_only:
@@ -1603,7 +1613,7 @@ def export_sentence_edl_json(
         ]
     return write_edl(
         out_path,
-        source_audio=source_audio_rel,
+        source_audio=source_audio_abs,
         segments=segments,
         schema_version=1,
         sample_rate=samplerate,
@@ -1611,6 +1621,9 @@ def export_sentence_edl_json(
         source_samplerate=source_samplerate,
         stats={"segment_count": len(segments), "review_only": review_only},
         stem=stem,
+        audio_root=audio_root,
+        prefer_relative_audio=prefer_relative_audio,
+        path_style=path_style,
     )
 
 
