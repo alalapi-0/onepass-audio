@@ -62,8 +62,11 @@ def test_norm_outputs_are_sentence_lines(tmp_path: Path) -> None:
     assert norm_text.count("\n") >= 1
     _assert_sentence_lines(norm_text)
     assert "\r" not in align_text
-    assert "\t" not in align_text
-    assert "\n" not in align_text
+    align_lines = align_text.splitlines()
+    assert align_lines, "align text should contain sentence lines"
+    for line in align_lines:
+        assert line == line.strip(), "align sentence should not have surrounding spaces"
+        assert "\t" not in line
     _assert_sentence_lines(align_text, enforce_boundary=False)
 
 

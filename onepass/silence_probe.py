@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import List, Tuple
 
-from .utils_subproc import run_cmd
+from .utils.subproc import run_cmd
 
 __all__ = ["probe_silence_ffmpeg"]
 
@@ -32,22 +32,23 @@ def probe_silence_ffmpeg(audio: Path, noise_db: int = -35, min_d: float = 0.28) 
         "-",
     ]
     try:
-        returncode, _stdout, stderr = run_cmd(cmd, capture=True)
+        cp = run_cmd(cmd)
     except FileNotFoundError:
         LOGGER.warning("未找到 ffmpeg，无法探测静音。")
         return []
-    if returncode != 0:
+    if cp.returncode != 0:
+        stderr_lines = (cp.stderr or "").strip().splitlines()[:3]
         LOGGER.warning(
             "silence_probe: ffmpeg 返回码 %s，回退为空列表。stderr=%s",
-            returncode,
-            (stderr or "").strip().splitlines()[:3],
+            cp.returncode,
+            stderr_lines,
         )
         return []
     silence_start = re.compile(r"silence_start:\s*([0-9.]+)")
     silence_end = re.compile(r"silence_end:\s*([0-9.]+)")
     ranges: List[Tuple[float, float]] = []
     pending: float | None = None
-    for raw_line in (stderr.splitlines() if stderr else []):
+    for raw_line in (cp.stderr or "").splitlines():
         line = raw_line.strip()
         if not line:
             continue

@@ -9,11 +9,13 @@ import re  # 处理 glob 参数拆分与上下文清理
 import shlex  # 构建可复制的命令示例
 import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
+import threading
 import time  # 统计耗时
 from dataclasses import asdict, dataclass  # 复用数据类结构化统计
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed  # 并发执行
 from pathlib import Path  # 跨平台路径处理
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from urllib.parse import urlencode
 
 # 计算项目根目录，确保脚本可直接运行
 ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
@@ -37,7 +39,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     render_audio,
     resolve_source_audio,
 )
-from onepass.normalize import collapse_soft_linebreaks
+from onepass.normalize import collapse_soft_linebreaks, to_align_text
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -66,39 +68,27 @@ from onepass.text_norm import (  # 规范化工具
     load_char_map,
     normalize_chinese_text,
     normalize_pipeline,
-    prepare_alignment_text,
     run_opencc_if_available,
     scan_suspects,
     sentence_lines_from_text,
     validate_sentence_lines,
 )
-from onepass.text_normalizer import normalize_alignment_text, normalize_text_for_export
+from onepass.text_normalizer import normalize_text_for_export
 from onepass.sent_align import (
     LOW_CONF as SENT_LOW_CONF,
     MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
     MERGE_ADJ_GAP_SEC,
 )
 from onepass.logging_utils import default_log_dir, setup_logger
-try:  # Web UI 功能依赖 fastapi，缺失时允许其它功能继续使用
-    from onepass.web import (
-        ensure_server_running,
-        run_server as run_ui_server,
-        spawn_server as spawn_ui_server,
-        wait_for_server,
-    )
-    _WEB_IMPORT_ERROR: ModuleNotFoundError | None = None
-except ModuleNotFoundError as web_exc:  # pragma: no cover - 测试环境可能缺少 fastapi
-    ensure_server_running = None  # type: ignore[assignment]
-    run_ui_server = None  # type: ignore[assignment]
-    spawn_ui_server = None  # type: ignore[assignment]
-    wait_for_server = None  # type: ignore[assignment]
-    _WEB_IMPORT_ERROR = web_exc
+from onepass.ui_server import open_browser_later, start_static_server
 
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
 DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
+
+_UI_THREADS: list[threading.Thread] = []
 
 
 @dataclass(slots=True)
@@ -127,13 +117,98 @@ def _build_cli_example(subcommand: str, parts: Sequence[str]) -> str:
     return shlex.join(args)  # 返回 shell 风格字符串
 
 
-def _ensure_web_available() -> None:
-    """若 Web UI 依赖缺失，则抛出更加友好的错误。"""
+def _ensure_web_assets() -> Path:
+    """确保 Web 前端静态资源目录存在。"""
 
-    if _WEB_IMPORT_ERROR is not None:
-        raise RuntimeError(
-            "Web UI 功能需要 fastapi 依赖，请运行 `pip install -r requirements.txt` 后重试"
-        ) from _WEB_IMPORT_ERROR
+    web_dir = ROOT_DIR / "web"
+    if not web_dir.exists():
+        raise FileNotFoundError("未找到 web/ 目录，无法启动本地 UI。")
+    return web_dir
+
+
+def _write_ui_manifest(
+    out_dir: Path,
+    *,
+    audio_root: Path,
+    items: Sequence[dict],
+    render_summary: Mapping[str, Mapping[str, object]],
+    stems: Sequence[str],
+    report_path: Path,
+) -> Path | None:
+    """根据流水线输出生成 UI manifest.json。"""
+
+    manifest_items: list[dict[str, object]] = []
+    lower_render = {key.lower(): value for key, value in render_summary.items()}
+    for item in items:
+        if item.get("status") != "ok":
+            continue
+        stem = str(item.get("stem") or "").strip()
+        outputs = item.get("outputs") or {}
+        entry: dict[str, object] = {
+            "stem": stem,
+            "txt": outputs.get("txt", ""),
+            "srt": outputs.get("srt", ""),
+            "markers": outputs.get("markers", ""),
+            "edl": outputs.get("edl", ""),
+            "source_audio": item.get("source_audio_written") or "",
+            "source_audio_resolved": item.get("source_audio_resolved_path") or "",
+        }
+        render_entry = lower_render.get(stem.lower()) if stem else None
+        if render_entry:
+            entry["rendered_audio"] = render_entry.get("output", "")
+            entry["render_status"] = render_entry.get("status", "")
+        manifest_items.append(entry)
+
+    manifest = {
+        "output_dir": str(out_dir),
+        "audio_root": str(audio_root),
+        "stems": [entry["stem"] for entry in manifest_items] if manifest_items else list(stems),
+        "items": manifest_items,
+        "batch_report": str(report_path),
+    }
+    try:
+        manifest_path = out_dir / "manifest.json"
+        write_json(manifest_path, manifest)
+        return manifest_path
+    except Exception:
+        LOGGER.exception("写入 manifest.json 失败")
+        return None
+
+
+def _launch_static_ui(
+    out_dir: Path,
+    *,
+    stems: Sequence[str],
+    serve_host: str,
+    serve_port: int,
+    open_browser: bool,
+    manifest_path: Path | None,
+) -> tuple[threading.Thread | None, str | None]:
+    """启动静态 Web UI，并在需要时打开浏览器。"""
+
+    try:
+        web_dir = _ensure_web_assets()
+    except FileNotFoundError as exc:
+        LOGGER.error(str(exc))
+        return None, None
+    query: dict[str, str] = {"out": str(out_dir)}
+    if stems:
+        query["stem"] = ",".join(stems)
+    if manifest_path and manifest_path.exists():
+        query["manifest"] = str(manifest_path)
+    try:
+        thread, base_url = start_static_server(str(web_dir), host=serve_host, port=serve_port)
+    except OSError:
+        LOGGER.exception("自动启动 Web UI 失败")
+        return None, None
+    _UI_THREADS.append(thread)
+    url = base_url
+    if query:
+        url = f"{base_url}?{urlencode(query)}"
+    LOGGER.info("UI 服务已启动: %s", url)
+    if open_browser:
+        open_browser_later(url)
+    return thread, url
 
 
 def _summarize_context(text: str, width: int = 20) -> str:
@@ -369,21 +444,13 @@ def _process_single_text(
             }
 
         if emit_align:
-            align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
-            if collapse_lines:
-                align_payload = collapse_soft_linebreaks(align_payload)
-                align_payload = normalize_alignment_text(align_payload, char_map=cmap)
-            else:
-                align_payload = normalize_text_for_export(
-                    align_payload,
-                    char_map=cmap,
-                    preserve_newlines=True,
-                )
-            if collapse_lines and align_payload:
-                if "\n" in align_payload:
-                    raise ValueError("对齐文本在 collapse-lines 模式下不应包含换行。")
-                if "\r" in align_payload:
-                    raise ValueError("对齐文本包含回车符，请检查折行规则。")
+            align_source = normalize_text_for_export(
+                payload_text,
+                char_map=cmap,
+                preserve_newlines=True,
+            )
+            align_payload = to_align_text(align_source)
+            if align_payload:
                 if "\t" in align_payload:
                     raise ValueError("对齐文本包含制表符，请检查规范化结果。")
                 for part in align_payload.splitlines():
@@ -1803,29 +1870,24 @@ def handle_render_audio(args: argparse.Namespace) -> int:
 def handle_serve_web(args: argparse.Namespace) -> int:
     """处理 serve-web 子命令，启动本地可视化控制台。"""
 
-    _ensure_web_available()
     out_dir = Path(args.out).expanduser().resolve()
-    audio_root = Path(args.audio_root).expanduser().resolve() if args.audio_root else None
-    LOGGER.info(
-        "启动本地控制台: out=%s audio_root=%s host=%s port=%s",
+    manifest_path = out_dir / "manifest.json"
+    stems = []
+    thread, url = _launch_static_ui(
         out_dir,
-        audio_root or "(未指定)",
-        args.host,
-        args.port,
+        stems=stems,
+        serve_host=args.host,
+        serve_port=args.port,
+        open_browser=args.open_browser,
+        manifest_path=manifest_path if manifest_path.exists() else None,
     )
-    if getattr(args, "cors", False):
-        LOGGER.warning("当前 Web UI 服务默认仅本地访问，--cors 参数已忽略。")
-    try:
-        run_ui_server(
-            out_dir,
-            audio_root,
-            host=args.host,
-            port=args.port,
-            open_browser=args.open_browser,
-        )
-    except Exception:
-        LOGGER.exception("serve-web 启动失败")
+    if thread is None or url is None:
         return 1
+    LOGGER.info("按 Ctrl+C 停止服务。")
+    try:
+        thread.join()
+    except KeyboardInterrupt:
+        LOGGER.info("收到中断信号，服务线程将自动结束。")
     return 0
 
 
@@ -2194,6 +2256,18 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     if ordered_stats:
         retake_result["retake_stats"] = [asdict(stat) for stat in ordered_stats]
         report["summary"]["retake_stats"] = [asdict(stat) for stat in ordered_stats]
+    manifest_path = _write_ui_manifest(
+        out_dir,
+        audio_root=audio_root_path,
+        items=items,
+        render_summary=render_summary,
+        stems=stems,
+        report_path=report_path,
+    )
+    if manifest_path:
+        report["ui_manifest"] = str(manifest_path)
+        report["summary"]["ui_manifest"] = str(manifest_path)
+    report["summary"]["stems"] = stems
     write_json(report_path, report)
 
     LOGGER.info(_safe_text(f"处理结果：成功 {success_items}/{total_items}"))
@@ -2348,83 +2422,23 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         for item in records
         if item.get("status") == "ok" and item.get("stem")
     ]
-    first_success_stem = success_stems[0] if success_stems else None
-
-    if args.serve:
-        _ensure_web_available()
-        out_dir = Path(args.output_dir).expanduser().resolve()
-        if args.audio_root:
-            audio_root = Path(args.audio_root).expanduser().resolve()
-        else:
-            audio_root = Path(args.input_dir).expanduser().resolve()
-        LOGGER.info(
-            _safe_text(
-                f"尝试启动本地控制台: http://{serve_host}:{serve_port}/ (out={out_dir})"
-            )
+    manifest_value = report.get("ui_manifest") or summary.get("ui_manifest")
+    manifest_path = Path(manifest_value).expanduser().resolve() if manifest_value else None
+    out_dir = Path(args.output_dir).expanduser().resolve()
+    stems_for_ui = success_stems or list(summary.get("stems", []))
+    if args.serve or args.open_ui:
+        thread, url = _launch_static_ui(
+            out_dir,
+            stems=stems_for_ui,
+            serve_host=serve_host,
+            serve_port=serve_port,
+            open_browser=bool(args.open_ui or args.open_browser),
+            manifest_path=manifest_path if manifest_path and manifest_path.exists() else None,
         )
-        try:
-            running = spawn_ui_server(
-                out_dir,
-                audio_root=audio_root,
-                host=serve_host,
-                port=serve_port,
-            )
-        except Exception:
-            LOGGER.exception("自动启动控制台失败")
-            LOGGER.error(
-                _safe_text(
-                    "流水线已完成，但本地控制台未成功启动。可手动执行 serve-web 子命令重试。"
-                )
-            )
+        if thread is None or url is None:
+            LOGGER.error("静态 UI 服务启动失败，可稍后通过 serve-web 子命令重试。")
         else:
-            if args.open_browser or args.open_ui:
-                running.open_in_browser(stem=first_success_stem)
-            LOGGER.info(
-                _safe_text(
-                    f"控制台运行中: http://{running.config.host}:{running.port}/ (Ctrl+C 停止服务)"
-                )
-            )
-            wait_for_server(running)
-        return 0
-
-    if args.open_ui:
-        _ensure_web_available()
-        out_dir = Path(args.output_dir).expanduser().resolve()
-        if args.audio_root:
-            audio_root = Path(args.audio_root).expanduser().resolve()
-        else:
-            audio_root = Path(args.input_dir).expanduser().resolve()
-        try:
-            running = ensure_server_running(
-                out_dir,
-                audio_root=audio_root,
-                host=serve_host,
-                port=serve_port,
-                open_browser=True,
-                stem=first_success_stem,
-            )
-        except Exception:
-            LOGGER.exception("自动启动 Web UI 失败")
-            LOGGER.error(
-                _safe_text(
-                    "流水线已完成，但可视化控制台未成功启动。可在主菜单选择 [W] 重试。"
-                )
-            )
-        else:
-            if getattr(running, "reused", False):
-                LOGGER.info(
-                    _safe_text(
-                        f"Web UI 已在运行: http://{running.config.host}:{running.port}/"
-                    )
-                )
-                return 0
-            LOGGER.info(
-                _safe_text(
-                    f"Web UI 运行中: http://{running.config.host}:{running.port}/ (Ctrl+C 停止服务)"
-                )
-            )
-            wait_for_server(running)
-        return 0
+            LOGGER.info("流水线结束后 UI 服务已在后台运行。")
     return 0
 
 
