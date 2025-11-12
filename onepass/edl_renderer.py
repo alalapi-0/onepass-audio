@@ -180,8 +180,9 @@ def load_edl(edl_path: Path) -> EDLDoc:
                 end = _to_float(action.get("end"), "end")
                 raw_segments.append({"start": start, "end": end, "action": "drop"})
 
+    original_segment_count = len(raw_segments)
     if not raw_segments:
-        raise ValueError("EDL 中未找到有效的 segments/actions 描述。")
+        LOGGER.warning("EDL 未包含任何 segments，后续渲染将跳过。")
 
     segments: list[EDLSegment] = []  # 存放转换后的片段
     for item in raw_segments:  # 遍历每个片段定义
@@ -194,7 +195,7 @@ def load_edl(edl_path: Path) -> EDLDoc:
             continue  # 去掉零长度或时间倒置片段
         segments.append(EDLSegment(start=start, end=end, action=action))  # 保存片段
 
-    if not segments:
+    if not segments and original_segment_count > 0:
         raise ValueError("EDL 片段全为零长度或非法定义，无法继续。")
 
     return EDLDoc(
@@ -542,6 +543,11 @@ def render_audio(
     if source_audio is None:
         raise FileNotFoundError("无法定位源音频，无法执行渲染。")
     duration = probe_duration(source_audio)  # 获取音频总时长
+    if not edl.segments:
+        message = "EDL 无有效片段，已跳过渲染"
+        LOGGER.warning(message)
+        raise ValueError(message)
+
     keeps = normalize_segments(edl.segments, duration)  # 归一化保留片段
 
     total_keep = sum(segment.end - segment.start for segment in keeps)
