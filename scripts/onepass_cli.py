@@ -1880,6 +1880,11 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     max_distance_ratio = float(getattr(args, "max_distance_ratio", 0.25))
     min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
     fallback_policy = getattr(args, "fallback_policy", "safe")
+    compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 120.0))
+    coarse_threshold = float(getattr(args, "coarse_threshold", 0.30))
+    coarse_len_tolerance = float(
+        getattr(args, "coarse_len_tol", getattr(args, "coarse_len_tolerance", 0.35))
+    )
 
     retake_items: list[dict] = []
     failed = 0
@@ -1946,6 +1951,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            compute_timeout_sec,
+            coarse_threshold,
+            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             pause_align=True,
@@ -2264,8 +2272,11 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "fast_match": args.fast_match,
         "max_windows": args.max_windows,
         "match_timeout": args.match_timeout,
+        "compute_timeout_sec": getattr(args, "compute_timeout_sec", 120.0),
         "max_distance_ratio": args.max_distance_ratio,
         "min_anchor_ngram": args.min_anchor_ngram,
+        "coarse_threshold": getattr(args, "coarse_threshold", 0.30),
+        "coarse_len_tol": getattr(args, "coarse_len_tol", 0.35),
         "fallback_policy": args.fallback_policy,
         "serve": args.serve,
         "open_browser": args.open_browser,
