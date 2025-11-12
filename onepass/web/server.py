@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Dict, Iterable, Optional
 from urllib.parse import quote
 
+import importlib.util
+
+if importlib.util.find_spec("fastapi") is None:  # pragma: no cover - 依赖缺失时提示
+    raise ModuleNotFoundError(
+        "无法导入 fastapi。请先运行 `pip install -r requirements.txt` 安装依赖。"
+    )
+
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
