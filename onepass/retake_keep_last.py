@@ -5,12 +5,11 @@ import json
 import logging
 import math
 import re
-import subprocess
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .utils.lev import bounded_levenshtein
 
@@ -27,7 +26,14 @@ from .sent_align import (
     KeepSpan as SentenceKeepSpan,
     align_sentences_from_text,
 )
-from .text_norm import build_char_index_map, cjk_or_latin_seq, normalize_for_align
+from .text_norm import (
+    apply_alias_map,
+    build_char_index_map,
+    cjk_or_latin_seq,
+    normalize_for_align,
+    normalize_text,
+)
+from .utils_subproc import run_cmd
 
 LOGGER = logging.getLogger(__name__)
 
@@ -167,13 +173,14 @@ def _resolve_audio_duration(words: Sequence[Word], audio_path: Path | None) -> f
         str(audio_path),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:  # 未安装 ffprobe 时直接回退
+        returncode, stdout, stderr = run_cmd(cmd, capture=True)
+    except FileNotFoundError:
         return fallback
-    if result.returncode != 0:
+    if returncode != 0:
         return fallback
+    output = stdout.strip() or stderr.strip()
     try:
-        value = float(result.stdout.strip())
+        value = float(output)
     except ValueError:
         return fallback
     if not math.isfinite(value) or value <= 0:
@@ -422,13 +429,20 @@ def _refine_segments(
     return active_indices, final_segments, stats, debug_list
 
 
-def _normalize_words(words: list[Word]) -> tuple[list[str], str, list[tuple[int, int]]]:
+def _normalize_words(
+    words: list[Word],
+    alias_map: Mapping[str, Sequence[str]] | None = None,
+) -> tuple[list[str], str, list[tuple[int, int]]]:
     """返回规范化后的词文本、拼接字符串与字符索引映射。"""
 
-    normalized_words = [normalize_for_align(word.text) for word in words]  # 逐词规范化文本
-    asr_norm_str = cjk_or_latin_seq(normalized_words)  # 拼接为连续字符串
-    char_map = build_char_index_map(normalized_words)  # 构建词到字符区间映射
-    return normalized_words, asr_norm_str, char_map  # 返回三项结果
+    normalized_words = [normalize_for_align(word.text) for word in words]
+    if alias_map:
+        normalized_words = [apply_alias_map(token, alias_map) for token in normalized_words]
+    asr_norm_str = cjk_or_latin_seq(normalized_words)
+    if alias_map:
+        asr_norm_str = apply_alias_map(asr_norm_str, alias_map)
+    char_map = build_char_index_map(normalized_words)
+    return normalized_words, asr_norm_str, char_map
 
 
 def _line_to_units(line: str) -> str:
@@ -940,16 +954,17 @@ def compute_retake_keep_last(
     merge_gap_sec: float = MERGE_GAP_SEC,
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     audio_path: Path | None = None,
+    alias_map: Mapping[str, Sequence[str]] | None = None,
     debug_label: str | None = None,
     fast_match: bool = True,
-    max_windows: int = 50,
-    match_timeout: float = 20.0,
-    max_distance_ratio: float = 0.25,
-    min_anchor_ngram: int = 8,
-    fallback_policy: str = "safe",
-    compute_timeout_sec: float = 120.0,
-    coarse_threshold: float = 0.30,
-    coarse_len_tolerance: float = 0.35,
+    max_windows: int = 200,
+    match_timeout: float = 60.0,
+    max_distance_ratio: float = 0.35,
+    min_anchor_ngram: int = 6,
+    fallback_policy: str = "greedy",
+    compute_timeout_sec: float = 300.0,
+    coarse_threshold: float = 0.20,
+    coarse_len_tolerance: float = 0.45,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -962,8 +977,21 @@ def compute_retake_keep_last(
     except OSError as exc:  # 其他 I/O 异常
         raise OSError(f"读取原文 TXT 失败: {exc}. 请检查文件权限或关闭占用程序。") from exc
 
-    lines = raw_text.splitlines()  # 按行拆分原文
-    _, asr_norm_str, char_map = _normalize_words(words)  # 获取规范化词串与索引
+    normalized_text = normalize_text(
+        raw_text,
+        collapse_lines=False,
+        drop_foreign_brackets=False,
+        alias_map=alias_map,
+    )
+    lines = normalized_text.splitlines()  # 按行拆分原文
+    fallback_policy_input = str(fallback_policy or "greedy")
+    fallback_policy = fallback_policy_input.strip().lower()
+    if fallback_policy == "greedy":
+        fallback_policy = "align-greedy"
+    if fallback_policy not in {"safe", "keep-all", "align-greedy"}:
+        LOGGER.warning("未知 fallback_policy=%s，已回退为 align-greedy", fallback_policy)
+        fallback_policy = "align-greedy"
+    _, asr_norm_str, char_map = _normalize_words(words, alias_map)  # 获取规范化词串与索引
     char_map = list(char_map)
     if not asr_norm_str:  # 如果规范化后为空
         raise ValueError("规范化后的词序列为空，可能所有词都是标点或空白。请检查 JSON 输出。")
@@ -975,11 +1003,13 @@ def compute_retake_keep_last(
         "max_distance_ratio": float(max_distance_ratio),
         "min_anchor_ngram": int(min_anchor_ngram),
         "fallback_policy": str(fallback_policy),
+        "fallback_policy_input": fallback_policy_input,
         "min_sent_chars": int(min_sent_chars),
         "max_dup_gap_sec": float(max_dup_gap_sec),
         "compute_timeout_sec": float(compute_timeout_sec),
         "coarse_threshold": float(coarse_threshold),
         "coarse_len_tolerance": float(coarse_len_tolerance),
+        "alias_map": bool(alias_map),
     }
     LOGGER.info("参数快照: %s", json.dumps(params_snapshot, ensure_ascii=False, sort_keys=True))
 
@@ -1173,6 +1203,7 @@ def compute_retake_keep_last(
 
     degrade_attempted = False
     degrade_reason: str | None = None
+    degrade_history: list[dict[str, object]] = []
 
     while True:
         try:
@@ -1186,10 +1217,28 @@ def compute_retake_keep_last(
                     "降级: stem=%s reason=timeout -> 放宽阈值重新尝试",
                     debug_label or "-",
                 )
+                previous_params = {
+                    "distance_ratio": current_distance_ratio,
+                    "anchor_ngram": current_anchor_ngram,
+                    "coarse_threshold": current_coarse_threshold,
+                    "coarse_len_tol": current_coarse_len_tol,
+                }
                 current_distance_ratio = min(0.6, current_distance_ratio * 1.5)
                 current_coarse_threshold = max(0.05, current_coarse_threshold * 0.6)
                 current_coarse_len_tol = min(0.9, current_coarse_len_tol + 0.2)
                 current_anchor_ngram = max(3, max(1, current_anchor_ngram // 2))
+                degrade_history.append(
+                    {
+                        "reason": "timeout",
+                        "previous": previous_params,
+                        "adjusted": {
+                            "distance_ratio": current_distance_ratio,
+                            "anchor_ngram": current_anchor_ngram,
+                            "coarse_threshold": current_coarse_threshold,
+                            "coarse_len_tol": current_coarse_len_tol,
+                        },
+                    }
+                )
                 if compute_timeout_sec and compute_timeout_sec > 0:
                     compute_deadline = time.monotonic() + compute_timeout_sec
                 else:
@@ -1215,10 +1264,28 @@ def compute_retake_keep_last(
                 degrade_attempted = True
                 degrade_reason = "interrupt"
                 LOGGER.warning("捕获 KeyboardInterrupt，降级重试。")
+                previous_params = {
+                    "distance_ratio": current_distance_ratio,
+                    "anchor_ngram": current_anchor_ngram,
+                    "coarse_threshold": current_coarse_threshold,
+                    "coarse_len_tol": current_coarse_len_tol,
+                }
                 current_distance_ratio = min(0.6, current_distance_ratio * 1.5)
                 current_coarse_threshold = max(0.05, current_coarse_threshold * 0.6)
                 current_coarse_len_tol = min(0.9, current_coarse_len_tol + 0.2)
                 current_anchor_ngram = max(3, max(1, current_anchor_ngram // 2))
+                degrade_history.append(
+                    {
+                        "reason": "interrupt",
+                        "previous": previous_params,
+                        "adjusted": {
+                            "distance_ratio": current_distance_ratio,
+                            "anchor_ngram": current_anchor_ngram,
+                            "coarse_threshold": current_coarse_threshold,
+                            "coarse_len_tol": current_coarse_len_tol,
+                        },
+                    }
+                )
                 if compute_timeout_sec and compute_timeout_sec > 0:
                     compute_deadline = time.monotonic() + compute_timeout_sec
                 else:
@@ -1320,9 +1387,23 @@ def compute_retake_keep_last(
                     current_dup_gap,
                     new_dup_gap,
                 )
+                previous_params = {
+                    "min_sent": current_min_sent,
+                    "max_dup_gap": current_dup_gap,
+                }
                 degrade_reason = degrade_reason or "cut_ratio_guard"
                 current_min_sent = new_min_sent
                 current_dup_gap = new_dup_gap
+                degrade_history.append(
+                    {
+                        "reason": "cut_ratio_guard",
+                        "previous": previous_params,
+                        "adjusted": {
+                            "min_sent": current_min_sent,
+                            "max_dup_gap": current_dup_gap,
+                        },
+                    }
+                )
                 recomputed = True
                 continue
         break
@@ -1367,6 +1448,13 @@ def compute_retake_keep_last(
 
     if fallback_reasons:
         fallback_used = True
+        degrade_history.append(
+            {
+                "reason": "fallback",
+                "policy": fallback_policy,
+                "fallback_reasons": list(fallback_reasons),
+            }
+        )
         fallback_keeps: list[KeepSpan] | None = None
         fallback_engine = match_engine
         if "no-match" in fallback_reasons and degrade_reason is None:
@@ -1483,6 +1571,7 @@ def compute_retake_keep_last(
         LOGGER.warning("EDL 产物保证策略已触发（原因：%s）", stats.get("fallback_reason"))
 
     stats["fallback_used"] = fallback_used
+    stats["fallback_policy_input"] = fallback_policy_input
     if fallback_reasons:
         stats.setdefault("fallback_reason", fallback_reasons[0])
         if len(fallback_reasons) > 1:
@@ -1493,6 +1582,8 @@ def compute_retake_keep_last(
     stats["timeout_fallback"] = bool(timed_out and fallback_used)
     stats["match_engine"] = match_engine
     stats["params_snapshot"] = params_snapshot
+    if degrade_history:
+        stats["degrade_history"] = degrade_history
     total_elapsed = time.monotonic() - start_ts
     stats["latency_ms"] = int(total_elapsed * 1000)
     stats["elapsed_sec"] = total_elapsed
@@ -1554,6 +1645,7 @@ def compute_sentence_review(
     segment_merge_gap_sec: float = MERGE_GAP_SEC,
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     audio_path: Path | None = None,
+    alias_map: Mapping[str, Sequence[str]] | None = None,
     debug_label: str | None = None,
 ) -> SentenceReviewResult:
     """执行句子级审阅模式的匹配与统计。"""

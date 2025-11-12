@@ -1,55 +1,71 @@
 """静音区间探测工具。"""
 from __future__ import annotations
 
+import logging
 import re
-import subprocess
 from pathlib import Path
 from typing import List, Tuple
 
+from .utils_subproc import run_cmd
+
 __all__ = ["probe_silence_ffmpeg"]
+
+
+LOGGER = logging.getLogger("onepass.silence_probe")
 
 
 def probe_silence_ffmpeg(audio: Path, noise_db: int = -35, min_d: float = 0.28) -> List[Tuple[float, float]]:
     """调用 ffmpeg 的 ``silencedetect`` 滤镜解析静音区间。"""
 
     cmd = [
-        "ffmpeg",  # 外部命令名称
-        "-hide_banner",  # 关闭冗余输出
-        "-nostats",  # 禁止进度信息
-        "-i",  # 指定输入文件
-        str(audio),  # 输入音频路径
-        "-af",  # 附加音频滤镜
-        f"silencedetect=noise={noise_db}dB:d={min_d}",  # 设置噪声阈值与最小静音时长
-        "-f",  # 输出格式设为 null
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "info",
+        "-i",
+        str(audio),
+        "-af",
+        f"silencedetect=noise={noise_db}dB:d={min_d}",
+        "-f",
         "null",
-        "-",  # 输出到 /dev/null
+        "-",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:  # 未安装 ffmpeg 时直接回退
+        returncode, _stdout, stderr = run_cmd(cmd, capture=True)
+    except FileNotFoundError:
+        LOGGER.warning("未找到 ffmpeg，无法探测静音。")
         return []
-    if result.returncode != 0:  # 命令失败亦视为无静音
+    if returncode != 0:
+        LOGGER.warning(
+            "silence_probe: ffmpeg 返回码 %s，回退为空列表。stderr=%s",
+            returncode,
+            (stderr or "").strip().splitlines()[:3],
+        )
         return []
-    silence_start = re.compile(r"silence_start: (?P<start>-?\d+(?:\.\d+)?)")
-    silence_end = re.compile(r"silence_end: (?P<end>-?\d+(?:\.\d+)?)")
+    silence_start = re.compile(r"silence_start:\s*([0-9.]+)")
+    silence_end = re.compile(r"silence_end:\s*([0-9.]+)")
     ranges: List[Tuple[float, float]] = []
     pending: float | None = None
-    for line in result.stderr.splitlines():  # silencedetect 输出位于 stderr
+    for raw_line in (stderr.splitlines() if stderr else []):
+        line = raw_line.strip()
+        if not line:
+            continue
         match_start = silence_start.search(line)
         if match_start:
             try:
-                pending = float(match_start.group("start"))
+                pending = float(match_start.group(1))
             except ValueError:
                 pending = None
             continue
         match_end = silence_end.search(line)
         if match_end and pending is not None:
             try:
-                end_val = float(match_end.group("end"))
+                end_val = float(match_end.group(1))
             except ValueError:
                 pending = None
                 continue
-            if end_val > pending:  # 仅记录有效区间
+            if end_val > pending:
                 ranges.append((pending, end_val))
             pending = None
     return ranges
