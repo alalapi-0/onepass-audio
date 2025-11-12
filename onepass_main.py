@@ -3,12 +3,9 @@ from __future__ import annotations  # 启用未来注解特性，避免前置字
 
 import json  # 处理 JSON 配置与结果文件
 import os  # 管理环境变量用于子进程
-import re  # 正则提取服务端口
 import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
-import threading  # 监听子进程输出
-import webbrowser  # 自动打开浏览器显示可视化面板
 from dataclasses import asdict, dataclass  # 引入数据类工具与转换字典的方法
 from pathlib import Path  # 使用 Path 进行跨平台路径操作
 from typing import Dict, Iterable, List, Optional, Tuple  # 导入常用类型注解
@@ -46,6 +43,7 @@ from onepass.ux import (  # 引入命令行交互的工具函数
     prompt_text,  # 自由输入文本
     prompt_yes_no,  # 询问用户是否继续的布尔函数
 )
+from onepass.web import ensure_server_running, wait_for_server
 
 
 ROOT_DIR = Path(__file__).resolve().parent  # 计算项目根目录，方便拼接相对路径
@@ -1152,91 +1150,39 @@ def _run_singlefile_menu():
 
 
 def _launch_web_panel() -> None:
-    """启动本地可视化控制台的 Flask 服务。"""
+    """启动或打开本地 Web UI。"""
 
     print_header("可视化控制台")
-    script = ROOT_DIR / "scripts" / "web_panel_server.py"
-    if not script.exists():
-        print_error("未找到 scripts/web_panel_server.py，请先更新仓库。")
-        return
-
-    env = os.environ.copy()
-    env.update({"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"})
-
-    cmd = [sys.executable, str(script), "--port", "8088"]
-    print_info(f"启动命令: {shlex.join(cmd)}")
-
+    out_dir = DEFAULT_OUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    audio_root = DEFAULT_MATERIALS_DIR
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT_DIR),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+        running = ensure_server_running(
+            out_dir,
+            audio_root=audio_root,
+            host="127.0.0.1",
+            port=8765,
+            open_browser=True,
         )
-    except OSError as exc:
-        print_error(f"无法启动服务器: {exc}")
+    except Exception as exc:
+        print_error(f"启动 Web UI 失败: {exc}")
         return
 
-    assert proc.stdout is not None
-    port_event = threading.Event()
-    detected = {"port": None}
+    base_url = f"http://{running.config.host}:{running.port}/"
+    if getattr(running, "reused", False):
+        print_success(f"Web UI 已在运行: {base_url}")
+        print_info("已尝试在浏览器中打开页面。")
+        return
 
-    def _reader() -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end="")
-            match = re.search(r"http://127\\.0\\.0\\.1:(\\d+)", line)
-            if match and detected["port"] is None:
-                detected["port"] = int(match.group(1))
-                port_event.set()
-        proc.stdout.close()
-
-    reader_thread = threading.Thread(target=_reader, daemon=True)
-    reader_thread.start()
-
+    print_success(f"Web UI 已启动: {base_url}")
+    print_info("按 Ctrl+C 停止服务并返回主菜单。")
     try:
-        while not port_event.wait(timeout=0.1):
-            if proc.poll() is not None:
-                return_code = proc.returncode
-                print_error(
-                    f"可视化控制台启动失败 (exit={return_code})，请检查上方输出。"
-                )
-                return
-
-        port = detected["port"] or 8088
-        base_url = f"http://127.0.0.1:{port}"
-        panel_url = f"{base_url}/web/index.html?api={base_url}"
-        print_success(f"可视化控制台已运行: {panel_url}")
-        try:
-            webbrowser.open(panel_url)
-        except Exception as exc:  # pragma: no cover - 浏览器未配置
-            print_warning(f"自动打开浏览器失败: {exc}")
-        print_info(f"如浏览器未自动打开，请手动访问 {panel_url}")
-        print_info("按 Ctrl+C 停止服务器。")
-
-        try:
-            proc.wait()
-        except KeyboardInterrupt:
-            print_info("正在关闭服务器...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        wait_for_server(running)
+    except KeyboardInterrupt:
+        print_info("正在停止 Web UI 服务…")
+        running.stop()
     finally:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        try:
-            reader_thread.join(timeout=1)
-        except Exception:  # pragma: no cover - 容错
-            pass
+        print_info("Web UI 已关闭。")
 
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息

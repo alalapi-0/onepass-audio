@@ -78,7 +78,7 @@ from onepass.sent_align import (
     MERGE_ADJ_GAP_SEC,
 )
 from onepass.logging_utils import default_log_dir, setup_logger
-from onepass.web_server import run_web_server, spawn_web_server, wait_for_server
+from onepass.web import ensure_server_running, run_server as run_ui_server, spawn_server as spawn_ui_server, wait_for_server
 
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
@@ -1778,13 +1778,14 @@ def handle_serve_web(args: argparse.Namespace) -> int:
         args.host,
         args.port,
     )
+    if getattr(args, "cors", False):
+        LOGGER.warning("当前 Web UI 服务默认仅本地访问，--cors 参数已忽略。")
     try:
-        run_web_server(
+        run_ui_server(
             out_dir,
             audio_root,
             host=args.host,
             port=args.port,
-            enable_cors=args.cors,
             open_browser=args.open_browser,
         )
     except Exception:
@@ -2221,6 +2222,14 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--quiet")
     if args.serve:
         parts.append("--serve")
+    serve_host = getattr(args, "serve_host", "127.0.0.1")
+    serve_port = getattr(args, "serve_port", 8765)
+    if serve_host != "127.0.0.1":
+        parts.extend(["--serve-host", serve_host])
+    if serve_port != 8765:
+        parts.extend(["--serve-port", str(serve_port)])
+    if args.open_ui:
+        parts.append("--open-ui")
     if args.open_browser:
         parts.append("--open-browser")
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
@@ -2260,6 +2269,9 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "fallback_policy": args.fallback_policy,
         "serve": args.serve,
         "open_browser": args.open_browser,
+        "open_ui": args.open_ui,
+        "serve_host": serve_host,
+        "serve_port": serve_port,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2276,23 +2288,31 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
                 f"部分条目失败，请检查 {Path(args.output_dir) / 'batch_report.json'}"
             )
         )
+    records = summary.get("records") or []
+    success_stems = [
+        str(item.get("stem"))
+        for item in records
+        if item.get("status") == "ok" and item.get("stem")
+    ]
+    first_success_stem = success_stems[0] if success_stems else None
+
     if args.serve:
-        serve_host = getattr(args, "serve_host", "127.0.0.1")
-        serve_port = getattr(args, "serve_port", 5173)
         out_dir = Path(args.output_dir).expanduser().resolve()
-        audio_root = Path(args.audio_root).expanduser().resolve() if args.audio_root else None
+        if args.audio_root:
+            audio_root = Path(args.audio_root).expanduser().resolve()
+        else:
+            audio_root = Path(args.input_dir).expanduser().resolve()
         LOGGER.info(
             _safe_text(
                 f"尝试启动本地控制台: http://{serve_host}:{serve_port}/ (out={out_dir})"
             )
         )
         try:
-            server, thread = spawn_web_server(
+            running = spawn_ui_server(
                 out_dir,
-                audio_root,
+                audio_root=audio_root,
                 host=serve_host,
                 port=serve_port,
-                open_browser=args.open_browser,
             )
         except Exception:
             LOGGER.exception("自动启动控制台失败")
@@ -2302,12 +2322,53 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
                 )
             )
         else:
+            if args.open_browser or args.open_ui:
+                running.open_in_browser(stem=first_success_stem)
             LOGGER.info(
                 _safe_text(
-                    "控制台运行中，按 Ctrl+C 停止服务。若需后台运行请单独执行 serve-web 子命令。"
+                    f"控制台运行中: http://{running.config.host}:{running.port}/ (Ctrl+C 停止服务)"
                 )
             )
-            wait_for_server(server, thread)
+            wait_for_server(running)
+        return 0
+
+    if args.open_ui:
+        out_dir = Path(args.output_dir).expanduser().resolve()
+        if args.audio_root:
+            audio_root = Path(args.audio_root).expanduser().resolve()
+        else:
+            audio_root = Path(args.input_dir).expanduser().resolve()
+        try:
+            running = ensure_server_running(
+                out_dir,
+                audio_root=audio_root,
+                host=serve_host,
+                port=serve_port,
+                open_browser=True,
+                stem=first_success_stem,
+            )
+        except Exception:
+            LOGGER.exception("自动启动 Web UI 失败")
+            LOGGER.error(
+                _safe_text(
+                    "流水线已完成，但可视化控制台未成功启动。可在主菜单选择 [W] 重试。"
+                )
+            )
+        else:
+            if getattr(running, "reused", False):
+                LOGGER.info(
+                    _safe_text(
+                        f"Web UI 已在运行: http://{running.config.host}:{running.port}/"
+                    )
+                )
+                return 0
+            LOGGER.info(
+                _safe_text(
+                    f"Web UI 运行中: http://{running.config.host}:{running.port}/ (Ctrl+C 停止服务)"
+                )
+            )
+            wait_for_server(running)
+        return 0
     return 0
 
 
@@ -2573,7 +2634,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--out", required=True, help="输出目录 (扫描成果与导出文件)")
     serve.add_argument("--audio-root", help="原始音频根目录 (可选)")
     serve.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1")
-    serve.add_argument("--port", type=int, default=5173, help="监听端口，默认 5173")
+    serve.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765，若占用会自动顺延")
     serve.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
     serve.add_argument(
         "--cors",
@@ -2664,6 +2725,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--serve",
         action="store_true",
         help="流水线结束后在后台启动本地控制台",
+    )
+    pipeline.add_argument(
+        "--serve-host",
+        default="127.0.0.1",
+        help="Web UI 服务绑定地址（默认 127.0.0.1）",
+    )
+    pipeline.add_argument(
+        "--serve-port",
+        type=int,
+        default=8765,
+        help="Web UI 服务起始端口（默认 8765）",
+    )
+    pipeline.add_argument(
+        "--open-ui",
+        action="store_true",
+        help="流水线结束后启动 Web UI 并自动打开浏览器",
     )
     pipeline.add_argument(
         "--open-browser",
