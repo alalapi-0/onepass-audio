@@ -78,6 +78,7 @@ from onepass.sent_align import (
     MERGE_ADJ_GAP_SEC,
 )
 from onepass.logging_utils import default_log_dir, setup_logger
+from onepass.web_server import run_web_server, spawn_web_server, wait_for_server
 
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
@@ -1765,6 +1766,33 @@ def handle_render_audio(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_serve_web(args: argparse.Namespace) -> int:
+    """处理 serve-web 子命令，启动本地可视化控制台。"""
+
+    out_dir = Path(args.out).expanduser().resolve()
+    audio_root = Path(args.audio_root).expanduser().resolve() if args.audio_root else None
+    LOGGER.info(
+        "启动本地控制台: out=%s audio_root=%s host=%s port=%s",
+        out_dir,
+        audio_root or "(未指定)",
+        args.host,
+        args.port,
+    )
+    try:
+        run_web_server(
+            out_dir,
+            audio_root,
+            host=args.host,
+            port=args.port,
+            enable_cors=args.cors,
+            open_browser=args.open_browser,
+        )
+    except Exception:
+        LOGGER.exception("serve-web 启动失败")
+        return 1
+    return 0
+
+
 def run_all_in_one(args: argparse.Namespace) -> dict:
     """执行 all-in-one 流水线。"""
 
@@ -2191,6 +2219,10 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--verbose")
     if args.quiet:
         parts.append("--quiet")
+    if args.serve:
+        parts.append("--serve")
+    if args.open_browser:
+        parts.append("--open-browser")
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
@@ -2226,6 +2258,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "max_distance_ratio": args.max_distance_ratio,
         "min_anchor_ngram": args.min_anchor_ngram,
         "fallback_policy": args.fallback_policy,
+        "serve": args.serve,
+        "open_browser": args.open_browser,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2242,6 +2276,38 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
                 f"部分条目失败，请检查 {Path(args.output_dir) / 'batch_report.json'}"
             )
         )
+    if args.serve:
+        serve_host = getattr(args, "serve_host", "127.0.0.1")
+        serve_port = getattr(args, "serve_port", 5173)
+        out_dir = Path(args.output_dir).expanduser().resolve()
+        audio_root = Path(args.audio_root).expanduser().resolve() if args.audio_root else None
+        LOGGER.info(
+            _safe_text(
+                f"尝试启动本地控制台: http://{serve_host}:{serve_port}/ (out={out_dir})"
+            )
+        )
+        try:
+            server, thread = spawn_web_server(
+                out_dir,
+                audio_root,
+                host=serve_host,
+                port=serve_port,
+                open_browser=args.open_browser,
+            )
+        except Exception:
+            LOGGER.exception("自动启动控制台失败")
+            LOGGER.error(
+                _safe_text(
+                    "流水线已完成，但本地控制台未成功启动。可手动执行 serve-web 子命令重试。"
+                )
+            )
+        else:
+            LOGGER.info(
+                _safe_text(
+                    "控制台运行中，按 Ctrl+C 停止服务。若需后台运行请单独执行 serve-web 子命令。"
+                )
+            )
+            wait_for_server(server, thread)
     return 0
 
 
@@ -2503,6 +2569,19 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument("--channels", type=int, help="渲染声道数 (可选)")
     render.set_defaults(func=handle_render_audio)
 
+    serve = subparsers.add_parser("serve-web", help="启动本地可视化控制台")
+    serve.add_argument("--out", required=True, help="输出目录 (扫描成果与导出文件)")
+    serve.add_argument("--audio-root", help="原始音频根目录 (可选)")
+    serve.add_argument("--host", default="127.0.0.1", help="监听地址，默认 127.0.0.1")
+    serve.add_argument("--port", type=int, default=5173, help="监听端口，默认 5173")
+    serve.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
+    serve.add_argument(
+        "--cors",
+        action="store_true",
+        help="允许来自 localhost 的跨域访问 (调试其它前端时启用)",
+    )
+    serve.set_defaults(func=handle_serve_web)
+
     pipeline = subparsers.add_parser(
         "all-in-one",
         help="一键流水线：规范化（含去换行与空格修复） → 保留最后一遍 → 生成对齐标记（有音频时自动渲染）",
@@ -2581,6 +2660,16 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--no-interaction", action="store_true", help="无交互模式，直接执行")
     pipeline.add_argument("--verbose", action="store_true", help="输出调试日志")
     pipeline.add_argument("--quiet", action="store_true", help="仅输出警告及以上")
+    pipeline.add_argument(
+        "--serve",
+        action="store_true",
+        help="流水线结束后在后台启动本地控制台",
+    )
+    pipeline.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="配合 --serve 使用，启动后自动打开浏览器",
+    )
     pipeline.add_argument(
         "--fast-match",
         dest="fast_match",

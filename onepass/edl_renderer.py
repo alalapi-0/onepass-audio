@@ -20,6 +20,7 @@ __all__ = [
     "probe_duration",
     "normalize_segments",
     "build_filter_complex",
+    "build_filter_pipeline",
     "render_audio",
 ]
 
@@ -55,6 +56,7 @@ _AUDIO_SUFFIXES: tuple[str, ...] = (".wav", ".flac", ".m4a", ".aac", ".mp3", ".o
 _WINDOWS_DRIVE = re.compile(r"^[a-zA-Z]:[/\\]")
 _MAX_SCAN_DEPTH = 2
 _MAX_LOG_CANDIDATES = 5
+_DEFAULT_CHUNK_SIZE = 200
 
 
 def _derive_stem_from_path(edl_path: Path) -> str:
@@ -484,6 +486,80 @@ def normalize_segments(segments: list[EDLSegment], total: float) -> list[EDLSegm
     return filtered
 
 
+def build_filter_pipeline(
+    keeps: list[EDLSegment],
+    samplerate: int | None,
+    channels: int | None,
+    *,
+    chunk_size: int = _DEFAULT_CHUNK_SIZE,
+) -> tuple[str, str]:
+    """基于保留片段构造 ``filter_complex`` 与输出标签。
+
+    该函数在 ``build_filter_complex`` 基础上新增分段拼接能力，
+    当片段数量超过 ``chunk_size`` 时会先分块 concat，再做总拼接，
+    避免命令行过长导致 ffmpeg 报错。
+    返回值为 (filter_complex_str, output_label)。
+    """
+
+    if not keeps:
+        raise ValueError("缺少保留片段，无法构造滤镜。")
+    if chunk_size <= 0:
+        chunk_size = len(keeps)
+
+    chains: list[str] = []
+    chunk_outputs: list[str] = []
+    current_segment_labels: list[str] = []
+
+    for index, segment in enumerate(keeps):
+        start = _format_ts(segment.start)
+        end = _format_ts(segment.end)
+        label = f"seg{index}"
+        chains.append(
+            f"[0:a]atrim=start={start}:end={end},asetpts=N/SR/TB[{label}]"
+        )
+        current_segment_labels.append(label)
+
+        is_last = index == len(keeps) - 1
+        if len(current_segment_labels) >= chunk_size or is_last:
+            if len(current_segment_labels) == 1:
+                chunk_outputs.append(current_segment_labels[0])
+            else:
+                chunk_label = f"chunk{len(chunk_outputs)}"
+                inputs = "".join(f"[{name}]" for name in current_segment_labels)
+                chains.append(
+                    f"{inputs}concat=n={len(current_segment_labels)}:v=0:a=1[{chunk_label}]"
+                )
+                chunk_outputs.append(chunk_label)
+            current_segment_labels = []
+
+    if not chunk_outputs:
+        raise RuntimeError("滤镜构建失败，未生成任何拼接片段。")
+
+    current_label = chunk_outputs[0]
+    if len(chunk_outputs) > 1:
+        merge_label = "merged"
+        inputs = "".join(f"[{name}]" for name in chunk_outputs)
+        chains.append(f"{inputs}concat=n={len(chunk_outputs)}:v=0:a=1[{merge_label}]")
+        current_label = merge_label
+
+    post_filters: list[str] = []
+    if samplerate:
+        post_filters.append(f"aresample={samplerate}")
+    if channels:
+        layout = {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")
+        post_filters.append(f"aformat=sample_fmts=s16:channel_layouts={layout}")
+
+    if post_filters:
+        final_label = "ac"
+        chains.append(
+            f"[{current_label}]" + ",".join(post_filters) + f"[{final_label}]"
+        )
+        current_label = final_label
+
+    filter_complex = ";".join(chains)
+    return filter_complex, f"[{current_label}]"
+
+
 def build_filter_complex(
     keeps: list[EDLSegment],
     samplerate: int | None,
@@ -491,33 +567,8 @@ def build_filter_complex(
 ) -> tuple[list[str], str]:
     """基于保留片段构造 ffmpeg filter_complex 参数。"""
 
-    if not keeps:
-        raise ValueError("缺少保留片段，无法构造滤镜。")
-
-    chains: list[str] = []  # 存放逐片段的滤镜链
-    for index, segment in enumerate(keeps):
-        start = _format_ts(segment.start)
-        end = _format_ts(segment.end)
-        chains.append(
-            f"[0:a]atrim=start={start}:end={end},asetpts=N/SR/TB[a{index}]"
-        )  # 截取 + 校正时间戳
-
-    concat_inputs = "".join(f"[a{idx}]" for idx in range(len(keeps)))  # 拼接所有标签
-    post_filters: list[str] = []  # 收集可选的后处理滤镜
-    if samplerate:
-        post_filters.append(f"aresample={samplerate}")
-    if channels:
-        layout = {1: "mono", 2: "stereo"}.get(channels, f"{channels}c")  # 根据声道数映射布局
-        post_filters.append(f"aformat=sample_fmts=s16:channel_layouts={layout}")
-
-    final_label = "[ac]"  # 约定最终输出标签
-    concat_filter = f"{concat_inputs}concat=n={len(keeps)}:v=0:a=1"
-    if post_filters:
-        concat_filter += "," + ",".join(post_filters)
-    concat_filter += final_label  # 绑定输出标签
-
-    filter_complex = ";".join(chains + [concat_filter])  # 拼装完整滤镜
-    return ["-filter_complex", filter_complex], final_label
+    filter_complex, label = build_filter_pipeline(keeps, samplerate, channels)
+    return ["-filter_complex", filter_complex], label
 
 
 def render_audio(
