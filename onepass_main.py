@@ -6,6 +6,7 @@ import os  # 管理环境变量用于子进程
 import shlex  # 构建 shell 风格命令展示
 import subprocess  # 调用外部脚本与命令
 import sys  # 访问命令行参数与退出函数
+from urllib.parse import urlencode
 from dataclasses import asdict, dataclass  # 引入数据类工具与转换字典的方法
 from pathlib import Path  # 使用 Path 进行跨平台路径操作
 from typing import Dict, Iterable, List, Optional, Tuple  # 导入常用类型注解
@@ -44,7 +45,7 @@ from onepass.ux import (  # 引入命令行交互的工具函数
     prompt_text,  # 自由输入文本
     prompt_yes_no,  # 询问用户是否继续的布尔函数
 )
-from onepass.web import ensure_server_running, wait_for_server
+from onepass.ui_server import open_browser_later, start_static_server
 
 
 ROOT_DIR = Path(__file__).resolve().parent  # 计算项目根目录，方便拼接相对路径
@@ -1157,32 +1158,25 @@ def _launch_web_panel() -> None:
     print_header("可视化控制台")
     out_dir = DEFAULT_OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    audio_root = DEFAULT_MATERIALS_DIR
+    web_dir = ROOT_DIR / "web"
+    if not web_dir.exists():
+        print_error("未找到 web/ 目录，无法启动本地 UI。")
+        return
+    query = {"out": str(out_dir)}
+    manifest_path = out_dir / "manifest.json"
+    if manifest_path.exists():
+        query["manifest"] = str(manifest_path)
     try:
-        running = ensure_server_running(
-            out_dir,
-            audio_root=audio_root,
-            host="127.0.0.1",
-            port=8765,
-            open_browser=True,
-        )
-    except Exception as exc:
+        _, base_url = start_static_server(str(web_dir), host="127.0.0.1", port=8765)
+    except OSError as exc:
         print_error(f"启动 Web UI 失败: {exc}")
         return
-
-    base_url = f"http://{running.config.host}:{running.port}/"
-    if getattr(running, "reused", False):
-        print_success(f"Web UI 已在运行: {base_url}")
-        print_info("已尝试在浏览器中打开页面。")
-        return
-
-    print_success(f"Web UI 已启动: {base_url}")
-    print_info("按 Ctrl+C 停止服务并返回主菜单。")
-    try:
-        wait_for_server(running)
-    except KeyboardInterrupt:
-        print_info("正在停止 Web UI 服务…")
-        running.stop()
+    url = base_url
+    if query:
+        url = f"{base_url}?{urlencode(query)}"
+    print_success(f"UI 服务已启动: {url}")
+    print_info("浏览器页面将自动打开，可直接使用 app.html。")
+    open_browser_later(url)
     finally:
         print_info("Web UI 已关闭。")
 

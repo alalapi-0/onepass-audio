@@ -33,7 +33,7 @@ from .text_norm import (
     normalize_for_align,
     normalize_text,
 )
-from .utils_subproc import run_cmd
+from .utils.subproc import run_cmd
 
 LOGGER = logging.getLogger(__name__)
 
@@ -173,12 +173,12 @@ def _resolve_audio_duration(words: Sequence[Word], audio_path: Path | None) -> f
         str(audio_path),
     ]
     try:
-        returncode, stdout, stderr = run_cmd(cmd, capture=True)
+        cp = run_cmd(cmd)
     except FileNotFoundError:
         return fallback
-    if returncode != 0:
+    if cp.returncode != 0:
         return fallback
-    output = stdout.strip() or stderr.strip()
+    output = (cp.stdout or "").strip() or (cp.stderr or "").strip()
     try:
         value = float(output)
     except ValueError:

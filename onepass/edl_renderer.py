@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import shlex  # 美化 dry-run 输出
-from .utils_subproc import run_cmd  # 统一子进程调用
+from .utils.subproc import run_cmd  # 统一子进程调用
 from collections import deque
 from dataclasses import dataclass  # 构建结构化数据模型
 from pathlib import Path, PurePosixPath
@@ -417,19 +417,21 @@ def probe_duration(audio_path: Path) -> float:
         str(audio_path),
     ]
     try:
-        returncode, stdout, stderr = run_cmd(cmd, capture=True)
+        cp = run_cmd(cmd)
     except FileNotFoundError as exc:  # 未安装 ffprobe
         raise RuntimeError(
             "未找到 ffprobe，可通过安装 ffmpeg 并将其加入 PATH 解决。"
         ) from exc
 
-    if returncode != 0:
+    if cp.returncode != 0:
+        stdout = cp.stdout or ""
+        stderr = cp.stderr or ""
         message = (stderr.strip() or stdout.strip()).splitlines()[:3]
         raise RuntimeError(
             "ffprobe 调用失败，无法获取音频时长。stderr=" + " | ".join(message)
         )
 
-    output = stdout.strip() or stderr.strip()
+    output = (cp.stdout or "").strip() or (cp.stderr or "").strip()
     try:
         duration = float(output)
     except ValueError as exc:  # 输出解析失败
@@ -628,14 +630,16 @@ def render_audio(
         return output_path
 
     try:
-        returncode, stdout, stderr = run_cmd(cmd, capture=True)
+        cp = run_cmd(cmd)
     except FileNotFoundError as exc:  # ffmpeg 不存在
         raise RuntimeError("未找到 ffmpeg，请安装后再试或将其加入 PATH。") from exc
 
-    if returncode != 0:
-        snippet = (stderr.strip() or stdout.strip()).splitlines()[:5]
+    if cp.returncode != 0:
+        stdout = (cp.stdout or "").strip()
+        stderr = (cp.stderr or "").strip()
+        snippet = (stderr or stdout).splitlines()[:5]
         raise RuntimeError(
-            f"ffmpeg 渲染失败（退出码 {returncode}）。stderr=" + " | ".join(snippet)
+            f"ffmpeg 渲染失败（退出码 {cp.returncode}）。stderr=" + " | ".join(snippet)
         )
 
     if not output_path.exists():

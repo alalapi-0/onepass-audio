@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 
+CN_PUNCT = "。！？；…?!；"
+RIGHT_CLOSERS = "”’）】］』」》"
+
 _ASCII_ALNUM = re.compile(r'^[\x00-\x7F]+$')
 
 
@@ -48,3 +51,40 @@ def collapse_soft_linebreaks(text: str) -> str:
 
     # 去除文首文末空白
     return text.strip()
+
+
+def normalize_whitespace(text: str) -> str:
+    """规范化空白字符，去除制表符与多余空格。"""
+
+    text = text.replace("\t", " ")
+    text = re.sub(r"[ \u00A0\u2009\u3000]+", " ", text)
+    text = re.sub(r"([^\x00-\x7F])\s+([，。！？；：、])", r"\1\2", text)
+    text = re.sub(r"([，。！？；：、])\s+([^\x00-\x7F])", r"\1\2", text)
+    return "\n".join(segment.strip() for segment in text.splitlines())
+
+
+def split_sentences_cn(text: str) -> list[str]:
+    """按照中文标点将文本切分为句子列表。"""
+
+    text = normalize_whitespace(text)
+    text = re.sub(r"\s*\n\s*", "", text)
+    pattern = rf"(?<=[{CN_PUNCT}])(?=[{RIGHT_CLOSERS}]*[^\x00-\x7F])|(?<=[{CN_PUNCT}])"
+    parts = re.split(pattern, text)
+    sentences: list[str] = []
+    for part in parts:
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        if len(cleaned) > 200 and not re.search(rf"[{CN_PUNCT}]", cleaned):
+            cleaned = re.sub(r"[，、]", "\n", cleaned)
+            sentences.extend(fragment.strip() for fragment in cleaned.splitlines() if fragment.strip())
+        else:
+            sentences.append(cleaned)
+    return sentences
+
+
+def to_align_text(text: str) -> str:
+    """生成对齐文本：每句单独一行、无制表符与多余空格。"""
+
+    sentences = split_sentences_cn(text)
+    return "\n".join(sentences)
