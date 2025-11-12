@@ -39,6 +39,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
 )
 from onepass.normalize import collapse_soft_linebreaks
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
+    EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
     MAX_WINDOW_SEC,
     MIN_SENT_CHARS,
@@ -520,16 +521,21 @@ def _export_retake_outputs(
     result,
     stem: str,
     out_dir: Path,
-    source_audio_name: Optional[str],
+    source_audio_abs: Optional[str],
     samplerate: Optional[int],
     channels: Optional[int],
+    audio_root: Optional[Path],
     *,
     sentence_mode: bool,
     review_only: bool,
-) -> dict:
-    """根据处理结果导出字幕、标记与 EDL。"""
+    prefer_relative_audio: bool,
+    path_style: str,
+) -> tuple[dict, EDLWriteResult]:
+    """根据处理结果导出字幕、标记与 EDL，并返回写出结果。"""
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    audio_root_str = str(audio_root) if audio_root else None
+    edl_result: EDLWriteResult
     if sentence_mode:
         srt_path = out_dir / f"{stem}.sentence.keep.srt"
         txt_path = out_dir / f"{stem}.sentence.keep.txt"
@@ -538,16 +544,20 @@ def _export_retake_outputs(
         export_sentence_srt(result.hits, srt_path)
         export_sentence_txt(result.hits, txt_path)
         export_sentence_markers(result.hits, result.review_points, markers_path)
-        export_sentence_edl_json(
+        edl_result = export_sentence_edl_json(
             result.edl_keep_segments,
             result.audio_start,
             result.audio_end,
             edl_path,
             review_only=review_only,
-            source_audio_rel=source_audio_name,
+            source_audio_abs=source_audio_abs,
             samplerate=samplerate,
             channels=channels,
             stem=stem,
+            source_samplerate=samplerate,
+            audio_root=audio_root_str,
+            prefer_relative_audio=prefer_relative_audio,
+            path_style=path_style,
         )
     else:
         srt_path = out_dir / f"{stem}.keepLast.srt"
@@ -561,21 +571,25 @@ def _export_retake_outputs(
             markers_path,
             note=result.fallback_marker_note if result.fallback_used else None,
         )
-        export_edl_json(
+        edl_result = export_edl_json(
             result.edl_keep_segments,
-            source_audio_name,
+            source_audio_abs,
             edl_path,
             stem=stem,
             samplerate=samplerate,
             channels=channels,
             source_samplerate=samplerate,
+            audio_root=audio_root_str,
+            prefer_relative_audio=prefer_relative_audio,
+            path_style=path_style,
         )
-    return {
+    outputs = {
         "srt": srt_path,
         "txt": txt_path,
         "markers": markers_path,
-        "edl": edl_path,
+        "edl": edl_result.edl_path,
     }
+    return outputs, edl_result
 
 
 def _process_retake_item(
@@ -585,6 +599,7 @@ def _process_retake_item(
     source_audio_path: Optional[Path],
     samplerate: Optional[int],
     channels: Optional[int],
+    audio_root: Optional[Path],
     materials_base: Optional[Path],
     out_base: Path,
     min_sent_chars: int,
@@ -601,6 +616,8 @@ def _process_retake_item(
     max_distance_ratio: float,
     min_anchor_ngram: int,
     fallback_policy: str,
+    prefer_relative_audio: bool,
+    path_style: str,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -626,16 +643,22 @@ def _process_retake_item(
         words = list(doc)
         audio_path: Path | None = None
         source_audio_name: str | None = None
+        source_audio_abs: Path | None = None
         if source_audio_path is not None:
             candidate = source_audio_path
             if not candidate.is_absolute():
                 base_dir = materials_base or words_path.parent
-                candidate = (base_dir / candidate).expanduser().resolve()
+                candidate = (base_dir / candidate).expanduser()
             else:
-                candidate = candidate.expanduser().resolve()
-            source_audio_name = candidate.name
-            if candidate.exists():
-                audio_path = candidate
+                candidate = candidate.expanduser()
+            try:
+                resolved_candidate = candidate.resolve()
+            except OSError:
+                resolved_candidate = candidate
+            source_audio_abs = resolved_candidate
+            source_audio_name = resolved_candidate.name
+            if resolved_candidate.exists():
+                audio_path = resolved_candidate
         silence_ranges: list[tuple[float, float]] | None = None
         if pause_align and silence_probe_enabled and audio_path is not None:
             silence_ranges = probe_silence_ffmpeg(audio_path, noise_db=noise_db, min_d=silence_min_d)
@@ -792,28 +815,20 @@ def _process_retake_item(
         stats["line_gap_final"] = current_line_gap
         stats["sentence_gap_final"] = current_sentence_gap
 
-        if sentence_strict:
-            outputs = _export_retake_outputs(
-                result,
-                stem,
-                out_dir,
-                source_audio,
-                samplerate,
-                channels,
-                sentence_mode=True,
-                review_only=review_only,
-            )
-        else:
-            outputs = _export_retake_outputs(
-                result,
-                stem,
-                out_dir,
-                source_audio_name,
-                samplerate,
-                channels,
-                sentence_mode=False,
-                review_only=False,
-            )
+        source_audio_abs_str = str(source_audio_abs) if source_audio_abs else None
+        outputs, edl_result = _export_retake_outputs(
+            result,
+            stem,
+            out_dir,
+            source_audio_abs_str,
+            samplerate,
+            channels,
+            audio_root,
+            sentence_mode=sentence_strict,
+            review_only=review_only if sentence_strict else False,
+            prefer_relative_audio=prefer_relative_audio,
+            path_style=path_style,
+        )
 
         LOGGER.info(
             "停顿吸附=%s 吸附次数=%s 自动合并=%s 丢弃碎片=%s 剪切比例=%.3f",
@@ -833,11 +848,16 @@ def _process_retake_item(
             stats["fallback_message"] = result.fallback_reason or "keep_full_audio"
         if source_audio_name:
             stats["source_audio_name"] = source_audio_name
+        if edl_result.source_audio is not None:
+            stats["source_audio_written"] = edl_result.source_audio
         item = {
             "stem": stem,
             "words_json": safe_rel(materials_base or words_path.parent, words_path),
             "text": safe_rel(materials_base or text_path.parent, text_path),
             "outputs": {key: safe_rel(out_base, value) for key, value in outputs.items()},
+            "source_audio_written": edl_result.source_audio,
+            "source_audio_abs": edl_result.source_audio_abs or source_audio_abs_str,
+            "audio_root": str(audio_root) if audio_root else "",
             "stats": stats,
             "status": "ok",
             "message": (
@@ -856,6 +876,9 @@ def _process_retake_item(
             "stats": {},
             "status": "failed",
             "message": str(exc),
+            "audio_root": str(audio_root) if audio_root else "",
+            "source_audio_written": None,
+            "source_audio_abs": None,
         }
     return stem, item  # 返回 stem 及结果条目
 
@@ -897,6 +920,7 @@ def _run_retake_batch(
     out_dir: Path,
     glob_words: list[str],
     text_patterns: list[str],
+    audio_root: Optional[Path],
     workers: Optional[int],
     min_sent_chars: int,
     line_max_dup_gap_sec: float,
@@ -912,6 +936,8 @@ def _run_retake_batch(
     max_distance_ratio: float,
     min_anchor_ngram: int,
     fallback_policy: str,
+    prefer_relative_audio: bool,
+    path_style: str,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -942,6 +968,7 @@ def _run_retake_batch(
     futures = []  # 并发任务列表
     processed = 0
     last_progress = start
+    audio_root_effective = audio_root or materials_dir
     try:
         if workers and workers > 1:  # 并发模式
             executor = ThreadPoolExecutor(max_workers=workers)  # 构建线程池
@@ -956,6 +983,9 @@ def _run_retake_batch(
                         "stats": {},
                         "status": "failed",
                         "message": "未找到匹配的 TXT 或 .norm.txt",
+                        "audio_root": str(audio_root_effective),
+                        "source_audio_written": None,
+                        "source_audio_abs": None,
                     }
                     failed += 1
                     items.append(item)
@@ -971,6 +1001,7 @@ def _run_retake_batch(
                         None,
                         None,
                         None,
+                        audio_root_effective,
                         materials_dir,
                         out_dir,
                         min_sent_chars,
@@ -987,6 +1018,8 @@ def _run_retake_batch(
                         max_distance_ratio,
                         min_anchor_ngram,
                         fallback_policy,
+                        prefer_relative_audio,
+                        path_style,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1024,6 +1057,9 @@ def _run_retake_batch(
                             "stats": {},
                             "status": "failed",
                             "message": "未找到匹配的 TXT 或 .norm.txt",
+                            "audio_root": str(audio_root_effective),
+                            "source_audio_written": None,
+                            "source_audio_abs": None,
                         }
                     )
                     failed += 1
@@ -1037,6 +1073,7 @@ def _run_retake_batch(
                     None,
                     None,
                     None,
+                    audio_root_effective,
                     materials_dir,
                     out_dir,
                     min_sent_chars,
@@ -1053,6 +1090,8 @@ def _run_retake_batch(
                     max_distance_ratio,
                     min_anchor_ngram,
                     fallback_policy,
+                    prefer_relative_audio,
+                    path_style,
                     pause_align=pause_align,
                     pause_gap_sec=pause_gap_sec,
                     pause_snap_limit=pause_snap_limit,
@@ -1124,6 +1163,16 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
         debug_csv = None
     no_interaction = bool(getattr(args, "no_interaction", False))
+    prefer_relative_audio = bool(getattr(args, "prefer_relative_audio", True))
+    path_style = str(getattr(args, "path_style", "auto")).lower()
+    if path_style not in {"auto", "posix", "windows"}:
+        raise ValueError("--path-style 仅支持 auto/posix/windows")
+    if args.audio_root:
+        audio_root_path = Path(args.audio_root).expanduser().resolve()
+    elif args.words_json:
+        audio_root_path = Path(args.words_json).expanduser().resolve().parent
+    else:
+        audio_root_path = Path(args.materials).expanduser().resolve()
     if args.words_json:  # 单文件模式
         if not args.text:
             raise ValueError("单文件模式需要同时提供 --text")
@@ -1137,6 +1186,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             source_audio_path,
             args.samplerate,
             args.channels,
+            audio_root_path,
             None,
             out_dir,
             args.min_sent_chars,
@@ -1153,6 +1203,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            prefer_relative_audio,
+            path_style,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1180,11 +1232,13 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     else:  # 目录批处理
         text_patterns = [_casefold_pattern(pattern) for pattern in args.glob_text]
         glob_words_pattern = parse_glob_list(args.glob_words)
+        materials_dir = Path(args.materials).expanduser().resolve()
         result = _run_retake_batch(
-            Path(args.materials),
+            materials_dir,
             out_dir,
             glob_words_pattern,
             text_patterns,
+            audio_root_path,
             args.workers,
             args.min_sent_chars,
             line_max_dup_gap_sec,
@@ -1200,6 +1254,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            prefer_relative_audio,
+            path_style,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1220,6 +1276,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         summary = result["summary"]
         failed = summary.get("failed", 0)
     payload = {"items": items, "summary": summary}
+    payload["audio_root"] = str(audio_root_path)
+    payload["prefer_relative_audio"] = prefer_relative_audio
+    payload["path_style"] = path_style
     retake_stats = [_build_retake_stats_from_item(item) for item in items]
     payload["retake_stats"] = [asdict(stat) for stat in retake_stats]
     stat_keys = [
@@ -1266,7 +1325,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     if write_report:  # 写入批处理报告
         existing = {}
         if report_path.exists():
-            existing = json.loads(report_path.read_text(encoding="utf-8-sig"))
+            existing = json.loads(report_path.read_text(encoding="utf-8-sig", errors="replace"))
         existing["retake_keep_last"] = payload
         write_json(report_path, existing)
     return payload
@@ -1298,6 +1357,12 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         if args.workers:
             parts.extend(["--workers", str(args.workers)])
     parts.extend(["--out", str(Path(args.out))])
+    if args.audio_root:
+        parts.extend(["--audio-root", str(Path(args.audio_root))])
+    if not args.prefer_relative_audio:
+        parts.append("--no-prefer-relative-audio")
+    if args.path_style != "auto":
+        parts.extend(["--path-style", args.path_style])
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
     if args.source_audio:
         parts.extend(["--source-audio", args.source_audio])
@@ -1358,6 +1423,25 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
+    if args.audio_root:
+        snapshot_audio_root = str(Path(args.audio_root))
+    elif args.words_json:
+        snapshot_audio_root = str(Path(args.words_json).expanduser().resolve().parent)
+    else:
+        snapshot_audio_root = str(Path(args.materials).expanduser().resolve())
+    snapshot = {
+        "mode": "single" if args.words_json else "batch",
+        "audio_root": snapshot_audio_root,
+        "prefer_relative_audio": args.prefer_relative_audio,
+        "path_style": args.path_style,
+        "fast_match": args.fast_match,
+        "workers": args.workers,
+        "max_windows": args.max_windows,
+        "match_timeout": args.match_timeout,
+        "fallback_policy": args.fallback_policy,
+    }
+    LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
+
     try:
         payload = run_retake_keep_last(args, report_path=Path(args.out) / "batch_report.json")
     except Exception as exc:
@@ -1396,7 +1480,24 @@ def _process_render_item(
             source_hint,
             audio_root,
         )
-        source_audio = resolve_source_audio(edl, edl_path, audio_root)  # 定位源音频
+        source_audio = resolve_source_audio(edl, edl_path, audio_root, strict=False)  # 定位源音频
+        if source_audio is None:
+            LOGGER.warning(
+                "未定位到源音频，跳过渲染: stem=%s source_audio=%s audio_root=%s",
+                stem_hint,
+                source_hint,
+                audio_root,
+            )
+            return {
+                "edl": safe_rel(edl_path.parent, edl_path),
+                "source_audio": source_hint,
+                "output": "",
+                "stats": {},
+                "status": "skipped",
+                "render_skipped_reason": "audio_not_found",
+                "message": "未定位到源音频，已跳过渲染",
+                "source_audio_written": edl.source_audio,
+            }
         LOGGER.info(
             "[render] resolve audio: stem=%s source_audio=%s audio_root=%s resolved=%s",
             stem_hint,
@@ -1415,6 +1516,8 @@ def _process_render_item(
             actual_samplerate,
             actual_channels,
             dry_run=False,
+            edl_doc=edl,
+            source_audio_path=source_audio,
         )  # 调用渲染
         keep_duration = sum(seg.end - seg.start for seg in keeps)  # 统计保留时长
         return {
@@ -1429,6 +1532,7 @@ def _process_render_item(
             },
             "status": "ok",
             "message": "渲染成功",
+            "source_audio_written": edl.source_audio,
         }
     except Exception as exc:
         LOGGER.exception("渲染任务失败: %s", edl_path)
@@ -1439,6 +1543,8 @@ def _process_render_item(
             "stats": {},
             "status": "failed",
             "message": str(exc),
+            "render_skipped_reason": "error",
+            "source_audio_written": edl.source_audio if 'edl' in locals() else None,
         }
 
 
@@ -1514,6 +1620,7 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
         items.sort(key=lambda item: item.get("edl", ""))  # 按 EDL 名称排序
         summary = {"total": total, "ok": total - failed, "failed": failed, "elapsed_seconds": elapsed}
     payload = {"items": items, "summary": summary}
+    payload["audio_root"] = str(audio_root)
     summary["aggregated_stats"] = {
         "segments": sum(int(item.get("stats", {}).get("segments", 0)) for item in items if item.get("status") == "ok"),
         "keep_duration": sum(float(item.get("stats", {}).get("keep_duration", 0.0)) for item in items if item.get("status") == "ok"),
@@ -1521,7 +1628,7 @@ def run_render_audio(args: argparse.Namespace, *, report_path: Path, write_repor
     if write_report:
         existing = {}
         if report_path.exists():
-            existing = json.loads(report_path.read_text(encoding="utf-8-sig"))
+            existing = json.loads(report_path.read_text(encoding="utf-8-sig", errors="replace"))
         existing.setdefault("retake_keep_last", {})
         existing["render_audio"] = payload
         write_json(report_path, existing)
@@ -1584,6 +1691,16 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     stage_summary: dict[str, dict] = {}
     pipeline_records: list[dict] = []
     start = time.perf_counter()
+
+    audio_root_arg = getattr(args, "audio_root", None)
+    if audio_root_arg:
+        audio_root_path = Path(audio_root_arg).expanduser().resolve()
+    else:
+        audio_root_path = input_dir
+    prefer_relative_audio = bool(getattr(args, "prefer_relative_audio", True))
+    path_style = str(getattr(args, "path_style", "auto")).lower()
+    if path_style not in {"auto", "posix", "windows"}:
+        raise ValueError("--path-style 仅支持 auto/posix/windows")
 
     norm_pattern = _casefold_pattern(args.norm_glob)
     norm_out_dir = out_dir / "norm"
@@ -1665,6 +1782,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                     "stats": {},
                     "status": "failed",
                     "message": "未找到匹配的词级 JSON",
+                    "audio_root": str(audio_root_path),
+                    "source_audio_written": None,
+                    "source_audio_abs": None,
                 }
             )
             failed += 1
@@ -1679,6 +1799,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                     "stats": {},
                     "status": "failed",
                     "message": "未找到匹配的 TXT/.norm/.align 文件",
+                    "audio_root": str(audio_root_path),
+                    "source_audio_written": None,
+                    "source_audio_abs": None,
                 }
             )
             failed += 1
@@ -1690,6 +1813,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             kit.audio,
             None,
             None,
+            audio_root_path,
             input_dir,
             out_dir,
             MIN_SENT_CHARS,
@@ -1706,6 +1830,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             max_distance_ratio,
             min_anchor_ngram,
             fallback_policy,
+            prefer_relative_audio,
+            path_style,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -1736,6 +1862,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         "elapsed_seconds": retake_elapsed,
     }
     retake_result = {"items": retake_items, "summary": retake_summary, "retake_stats": []}
+    retake_result["audio_root"] = str(audio_root_path)
+    retake_result["prefer_relative_audio"] = prefer_relative_audio
+    retake_result["path_style"] = path_style
     report["retake_keep_last"] = retake_result
     stage_summary["retake_keep_last"] = retake_summary
     LOGGER.info("[stage] retake done elapsed=%.2fs", retake_elapsed)
@@ -1796,6 +1925,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             "items": [],
             "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
             "status": "skipped(manual)",
+            "audio_root": str(audio_root_path),
+            "render_skipped_reason": "render_disabled",
         }
         report["render_audio"] = render_payload
         stage_summary["render_audio"] = render_payload["summary"]
@@ -1808,6 +1939,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                 "items": [],
                 "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
                 "status": "skipped(no-audio)",
+                "audio_root": str(audio_root_path),
+                "render_skipped_reason": "no_audio_detected",
             }
             report["render_audio"] = render_payload
             stage_summary["render_audio"] = render_payload["summary"]
@@ -1820,7 +1953,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                     ["*.keepLast.edl.json", "*.sentence.edl.json"]
                 ),
                 workers=args.workers,
-                audio_root=str(input_dir),
+                audio_root=str(audio_root_path),
                 out=str(out_dir),
                 samplerate=None,
                 channels=None,
@@ -1833,6 +1966,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
                     "items": [],
                     "summary": {"total": 0, "ok": 0, "failed": 0, "elapsed_seconds": 0.0},
                     "error": str(exc),
+                    "audio_root": str(audio_root_path),
+                    "render_skipped_reason": "error",
                 }
             report["render_audio"] = render_payload
             stage_summary["render_audio"] = render_payload.get("summary", {})
@@ -1846,6 +1981,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         stem = item.get("stem", "")
         stats = stats_by_stem.get(stem) or _build_retake_stats_from_item(item)
         has_audio = audio_flags.get(stem.lower(), False)
+        stats_map = item.get("stats", {}) or {}
         render_note = _resolve_render_status(
             stem,
             render_mode=render_mode,
@@ -1854,6 +1990,13 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             render_summary=render_summary,
             global_error=render_error,
         )
+        render_entry = render_summary.get(stem.lower())
+        render_reason = render_entry.get("render_skipped_reason") if render_entry else None
+        if render_reason is None:
+            if render_mode == "never":
+                render_reason = "render_disabled"
+            elif render_skipped_no_audio:
+                render_reason = "no_audio_detected"
         record = {
             "stem": stem,
             "status": item.get("status"),
@@ -1864,6 +2007,11 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             "window": stats.dedup_window,
             "cut": stats.cut_seconds,
             "render": render_note,
+            "source_audio_written": item.get("source_audio_written"),
+            "audio_root": item.get("audio_root") or str(audio_root_path),
+            "render_skipped_reason": render_reason,
+            "match_engine": stats_map.get("match_engine"),
+            "timed_out": stats_map.get("timed_out"),
         }
         pipeline_records.append(record)
 
@@ -1875,6 +2023,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         "stages": stage_summary,
         "records": pipeline_records,
     }
+    report["summary"]["audio_root"] = str(audio_root_path)
+    report["audio_root"] = str(audio_root_path)
+    report["prefer_relative_audio"] = prefer_relative_audio
+    report["path_style"] = path_style
     if ordered_stats:
         retake_result["retake_stats"] = [asdict(stat) for stat in ordered_stats]
         report["summary"]["retake_stats"] = [asdict(stat) for stat in ordered_stats]
@@ -1935,6 +2087,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-audio",
         args.glob_audio,
     ]
+    if args.audio_root:
+        parts.extend(["--audio-root", str(Path(args.audio_root))])
+    if not args.prefer_relative_audio:
+        parts.append("--no-prefer-relative-audio")
+    if args.path_style != "auto":
+        parts.extend(["--path-style", args.path_style])
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
     if not args.emit_align:
         parts.append("--no-emit-align")
@@ -1970,6 +2128,9 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
         "render": canonical_render,
+        "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
+        "prefer_relative_audio": args.prefer_relative_audio,
+        "path_style": args.path_style,
         "workers": args.workers,
         "no_interaction": args.no_interaction,
         "fast_match": args.fast_match,
@@ -2030,6 +2191,20 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--materials", help="目录批处理模式：素材根目录")
     retake.add_argument("--text", help="单文件模式：原文 TXT")
     retake.add_argument("--out", required=True, help="输出目录")
+    retake.add_argument("--audio-root", help="源音频搜索根目录（默认=素材根或词级 JSON 所在目录）")
+    retake.add_argument(
+        "--prefer-relative-audio",
+        dest="prefer_relative_audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="若音频位于 audio-root 下，EDL 中优先写相对路径（默认开启）",
+    )
+    retake.add_argument(
+        "--path-style",
+        choices=["auto", "posix", "windows"],
+        default="auto",
+        help="EDL 中 source_audio 的分隔符风格（默认 auto）",
+    )
     retake.add_argument(
         "--glob-words",
         default="*.words.json;*.json",
@@ -2230,11 +2405,28 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument("--in", dest="input_dir", required=True, help="输入目录 (含 *.txt/*.json/音频)")
     pipeline.add_argument("--out", dest="output_dir", required=True, help="输出目录")
     pipeline.add_argument(
+        "--audio-root",
+        help="渲染阶段音频搜索根目录（默认=输入目录）",
+    )
+    pipeline.add_argument(
         "--emit-align",
         dest="emit_align",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="规范化阶段是否产出 .align.txt (默认开启)",
+    )
+    pipeline.add_argument(
+        "--prefer-relative-audio",
+        dest="prefer_relative_audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="若音频位于 audio-root 下，EDL 中优先写相对路径（默认开启）",
+    )
+    pipeline.add_argument(
+        "--path-style",
+        choices=["auto", "posix", "windows"],
+        default="auto",
+        help="EDL 中 source_audio 的分隔符风格（默认 auto）",
     )
     pipeline.add_argument(
         "--collapse-lines",
