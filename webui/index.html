@@ -2,14 +2,109 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>OnePass Audio UI 占位</title>
+    <title>OnePass Audio 审听工作台</title>
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main>
-      <h1>OnePass Audio Web UI</h1>
-      <p>界面占位符，后续版本将提供完整功能。</p>
-    </main>
-    <script src="/app.js" defer></script>
+    <div id="app">
+      <aside class="sidebar">
+        <header class="sidebar__header">
+          <h1>音轨列表</h1>
+          <button id="refresh-stems" type="button" title="重新扫描">
+            刷新
+          </button>
+        </header>
+        <div class="sidebar__list" id="stem-list" aria-label="Stems"></div>
+      </aside>
+      <section class="workspace">
+        <header class="workspace__header">
+          <div class="workspace__title">
+            <h2 id="stem-title">请选择要处理的 stem</h2>
+            <p id="stem-summary" class="workspace__summary"></p>
+          </div>
+          <div class="workspace__actions">
+            <label class="toggle" title="开启后两个波形联动播放">
+              <input type="checkbox" id="sync-toggle" checked />
+              <span>AB 同步</span>
+            </label>
+            <button id="import-csv" type="button">导入 CSV</button>
+            <button id="import-audio" type="button">导入音频</button>
+            <button id="save-all" type="button">保存 (Ctrl+S)</button>
+          </div>
+        </header>
+        <div class="workspace__content">
+          <div class="player-grid">
+            <section class="player" data-player="source">
+              <header>
+                <h3>源音频</h3>
+                <div class="player__actions">
+                  <button class="player-play" data-player="source" type="button">
+                    播放 / 暂停 (空格)
+                  </button>
+                  <span class="player__status" data-player="source"></span>
+                </div>
+              </header>
+              <div class="wave-container">
+                <div class="wave" id="wave-source" tabindex="0"></div>
+              </div>
+              <p class="player__meta" id="source-meta"></p>
+            </section>
+            <section class="player" data-player="rendered">
+              <header>
+                <h3>剪辑后音频</h3>
+                <div class="player__actions">
+                  <button class="player-play" data-player="rendered" type="button">
+                    播放 / 暂停 (空格)
+                  </button>
+                  <span class="player__status" data-player="rendered"></span>
+                </div>
+              </header>
+              <div class="wave-container">
+                <div class="wave" id="wave-rendered" tabindex="0"></div>
+              </div>
+              <p class="player__meta" id="rendered-meta"></p>
+            </section>
+          </div>
+          <section class="segments-panel">
+            <header>
+              <h3>标记区间</h3>
+              <div class="segments__tips">
+                <span>Alt+拖拽：新增区域</span>
+                <span>D：切换状态</span>
+                <span>Delete：删除区域</span>
+                <span>←/→：切换区域</span>
+              </div>
+            </header>
+            <div class="table-wrapper">
+              <table id="segments-table">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>名称</th>
+                    <th>开始 (s)</th>
+                    <th>结束 (s)</th>
+                    <th>时长 (s)</th>
+                    <th>状态</th>
+                    <th>备注</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+    </div>
+    <div id="drop-mask" hidden>
+      <div class="drop-mask__content">
+        <p>拖放 CSV 或音频到此处</p>
+        <p>松开后选择导入类型</p>
+      </div>
+    </div>
+    <div id="toast-container" aria-live="polite"></div>
+    <input type="file" id="hidden-file" hidden />
+    <script src="/vendor/wavesurfer.min.js"></script>
+    <script src="/vendor/regions.min.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
