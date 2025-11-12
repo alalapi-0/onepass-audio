@@ -71,6 +71,7 @@ from onepass.text_norm import (  # 规范化工具
     sentence_lines_from_text,
     validate_sentence_lines,
 )
+from onepass.text_normalizer import normalize_alignment_text, normalize_text_for_export
 from onepass.sent_align import (
     LOW_CONF as SENT_LOW_CONF,
     MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
@@ -314,6 +315,11 @@ def _process_single_text(
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
+        payload_text = normalize_text_for_export(
+            payload_text,
+            char_map=cmap,
+            preserve_newlines=not collapse_lines,
+        )
         payload = payload_text
         if payload and not payload.endswith("\n"):
             payload = payload + "\n"
@@ -341,6 +347,13 @@ def _process_single_text(
             align_payload = prepare_alignment_text(payload, collapse_lines=collapse_lines)
             if collapse_lines:
                 align_payload = collapse_soft_linebreaks(align_payload)
+                align_payload = normalize_alignment_text(align_payload, char_map=cmap)
+            else:
+                align_payload = normalize_text_for_export(
+                    align_payload,
+                    char_map=cmap,
+                    preserve_newlines=True,
+                )
             if collapse_lines and align_payload:
                 if "\n" in align_payload:
                     raise ValueError("对齐文本在 collapse-lines 模式下不应包含换行。")
@@ -582,6 +595,8 @@ def _export_retake_outputs(
             audio_root=audio_root_str,
             prefer_relative_audio=prefer_relative_audio,
             path_style=path_style,
+            fallback_reason=result.edl_fallback_reason,
+            fallback_used=result.edl_fallback,
         )
     outputs = {
         "srt": srt_path,
@@ -839,6 +854,20 @@ def _process_retake_item(
             cut_ratio,
         )
 
+        resolved_audio_path = edl_result.source_audio_abs or source_audio_abs_str
+        if resolved_audio_path:
+            try:
+                resolved_path = Path(resolved_audio_path)
+                exists_flag = resolved_path.exists()
+            except OSError:
+                exists_flag = False
+            if exists_flag:
+                LOGGER.info("source_audio 指向：%s（已验证存在）", resolved_audio_path)
+            else:
+                LOGGER.warning("source_audio 指向：%s（未找到）", resolved_audio_path)
+        else:
+            LOGGER.warning("source_audio 指向：无（未提供 source_audio 字段）")
+
         if debug_csv is not None and result.debug_rows:
             mode = "sentence" if sentence_strict else "line"
             _append_debug_rows(debug_csv, result.debug_rows, mode)
@@ -846,6 +875,9 @@ def _process_retake_item(
         stats["text_variant"] = text_path.name  # 记录使用的文本文件
         if result.fallback_used:
             stats["fallback_message"] = result.fallback_reason or "keep_full_audio"
+        if result.unmatched_samples:
+            stats.setdefault("unmatched_samples", result.unmatched_samples)
+        stats["source_audio_resolved_path"] = resolved_audio_path or ""
         if source_audio_name:
             stats["source_audio_name"] = source_audio_name
         if edl_result.source_audio is not None:
@@ -864,6 +896,12 @@ def _process_retake_item(
                 f"fallback:{result.fallback_reason or 'keep_full_audio'}"
                 if result.fallback_used
                 else "处理成功"
+            ),
+            "edl_segments_count": int(stats.get("edl_segments_count", len(result.edl_keep_segments))),
+            "edl_fallback": bool(result.edl_fallback),
+            "source_audio_resolved_path": resolved_audio_path or "",
+            "unmatched_samples": list(
+                (result.unmatched_samples or stats.get("unmatched_samples", []))[:5]
             ),
         }
     except Exception as exc:
@@ -1505,6 +1543,18 @@ def _process_render_item(
             audio_root,
             source_audio,
         )
+        if not edl.segments:
+            LOGGER.warning("EDL 无有效片段，已跳过渲染: %s", edl_path)
+            return {
+                "edl": safe_rel(edl_path.parent, edl_path),
+                "source_audio": safe_rel(audio_root, source_audio),
+                "output": "",
+                "stats": {},
+                "status": "skipped",
+                "render_skipped_reason": "no_segments",
+                "message": "EDL 无有效片段，已跳过渲染",
+                "source_audio_written": edl.source_audio,
+            }
         duration = probe_duration(source_audio)  # 探测音频时长
         keeps = normalize_segments(edl.segments, duration)  # 归一化保留片段
         actual_samplerate = samplerate or edl.samplerate  # 采样率优先使用命令行

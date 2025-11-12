@@ -96,6 +96,9 @@ class RetakeResult:
     fallback_reason: str | None = None
     fallback_marker_note: str | None = None
     audio_duration: float = 0.0
+    edl_fallback: bool = False
+    edl_fallback_reason: str | None = None
+    unmatched_samples: list[dict[str, object]] | None = None
 
 
 def infer_pause_boundaries(words: list[Word], gap: float = PAUSE_GAP_SEC) -> list[tuple[float, float]]:
@@ -1189,13 +1192,64 @@ def compute_retake_keep_last(
             "触发兜底策略(%s) -> %s", ",".join(fallback_reasons), fallback_engine
         )
 
+    edl_segments_count = len(edl_keep_segments)
+    unmatched_samples = unmatched_examples[:5]
+
+    if not edl_keep_segments:
+        fallback_used = True
+        fallback_reason_value = stats.get("fallback_reason") or "no_keep_segments"
+        if stats.get("fallback_reason"):
+            details = list(stats.get("fallback_reason_details", []))
+            if not details:
+                details = [stats["fallback_reason"]]
+            if "no_keep_segments" not in details:
+                details.append("no_keep_segments")
+            stats["fallback_reason_details"] = details
+        else:
+            stats["fallback_reason"] = "no_keep_segments"
+        if fallback_note is None:
+            fallback_note = "NO_KEEP_SEGMENTS_FALLBACK"
+        resolved_duration = audio_duration
+        if resolved_duration <= 0 and words:
+            resolved_duration = max(0.0, words[-1].end)
+        fallback_segment: list[tuple[float, float]] = []
+        if resolved_duration > 0:
+            fallback_segment = [(0.0, resolved_duration)]
+        elif words:
+            start_time = max(0.0, words[0].start)
+            end_time = max(0.0, words[-1].end)
+            if end_time > start_time:
+                fallback_segment = [(start_time, end_time)]
+        if fallback_segment:
+            edl_keep_segments = fallback_segment
+            edl_segments_count = len(edl_keep_segments)
+            if not keeps:
+                fallback_text = next((line.strip() for line in lines if line.strip()), "KEEP_ALL_FALLBACK")
+                keeps = [
+                    KeepSpan(
+                        line_no=0,
+                        text=fallback_text or "KEEP_ALL_FALLBACK",
+                        start=fallback_segment[0][0],
+                        end=fallback_segment[0][1],
+                    )
+                ]
+            keep_duration = sum(max(0.0, end - start) for start, end in edl_keep_segments)
+            stats["keep_duration"] = keep_duration
+            if audio_duration > 0:
+                stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - keep_duration) / audio_duration))
+        else:
+            edl_keep_segments = []
+            edl_segments_count = 0
+        stats.setdefault("fallback_reason", fallback_reason_value)
+        LOGGER.warning("EDL 产物保证策略已触发（原因：%s）", stats.get("fallback_reason"))
+
     stats["fallback_used"] = fallback_used
     if fallback_reasons:
-        stats["fallback_reason"] = fallback_reasons[0]
+        stats.setdefault("fallback_reason", fallback_reasons[0])
         if len(fallback_reasons) > 1:
-            stats["fallback_reason_details"] = fallback_reasons
+            stats.setdefault("fallback_reason_details", fallback_reasons)
     else:
-        stats["fallback_reason"] = ""
+        stats.setdefault("fallback_reason", "")
     stats["timed_out"] = timed_out
     stats["match_engine"] = match_engine
     stats["params_snapshot"] = params_snapshot
@@ -1205,6 +1259,16 @@ def compute_retake_keep_last(
     stats["deleted_count"] = len(drops)
     stats["cut_seconds"] = max(0.0, audio_duration - stats.get("keep_duration", 0.0))
     stats["max_window_splits"] = window_splits
+    stats["edl_segments_count"] = edl_segments_count
+    edl_fallback_flag = bool(
+        edl_segments_count == 0
+        or stats.get("fallback_reason") == "no_keep_segments"
+        or "no_keep_segments" in stats.get("fallback_reason_details", [])
+    )
+    stats["edl_fallback"] = edl_fallback_flag
+
+    if unmatched_samples:
+        stats["unmatched_samples"] = unmatched_samples
 
     return RetakeResult(
         keeps=keeps,
@@ -1216,6 +1280,9 @@ def compute_retake_keep_last(
         fallback_reason=stats.get("fallback_reason") or None,
         fallback_marker_note=fallback_note,
         audio_duration=audio_duration,
+        edl_fallback=edl_fallback_flag,
+        edl_fallback_reason=stats.get("fallback_reason") or None,
+        unmatched_samples=unmatched_samples,
     )
 
 
@@ -1458,9 +1525,10 @@ def export_audition_markers(
             {
                 "name": f"L{span.line_no}",
                 "start": span.start,
+                "end": span.end,
                 "duration": duration,
                 "type": "cue",
-                "description": f"[keep] {_clean_marker_text(span.text)}".strip(),
+                "comment": f"[keep] {_clean_marker_text(span.text)}".strip(),
             }
         )
     if note and rows:
@@ -1468,9 +1536,10 @@ def export_audition_markers(
             {
                 "name": "INFO",
                 "start": 0.0,
+                "end": 0.0,
                 "duration": 0.0,
                 "type": "cue",
-                "description": note,
+                "comment": note,
             }
         )
     return write_audition_csv(
@@ -1493,17 +1562,29 @@ def export_edl_json(
     audio_root: str | None = None,
     prefer_relative_audio: bool = True,
     path_style: str = "auto",
+    fallback_reason: str | None = None,
+    fallback_used: bool = False,
 ) -> EDLWriteResult:
     """导出仅包含 keep 动作的 EDL JSON。"""
 
-    segments = [
-        {
+    segments: list[dict[str, object]] = []
+    for start, end in edl_keep_segments:
+        payload: dict[str, object] = {
             "start": max(0.0, start),
             "end": max(0.0, end),
             "action": "keep",
         }
-        for start, end in edl_keep_segments
-    ]
+        if fallback_reason:
+            payload.setdefault("metadata", {})
+            if isinstance(payload["metadata"], dict):
+                payload["metadata"].setdefault("fallback_reason", fallback_reason)
+        segments.append(payload)
+    stats_payload: dict[str, object] = {
+        "segment_count": len(segments),
+        "fallback_used": bool(fallback_used),
+    }
+    if fallback_reason:
+        stats_payload["fallback_reason"] = fallback_reason
     return write_edl(
         out_path,
         source_audio=source_audio_abs,
@@ -1512,11 +1593,12 @@ def export_edl_json(
         sample_rate=samplerate,
         channels=channels,
         source_samplerate=source_samplerate,
-        stats={"segment_count": len(segments)},
+        stats=stats_payload,
         stem=stem,
         audio_root=audio_root,
         prefer_relative_audio=prefer_relative_audio,
         path_style=path_style,
+        ensure_non_empty=bool(segments),
     )
 
 
@@ -1560,9 +1642,10 @@ def export_sentence_markers(
             {
                 "name": f"L{hit.sent_idx}",
                 "start": hit.start_time,
+                "end": hit.end_time,
                 "duration": duration,
                 "type": "cue",
-                "description": f"[keep] {_clean_marker_text(hit.sent_text, 64)}".strip(),
+                "comment": f"[keep] {_clean_marker_text(hit.sent_text, 64)}".strip(),
             }
         )
     for point in review_points:
@@ -1578,9 +1661,10 @@ def export_sentence_markers(
             {
                 "name": f"R{point.sent_idx}",
                 "start": start_time or 0.0,
+                "end": (start_time or 0.0) + duration,
                 "duration": duration,
                 "type": "cue",
-                "description": description,
+                "comment": description,
             }
         )
     return write_audition_csv(out_path, rows, total_duration=total_duration)
