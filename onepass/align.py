@@ -18,7 +18,23 @@ from __future__ import annotations  # 启用未来注解语法，避免前置引
 
 from dataclasses import dataclass  # 导入数据类装饰器，简化结构定义
 from typing import Dict, Iterable, List, Optional  # 引入常用类型注解集合
-from rapidfuzz import fuzz  # 引入模糊匹配评分函数
+import importlib.util  # 用于检测可选依赖是否已安装
+from difflib import SequenceMatcher  # 提供回退的序列相似度计算
+
+if importlib.util.find_spec("rapidfuzz") is not None:  # 若 rapidfuzz 可用
+    from rapidfuzz import fuzz  # 引入模糊匹配评分函数
+else:  # 否则使用标准库回退实现
+
+    class _FallbackFuzz:
+        """提供与 rapidfuzz.fuzz.ratio 接口一致的回退实现。"""
+
+        @staticmethod
+        def ratio(a: str, b: str) -> float:
+            """使用 difflib 计算两字符串的相似度百分比。"""
+
+            return SequenceMatcher(None, a, b).ratio() * 100
+
+    fuzz = _FallbackFuzz()  # type: ignore[assignment]
 
 from .asr_loader import Word  # 导入词级时间戳数据结构
 from .textnorm import Sentence, normalize_sentence, tokenize_for_match  # 导入句子结构与规范化函数
