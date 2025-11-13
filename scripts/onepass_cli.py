@@ -907,8 +907,6 @@ def _process_retake_item(
     min_anchor_ngram: int,
     fallback_policy: str,
     compute_timeout_sec: float,
-    coarse_threshold: float,
-    coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
@@ -1014,8 +1012,6 @@ def _process_retake_item(
                 min_anchor_ngram=min_anchor_ngram,
                 fallback_policy=fallback_policy,
                 compute_timeout_sec=compute_timeout_sec,
-                coarse_threshold=coarse_threshold,
-                coarse_len_tolerance=coarse_len_tolerance,
                 no_collapse_align=no_collapse_align,
             )
 
@@ -1262,8 +1258,6 @@ def _run_retake_batch(
     min_anchor_ngram: int,
     fallback_policy: str,
     compute_timeout_sec: float,
-    coarse_threshold: float,
-    coarse_len_tolerance: float,
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
@@ -1349,9 +1343,7 @@ def _run_retake_batch(
                         min_anchor_ngram,
                         fallback_policy,
                         compute_timeout_sec,
-                        coarse_threshold,
-                        coarse_len_tolerance,
-                        prefer_relative_audio,
+                prefer_relative_audio,
                         path_style,
                         alias_map,
                         no_collapse_align,
@@ -1426,8 +1418,6 @@ def _run_retake_batch(
                     min_anchor_ngram,
                     fallback_policy,
                     compute_timeout_sec,
-                    coarse_threshold,
-                    coarse_len_tolerance,
                     prefer_relative_audio,
                     path_style,
                     alias_map,
@@ -1498,8 +1488,6 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     compute_timeout_sec = float(args.compute_timeout_sec)
     max_distance_ratio = float(args.max_distance_ratio)
     min_anchor_ngram = int(args.min_anchor_ngram)
-    coarse_threshold = float(args.coarse_threshold)
-    coarse_len_tolerance = float(args.coarse_len_tol)
     fallback_policy = args.fallback_policy
     debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
     if debug_csv and args.workers and args.workers > 1:
@@ -1549,8 +1537,6 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             min_anchor_ngram,
             fallback_policy,
             compute_timeout_sec,
-            coarse_threshold,
-            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             alias_map,
@@ -1605,8 +1591,6 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             min_anchor_ngram,
             fallback_policy,
             compute_timeout_sec,
-            coarse_threshold,
-            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             alias_map,
@@ -1641,6 +1625,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "total_lines",
         "align_line_count_read",
         "matched_lines",
+        "aligned_lines",
+        "unaligned_lines",
         "strict_matches",
         "fallback_matches",
         "unmatched_lines",
@@ -1667,6 +1653,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "fine_evaluated",
         "pruned_candidates",
         "search_elapsed_sec",
+        "edl_segments_count",
         "segment_count",
         "fallback_used",
         "timeout_fallback",
@@ -1790,8 +1777,6 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.extend(["--compute-timeout-sec", str(args.compute_timeout_sec)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
-    parts.extend(["--coarse-threshold", str(args.coarse_threshold)])
-    parts.extend(["--coarse-len-tol", str(args.coarse_len_tol)])
     parts.extend(["--fallback-policy", args.fallback_policy])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
@@ -1815,8 +1800,6 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         "match_timeout": args.match_timeout,
         "compute_timeout_sec": args.compute_timeout_sec,
         "fallback_policy": args.fallback_policy,
-        "coarse_threshold": args.coarse_threshold,
-        "coarse_len_tol": args.coarse_len_tol,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2199,10 +2182,6 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
     fallback_policy = getattr(args, "fallback_policy", "greedy")
     compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
-    coarse_threshold = float(getattr(args, "coarse_threshold", 0.30))
-    coarse_len_tolerance = float(
-        getattr(args, "coarse_len_tol", getattr(args, "coarse_len_tolerance", 0.35))
-    )
 
     retake_items: list[dict] = []
     failed = 0
@@ -2270,8 +2249,6 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             min_anchor_ngram,
             fallback_policy,
             compute_timeout_sec,
-            coarse_threshold,
-            coarse_len_tolerance,
             prefer_relative_audio,
             path_style,
             alias_map,
@@ -2625,8 +2602,6 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "compute_timeout_sec": getattr(args, "compute_timeout_sec", 120.0),
         "max_distance_ratio": args.max_distance_ratio,
         "min_anchor_ngram": args.min_anchor_ngram,
-        "coarse_threshold": getattr(args, "coarse_threshold", 0.30),
-        "coarse_len_tol": getattr(args, "coarse_len_tol", 0.35),
         "fallback_policy": args.fallback_policy,
         "serve": args.serve,
         "open_browser": args.open_browser,
@@ -2889,14 +2864,14 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--max-windows",
         type=int,
-        default=200,
-        help="每行最多尝试的候选窗口数（默认 200）",
+        default=400,
+        help="每行最多尝试的候选窗口数（默认 400）",
     )
     retake.add_argument(
         "--match-timeout",
         type=float,
-        default=60.0,
-        help="每个条目的匹配时间预算（秒，默认 60.0）",
+        default=90.0,
+        help="每个条目的匹配时间预算（秒，默认 90.0）",
     )
     retake.add_argument(
         "--compute-timeout-sec",
@@ -2907,26 +2882,14 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--max-distance-ratio",
         type=float,
-        default=0.35,
-        help="允许的编辑距离占比上限（默认 0.35）",
+        default=0.38,
+        help="允许的编辑距离占比上限（默认 0.38）",
     )
     retake.add_argument(
         "--min-anchor-ngram",
         type=int,
-        default=6,
-        help="候选预筛锚点 n-gram 长度（默认 6）",
-    )
-    retake.add_argument(
-        "--coarse-threshold",
-        type=float,
-        default=0.20,
-        help="粗筛相似度通过阈值（0-1，默认 0.20）",
-    )
-    retake.add_argument(
-        "--coarse-len-tol",
-        type=float,
-        default=0.45,
-        help="粗筛允许的窗口长度差占比（默认 0.45）",
+        default=5,
+        help="候选预筛锚点 n-gram 长度（默认 5）",
     )
     retake.add_argument(
         "--fallback-policy",
