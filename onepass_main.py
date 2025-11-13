@@ -32,6 +32,7 @@ from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需�
     export_srt,
     export_txt,
 )
+from onepass.canonicalize import load_alias_map as load_match_alias_map
 from onepass.text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir  # 引入统一日志目录工具
 from onepass.ux import (  # 引入命令行交互的工具函数
@@ -1415,7 +1416,10 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
 
     try:
         alias_map = load_alias_map(DEFAULT_ALIAS_MAP)
-        result = compute_retake_keep_last(list(doc), txt_path, alias_map=alias_map)  # 计算保留最后一遍
+        match_alias_map = load_match_alias_map(DEFAULT_ALIAS_MAP)
+        result = compute_retake_keep_last(
+            list(doc), txt_path, alias_map=alias_map, match_alias_map=match_alias_map
+        )  # 计算保留最后一遍
     except Exception as exc:  # pragma: no cover - 交互流程
         print_error(f"计算保留最后一遍失败: {exc}")
         return

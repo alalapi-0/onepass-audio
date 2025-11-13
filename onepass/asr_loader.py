@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence
 import json
 
+from .words_loader import load_tokens
+
 
 @dataclass(slots=True)
 class Word:
@@ -115,32 +117,40 @@ def _load_raw_json(json_path: Path) -> object:
 
 
 def load_words(json_path: Path) -> ASRDoc:
-    """加载词级 ASR JSON 并返回统一数据结构。
+    """加载词级 ASR JSON 并返回统一数据结构。"""
 
-    ``json_path`` 可以是 faster-whisper/Funasr 等包含 ``segments`` 或
-    顶层 ``words`` 数组的格式。返回的对象实现了列表协议，可与第一轮代码
-    向后兼容。"""
-
-    data = _load_raw_json(json_path)  # 先加载原始 JSON 内容，获得任意结构数据
-    words: List[Word] = []  # 初始化词级结果列表
-
-    # 逐种结构尝试解析，优先处理 segments->words 的嵌套结构
-    if isinstance(data, dict):  # 顶层是字典时常见于 faster-whisper 输出
-        segments = data.get("segments")  # 读取段落数组
-        if isinstance(segments, Sequence):  # 确认段落字段为序列
-            for segment in segments:  # 遍历每个段落
-                words.extend(_iter_words_from_segment(segment))  # 追加段内词列表
-        # 某些实现直接把 words 放在顶层
-        if not words and isinstance(data.get("words"), Sequence):  # 若未解析到则回退顶层 words
-            for item in data["words"]:  # 遍历顶层词条
-                word = _word_from_raw(item)  # 尝试解析成 Word
-                if word is not None:  # 过滤掉缺失字段的条目
-                    words.append(word)  # 收集有效词
-    elif isinstance(data, Sequence):  # 顶层直接是词序列的情况
-        for item in data:  # 遍历每个条目
-            word = _word_from_raw(item)  # 转换成 Word
-            if word is not None:  # 跳过非法词
-                words.append(word)  # 写入列表
+    data = _load_raw_json(json_path)
+    parsed_tokens = load_tokens(data)
+    words: List[Word] = []
+    if parsed_tokens:
+        for token in parsed_tokens:
+            text = str(token.get("text", "")).strip()
+            if not text:
+                continue
+            try:
+                start = float(token.get("start", 0.0))
+                end = float(token.get("end", start))
+            except Exception:
+                continue
+            if end <= start:
+                continue
+            words.append(Word(text=text, start=start, end=end))
+    if not words:
+        if isinstance(data, dict):
+            segments = data.get("segments")
+            if isinstance(segments, Sequence):
+                for segment in segments:
+                    words.extend(_iter_words_from_segment(segment))
+            if not words and isinstance(data.get("words"), Sequence):
+                for item in data["words"]:
+                    word = _word_from_raw(item)
+                    if word is not None:
+                        words.append(word)
+        elif isinstance(data, Sequence):
+            for item in data:
+                word = _word_from_raw(item)
+                if word is not None:
+                    words.append(word)
 
     if not words:  # 若最终仍无有效词，给出友好提示
         raise ValueError(

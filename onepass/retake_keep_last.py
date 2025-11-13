@@ -25,7 +25,7 @@ from .sent_align import (
     KeepSpan as SentenceKeepSpan,
     align_sentences_from_text,
 )
-from .retake.matcher import MatchRequest, StableMatcher
+from .match_core import MatchResult, TokenStream, build_token_stream, match_line_to_tokens
 from .text_norm import (
     apply_alias_map,
     build_char_index_map,
@@ -119,6 +119,7 @@ class RetakeResult:
     edl_fallback_reason: str | None = None
     edl_segment_metadata: list[dict[str, object]] | None = None
     unmatched_samples: list[dict[str, object]] | None = None
+    match_debug_rows: list[dict[str, object]] | None = None
 
 
 def infer_pause_boundaries(words: list[Word], gap: float = PAUSE_GAP_SEC) -> list[tuple[float, float]]:
@@ -723,6 +724,7 @@ def compute_retake_keep_last(
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     audio_path: Path | None = None,
     alias_map: Mapping[str, Sequence[str]] | None = None,
+    match_alias_map: Mapping[str, str] | None = None,
     debug_label: str | None = None,
     fast_match: bool = True,
     max_windows: int = 200,
@@ -733,6 +735,7 @@ def compute_retake_keep_last(
     compute_timeout_sec: float = 300.0,
     no_collapse_align: bool = True,
     drop_ascii_parens: bool = False,
+    collect_match_debug: bool = False,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -773,7 +776,22 @@ def compute_retake_keep_last(
     if not asr_norm_str:  # 如果规范化后为空
         raise ValueError("规范化后的词序列为空，可能所有词都是标点或空白。请检查 JSON 输出。")
 
-    stable_matcher = StableMatcher(asr_norm_str)
+    token_stream: TokenStream | None = None
+    try:
+        token_payload = [
+            {"text": word.text, "start": word.start, "end": word.end}
+            for word in words
+        ]
+        token_stream = build_token_stream(token_payload, match_alias_map)
+    except Exception:
+        token_stream = None
+    LOGGER.info(
+        "[match] stem=%s lines=%s tokens=%s alias=%s",
+        debug_label or "-",
+        len(lines),
+        len(words),
+        bool(match_alias_map),
+    )
 
     params_snapshot = {
         "fast_match": bool(fast_match),
@@ -787,6 +805,7 @@ def compute_retake_keep_last(
         "max_dup_gap_sec": float(max_dup_gap_sec),
         "compute_timeout_sec": float(compute_timeout_sec),
         "alias_map": bool(alias_map),
+        "match_alias_map": bool(match_alias_map),
         "no_collapse_align": bool(no_collapse_align),
     }
     LOGGER.info("参数快照: %s", json.dumps(params_snapshot, ensure_ascii=False, sort_keys=True))
@@ -795,11 +814,13 @@ def compute_retake_keep_last(
     compute_deadline: float | None = None
     if compute_timeout_sec and compute_timeout_sec > 0:
         compute_deadline = start_ts + compute_timeout_sec
-    search_timeout: float | None = None
+    per_line_timeout: float | None = None
     if match_timeout and match_timeout > 0:
-        search_timeout = float(match_timeout)
+        per_line_timeout = float(match_timeout)
     current_distance_ratio = float(max_distance_ratio)
     current_anchor_ngram = max(1, int(min_anchor_ngram))
+    fast_window_limit = max(1, int(max_windows))
+    slow_window_limit = max(fast_window_limit, len(words) or 1)
 
     audio_duration = _resolve_audio_duration(words, audio_path)
     pause_intervals_base: list[tuple[float, float]] = []
@@ -836,89 +857,110 @@ def compute_retake_keep_last(
         pruned_candidates = 0
         search_elapsed = 0.0
         ascii_relaxed = 0
+        match_rows: list[dict[str, object]] | None = [] if collect_match_debug else None
         for index, line in enumerate(lines, start=1):
             if active_deadline and time.monotonic() > active_deadline:
                 raise TimeoutError("match deadline")
             norm_line = normalize_for_align(line)
             units = _line_to_units(norm_line)
+            row_record: dict[str, object] | None = None
+            if match_rows is not None:
+                row_record = {
+                    "idx": index,
+                    "seg_len": len(line),
+                    "score": 1.0,
+                    "method": "skip-empty" if not units else "fail",
+                    "anchor_hits": 0,
+                    "tok_lo": -1,
+                    "tok_hi": -1,
+                    "t_start": -1.0,
+                    "t_end": -1.0,
+                    "text_preview": line.replace("\t", " ").replace("\n", " "),
+                }
             if not units:
+                if match_rows is not None and row_record is not None:
+                    match_rows.append(row_record)
                 continue
             spans: list[tuple[float, float]] = []
-            occurrences = _find_all_occurrences(asr_norm_str, units)
-            if occurrences:
-                strict_count += 1
-                for occ in occurrences:
-                    word_range = _char_range_to_word_range(occ, char_map)
-                    if word_range is None:
-                        continue
-                    spans.append(_word_range_to_time(word_range, words))
-            else:
-                window_limit = max(1, max_windows if fast_match else max(len(asr_norm_str), len(units)))
-                local_deadline = active_deadline
-                if search_timeout and search_timeout > 0:
-                    candidate_deadline = time.monotonic() + search_timeout
-                    if local_deadline is None:
-                        local_deadline = candidate_deadline
-                    else:
-                        local_deadline = min(local_deadline, candidate_deadline)
-                line_ratio = current_distance_ratio
-                if drop_ascii_parens and _ascii_ratio(line) > 0.6:
-                    line_ratio = max(line_ratio, 0.5)
-                    ascii_relaxed += 1
-                match_request = MatchRequest(
-                    target_text=units,
-                    max_distance_ratio=line_ratio,
+            match_result: MatchResult | None = None
+            effective_timeout = per_line_timeout
+            local_deadline = active_deadline
+            if local_deadline is not None:
+                remaining = max(0.0, local_deadline - time.monotonic())
+                if effective_timeout is None:
+                    effective_timeout = remaining
+                else:
+                    effective_timeout = min(effective_timeout, remaining)
+            line_ratio = current_distance_ratio
+            if drop_ascii_parens and _ascii_ratio(line) > 0.6:
+                line_ratio = max(line_ratio, 0.5)
+                ascii_relaxed += 1
+            window_limit = fast_window_limit if fast_match else slow_window_limit
+            if token_stream is not None and token_stream.canonical_text:
+                match_start = time.monotonic()
+                match_result = match_line_to_tokens(
+                    norm_line,
+                    token_stream,
+                    match_alias_map,
                     min_anchor_ngram=current_anchor_ngram,
                     max_windows=window_limit,
-                    deadline=local_deadline,
+                    max_distance_ratio=line_ratio,
+                    match_timeout=effective_timeout,
+                    prefer_latest=True,
                 )
-                match_response = stable_matcher.match(match_request)
-                coarse_total += match_response.coarse_total
-                coarse_passed += match_response.coarse_passed
-                fine_evaluated += match_response.fine_evaluated
-                pruned_candidates += match_response.pruned_candidates
-                search_elapsed += match_response.elapsed_sec
-                if match_response.success and match_response.char_range is not None:
-                    word_range = _char_range_to_word_range(match_response.char_range, char_map)
-                    if word_range is not None:
-                        fuzzy_count += 1
-                        spans.append(_word_range_to_time(word_range, words))
-                        LOGGER.info(
-                            "[stable-match] line=%s dist=%.3f ratio=%.3f",
-                            index,
-                            match_response.distance or -1.0,
-                            match_response.ratio,
-                        )
-                if not spans:
-                    unmatched_count += 1
-                    preview_line = _preview_text(line, 120)
-                    preview_words = _preview_text(match_response.normalized_candidate, 120)
-                    if len(mismatch_details) < 10:
-                        mismatch_details.append(
-                            {
-                                "line_no": index,
-                                "text": preview_line,
-                                "text_view": _preview_text(units, 120),
-                                "words_view": preview_words,
-                                "distance": match_response.distance,
-                            }
-                        )
-                    if len(unmatched_details) < 10:
-                        unmatched_details.append(
-                            {
-                                "line_no": index,
-                                "text": preview_line,
-                                "closest_words_snippet": preview_words,
-                                "distance": match_response.distance,
-                            }
-                        )
-                    LOGGER.warning(
-                        "[unmatched] line=%s text=%s | words=%s",
-                        index,
-                        _preview_text(units, 120),
-                        preview_words or "-",
+                search_elapsed += time.monotonic() - match_start
+            if match_result:
+                spans.append((match_result.time_start, match_result.time_end))
+                if match_result.method == "anchor+lev":
+                    strict_count += 1
+                else:
+                    fuzzy_count += 1
+                hits = max(1, int(match_result.anchor_hits or 0))
+                coarse_total += hits
+                coarse_passed += hits
+                fine_evaluated += 1
+                if row_record is not None:
+                    row_record.update(
+                        {
+                            "score": match_result.score,
+                            "method": match_result.method,
+                            "anchor_hits": match_result.anchor_hits,
+                            "tok_lo": match_result.tok_start,
+                            "tok_hi": match_result.tok_end,
+                            "t_start": match_result.time_start,
+                            "t_end": match_result.time_end,
+                        }
                     )
-                    continue
+            else:
+                unmatched_count += 1
+                preview_line = _preview_text(line, 120)
+                if len(mismatch_details) < 10:
+                    mismatch_details.append(
+                        {
+                            "line_no": index,
+                            "text": preview_line,
+                            "text_view": _preview_text(units, 120),
+                            "words_view": "-",
+                            "distance": None,
+                        }
+                    )
+                if len(unmatched_details) < 10:
+                    unmatched_details.append(
+                        {
+                            "line_no": index,
+                            "text": preview_line,
+                            "closest_words_snippet": "-",
+                            "distance": None,
+                        }
+                    )
+                LOGGER.warning(
+                    "[unmatched] line=%s text=%s",
+                    index,
+                    _preview_text(units, 120),
+                )
+                if match_rows is not None and row_record is not None:
+                    match_rows.append(row_record)
+                continue
             spans.sort(key=lambda item: item[0])
             sentence_length = len(units)
             if sentence_length < max(0, min_sent_cutoff):
@@ -936,22 +978,25 @@ def compute_retake_keep_last(
                         end=span_end,
                     )
                 )
-            return {
-                "keeps": local_keeps,
-                "strict_matches": strict_count,
-                "fallback_matches": fuzzy_count,
-                "unmatched": unmatched_count,
-                "len_gate_skipped": len_gate_skip,
-                "neighbor_gap_skipped": neighbor_skip,
-                "mismatch_samples": mismatch_details,
-                "unmatched_examples": unmatched_details,
-                "coarse_total": coarse_total,
-                "coarse_passed": coarse_passed,
-                "fine_evaluated": fine_evaluated,
-                "pruned_candidates": pruned_candidates,
-                "search_elapsed_sec": search_elapsed,
-                "ascii_relaxed_lines": ascii_relaxed,
-            }
+            if match_rows is not None and row_record is not None:
+                match_rows.append(row_record)
+        return {
+            "keeps": local_keeps,
+            "strict_matches": strict_count,
+            "fallback_matches": fuzzy_count,
+            "unmatched": unmatched_count,
+            "len_gate_skipped": len_gate_skip,
+            "neighbor_gap_skipped": neighbor_skip,
+            "mismatch_samples": mismatch_details,
+            "unmatched_examples": unmatched_details,
+            "coarse_total": coarse_total,
+            "coarse_passed": coarse_passed,
+            "fine_evaluated": fine_evaluated,
+            "pruned_candidates": pruned_candidates,
+            "search_elapsed_sec": search_elapsed,
+            "ascii_relaxed_lines": ascii_relaxed,
+            "match_debug_rows": match_rows,
+        }
 
     keeps: list[KeepSpan] = []
     edl_keep_segments: list[tuple[float, float]] = []
@@ -968,7 +1013,8 @@ def compute_retake_keep_last(
     unmatched_examples: list[dict[str, object]] = []
     window_splits = 0
     timed_out = False
-    match_engine = "stable-edit"
+    match_engine = "anchor-ngram"
+    match_debug_rows_final: list[dict[str, object]] | None = None
 
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
@@ -1082,6 +1128,8 @@ def compute_retake_keep_last(
                 fallback_policy,
             )
             break
+        if collect_match_debug:
+            match_debug_rows_final = list(alignment.get("match_debug_rows") or [])
         raw_keeps = list(alignment.get("keeps", []))
         strict_matches = int(alignment.get("strict_matches", 0))
         fallback_matches = int(alignment.get("fallback_matches", 0))
@@ -1431,6 +1479,7 @@ def compute_retake_keep_last(
         drops=drops,
         stats=stats,
         debug_rows=debug_rows,
+        match_debug_rows=match_debug_rows_final,
         fallback_used=fallback_used,
         fallback_reason=stats.get("fallback_reason") or None,
         fallback_marker_note=fallback_note,
