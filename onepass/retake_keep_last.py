@@ -25,7 +25,9 @@ from .sent_align import (
     KeepSpan as SentenceKeepSpan,
     align_sentences_from_text,
 )
+from .boundary import snap_segment
 from .match_core import MatchResult, TokenStream, build_token_stream, match_line_to_tokens
+from .retake_seq import enforce_monotonic
 from .text_norm import (
     apply_alias_map,
     build_char_index_map,
@@ -120,6 +122,7 @@ class RetakeResult:
     edl_segment_metadata: list[dict[str, object]] | None = None
     unmatched_samples: list[dict[str, object]] | None = None
     match_debug_rows: list[dict[str, object]] | None = None
+    timeline_rows: list[dict[str, object]] | None = None
 
 
 def infer_pause_boundaries(words: list[Word], gap: float = PAUSE_GAP_SEC) -> list[tuple[float, float]]:
@@ -442,6 +445,120 @@ def _refine_segments(
     return active_indices, final_segments, stats, debug_list
 
 
+def _apply_silence_snap_and_monotonic(
+    keep_spans: Sequence[KeepSpan],
+    *,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    snap_enabled: bool,
+    snap_radius: float,
+    min_duration: float,
+    monotonic_mode: str,
+    monotonic_epsilon: float,
+) -> tuple[list[KeepSpan], list[dict[str, object]], dict[str, object]]:
+    """对片段执行静音吸附与全局时间约束。"""
+
+    silence = list(silence_ranges or [])
+    radius = max(0.0, float(snap_radius))
+    min_duration = max(0.0, float(min_duration))
+    timeline_rows: list[dict[str, object]] = []
+    candidate_rows: list[dict[str, object]] = []
+    snap_hits = 0
+    total = len(keep_spans)
+    too_short = 0
+    invalid = 0
+    for keep in keep_spans:
+        match_start = float(getattr(keep, "start", 0.0) or 0.0)
+        match_end = float(getattr(keep, "end", 0.0) or 0.0)
+        row = {
+            "idx": keep.line_no,
+            "text": keep.text,
+            "match_t0": match_start,
+            "match_t1": match_end,
+            "snap_t0": match_start,
+            "snap_t1": match_end,
+            "snapped": "no-snap",
+            "kept": 1,
+            "drop_reason": "-",
+            "mono_mode": monotonic_mode,
+        }
+        if match_end <= match_start:
+            row["drop_reason"] = "invalid"
+            row["kept"] = 0
+            timeline_rows.append(row)
+            invalid += 1
+            continue
+        snapped_label = "no-snap"
+        if snap_enabled and silence:
+            snap_start, snap_end, snapped_label, too_small = snap_segment(
+                match_start,
+                match_end,
+                silence,
+                radius,
+                min_duration,
+            )
+            row["snap_t0"] = snap_start
+            row["snap_t1"] = snap_end
+            row["snapped"] = snapped_label
+            if snapped_label != "no-snap":
+                snap_hits += 1
+            if too_small:
+                row["drop_reason"] = "too_short"
+                row["kept"] = 0
+                timeline_rows.append(row)
+                too_short += 1
+                continue
+        else:
+            if (match_end - match_start) < min_duration:
+                row["drop_reason"] = "too_short"
+                row["kept"] = 0
+                timeline_rows.append(row)
+                too_short += 1
+                continue
+        timeline_rows.append(row)
+        candidate_rows.append(row)
+
+    if candidate_rows:
+        kept_rows, dropped_rows = enforce_monotonic(
+            candidate_rows,
+            mode=monotonic_mode,
+            epsilon=monotonic_epsilon,
+        )
+    else:
+        kept_rows, dropped_rows = [], []
+    for row in dropped_rows:
+        row.setdefault("drop_reason", "pre_take")
+        row["kept"] = 0
+
+    filtered_keeps: list[KeepSpan] = []
+    for row in timeline_rows:
+        if not row.get("kept"):
+            continue
+        start = float(row.get("snap_t0", row.get("match_t0", 0.0)) or 0.0)
+        end = float(row.get("snap_t1", row.get("match_t1", 0.0)) or 0.0)
+        if end <= start:
+            row["kept"] = 0
+            row["drop_reason"] = "invalid"
+            invalid += 1
+            continue
+        filtered_keeps.append(
+            KeepSpan(line_no=int(row.get("idx", 0) or 0), text=row.get("text", ""), start=start, end=end)
+        )
+
+    stats = {
+        "silence_snap_used": bool(snap_enabled and silence),
+        "silence_snap_radius": radius,
+        "snap_total": total,
+        "snap_hits": snap_hits,
+        "snap_kept": len(filtered_keeps),
+        "snap_dropped": total - len(filtered_keeps),
+        "snap_too_short": too_short,
+        "snap_invalid": invalid,
+        "monotonic_mode": (monotonic_mode or "strict").lower(),
+        "monotonic_dropped": len(dropped_rows),
+    }
+    return filtered_keeps, timeline_rows, stats
+
+
 def _normalize_words(
     words: list[Word],
     alias_map: Mapping[str, Sequence[str]] | None = None,
@@ -736,6 +853,11 @@ def compute_retake_keep_last(
     no_collapse_align: bool = True,
     drop_ascii_parens: bool = False,
     collect_match_debug: bool = False,
+    snap_silence: bool = True,
+    snap_radius: float = 0.35,
+    snap_min_duration: float = 0.22,
+    monotonic_mode: str = "strict",
+    monotonic_epsilon: float = 0.02,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -1015,6 +1137,7 @@ def compute_retake_keep_last(
     timed_out = False
     match_engine = "anchor-ngram"
     match_debug_rows_final: list[dict[str, object]] | None = None
+    timeline_rows_final: list[dict[str, object]] | None = None
 
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
@@ -1145,6 +1268,18 @@ def compute_retake_keep_last(
         search_elapsed_total = float(alignment.get("search_elapsed_sec", 0.0))
         ascii_relaxed = int(alignment.get("ascii_relaxed_lines", 0))
 
+        processed_keeps, timeline_rows, snap_stats = _apply_silence_snap_and_monotonic(
+            raw_keeps,
+            silence_ranges=silence_ranges,
+            snap_enabled=bool(snap_silence),
+            snap_radius=float(snap_radius),
+            min_duration=float(snap_min_duration),
+            monotonic_mode=monotonic_mode,
+            monotonic_epsilon=float(monotonic_epsilon),
+        )
+        timeline_rows_final = timeline_rows
+        raw_keeps = processed_keeps
+
         pause_intervals = list(pause_intervals_base)
         active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
             raw_keeps,
@@ -1188,6 +1323,7 @@ def compute_retake_keep_last(
             "ascii_relaxed_lines": ascii_relaxed,
         }
         stats.update(refine_stats)
+        stats.update(snap_stats)
         stats["aligned_lines"] = stats["matched_lines"]
         stats["unaligned_lines"] = max(0, stats["total_lines"] - stats["matched_lines"])
         if align_line_count_read is not None:
@@ -1480,6 +1616,7 @@ def compute_retake_keep_last(
         stats=stats,
         debug_rows=debug_rows,
         match_debug_rows=match_debug_rows_final,
+        timeline_rows=timeline_rows_final,
         fallback_used=fallback_used,
         fallback_reason=stats.get("fallback_reason") or None,
         fallback_marker_note=fallback_note,
