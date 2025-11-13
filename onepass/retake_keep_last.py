@@ -995,6 +995,14 @@ def compute_retake_keep_last(
         lines = raw_text.splitlines()
         align_line_count_read = len(lines)
         LOGGER.info("[align] read lines=%s file=%s", align_line_count_read, original_txt)
+        if alias_map:
+            aliased_lines: list[str] = []
+            for line in lines:
+                if not line:
+                    aliased_lines.append(line)
+                    continue
+                aliased_lines.append(apply_alias_map(line, alias_map))
+            lines = aliased_lines
     else:
         normalized_text = normalize_text(
             raw_text,
