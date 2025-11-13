@@ -1177,8 +1177,6 @@ def _launch_web_panel() -> None:
     print_success(f"UI 服务已启动: {url}")
     print_info("浏览器页面将自动打开，可直接使用 app.html。")
     open_browser_later(url)
-    finally:
-        print_info("Web UI 已关闭。")
 
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
