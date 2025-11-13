@@ -22,10 +22,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]  # 项目根目录
 if str(ROOT_DIR) not in sys.path:  # 若根目录未在 sys.path 中则插入
     sys.path.insert(0, str(ROOT_DIR))
 
-from match_materials import match_materials, parse_glob_list
+from match_materials import is_canonical_stem, match_materials, parse_glob_list
 from scripts.ui_server import start_ui
 
 from onepass.asr_loader import load_words  # 载入词级 JSON
+from onepass.canonicalize import load_alias_map as load_match_alias_map
 from onepass.alignment.canonical import (
     CanonicalRules,
     concat_and_index,
@@ -701,6 +702,26 @@ def _write_align_debug(path: Path, rows: Sequence[tuple[str, int, str]]) -> None
             handle.write(f"{idx}\t{length}\t{reason}\t{preview}\n")
 
 
+def _write_match_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    """Write TSV rows describing per-line keep-last matches."""
+
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "idx\tseg_len\tscore\tmethod\tanchor_hits\ttok_start\ttok_end\tt_start\tt_end\ttext_preview\n"
+        )
+        for row in rows:
+            preview = str(row.get("text_preview", "")).replace("\t", " ")
+            score = float(row.get("score", 1.0))
+            t_start = float(row.get("t_start", -1.0))
+            t_end = float(row.get("t_end", -1.0))
+            handle.write(
+                f"{int(row.get('idx', 0))}\t{int(row.get('seg_len', 0))}\t{score:.4f}\t"
+                f"{row.get('method', '')}\t{int(row.get('anchor_hits', 0))}\t"
+                f"{int(row.get('tok_lo', -1))}\t{int(row.get('tok_hi', -1))}\t"
+                f"{t_start:.3f}\t{t_end:.3f}\t{preview}\n"
+            )
+
+
 def run_prep_norm(
     input_path: Path,
     output_dir: Path,
@@ -992,8 +1013,10 @@ def _process_retake_item(
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
+    match_alias_map: Mapping[str, str] | None,
     no_collapse_align: bool,
     drop_ascii_parens: bool,
+    match_debug: bool,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -1087,6 +1110,7 @@ def _process_retake_item(
                 silence_ranges=effective_silence,
                 audio_path=audio_path,
                 alias_map=alias_map,
+                match_alias_map=match_alias_map,
                 debug_label=stem,
                 fast_match=fast_match,
                 max_windows=max_windows,
@@ -1097,6 +1121,7 @@ def _process_retake_item(
                 compute_timeout_sec=compute_timeout_sec,
                 no_collapse_align=no_collapse_align,
                 drop_ascii_parens=drop_ascii_parens,
+                collect_match_debug=match_debug,
             )
 
         def _load_context_preview() -> str:
@@ -1133,6 +1158,13 @@ def _process_retake_item(
             }
             return stem, item
         stats = dict(result.stats)
+        if match_debug and isinstance(getattr(result, "match_debug_rows", None), list):
+            match_debug_path = out_dir / f"{stem}.keepLast.match.tsv"
+            try:
+                _write_match_debug(match_debug_path, result.match_debug_rows or [])
+                stats["match_debug_path"] = str(match_debug_path)
+            except OSError as exc:
+                LOGGER.warning("写入 match 调试文件失败: %s", exc)
         cut_ratio = float(stats.get("cut_ratio", 0.0))
         action = "none"
         if overcut_guard and stats.get("audio_duration", 0.0) > 0 and cut_ratio > overcut_threshold:
@@ -1345,8 +1377,10 @@ def _run_retake_batch(
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
+    match_alias_map: Mapping[str, str] | None,
     no_collapse_align: bool,
     drop_ascii_parens: bool,
+    match_debug: bool,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -1431,8 +1465,10 @@ def _run_retake_batch(
                 prefer_relative_audio,
                         path_style,
                         alias_map,
+                        match_alias_map,
                         no_collapse_align,
                         args.drop_ascii_parens,
+                        match_debug,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1507,8 +1543,10 @@ def _run_retake_batch(
                     prefer_relative_audio,
                     path_style,
                     alias_map,
+                    match_alias_map,
                     no_collapse_align,
                     drop_ascii_parens,
+                    match_debug,
                     pause_align=pause_align,
                     pause_gap_sec=pause_gap_sec,
                     pause_snap_limit=pause_snap_limit,
@@ -1599,7 +1637,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     path_style = str(getattr(args, "path_style", "auto")).lower()
     if path_style not in {"auto", "posix", "windows"}:
         raise ValueError("--path-style 仅支持 auto/posix/windows")
-    alias_map = load_alias_map(Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)))
+    alias_map_path = Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)).expanduser()
+    alias_map = load_alias_map(alias_map_path)
+    match_alias_map = load_match_alias_map(alias_map_path)
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
     no_collapse_align = bool(getattr(args, "no_collapse_align", True))
     if args.audio_root:
@@ -1642,8 +1682,10 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             prefer_relative_audio,
             path_style,
             alias_map,
+            match_alias_map,
             no_collapse_align,
             drop_ascii_parens,
+            match_debug,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1697,8 +1739,10 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             prefer_relative_audio,
             path_style,
             alias_map,
+            match_alias_map,
             no_collapse_align,
             drop_ascii_parens,
+            args.match_debug,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1898,6 +1942,8 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.extend(["--compute-timeout-sec", str(args.compute_timeout_sec)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
+    if args.match_debug:
+        parts.append("--match-debug")
     parts.extend(["--fallback-policy", args.fallback_policy])
     if args.match_preset:
         parts.extend(["--match-preset", args.match_preset])
@@ -2320,7 +2366,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     if not kits:
         LOGGER.warning("未匹配到任何素材套件，请检查目录结构或 glob 配置。")
 
-    missing_words = [kit for kit in kits if not kit.words]
+    missing_words = [kit for kit in kits if not kit.words and not is_canonical_stem(kit.stem)]
     if missing_words:
         LOGGER.warning(
             "检测到 %s 套素材缺少词级 JSON（支持 *.words.json;*.json），请确认文件名。",
@@ -2414,8 +2460,10 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             prefer_relative_audio,
             path_style,
             alias_map,
+            match_alias_map,
             no_collapse_align,
             drop_ascii_parens,
+            args.match_debug,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -2747,6 +2795,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     parts.extend(["--match-timeout", str(args.match_timeout)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
+    if args.match_debug:
+        parts.append("--match-debug")
     parts.extend(["--fallback-policy", args.fallback_policy])
     if args.match_preset:
         parts.extend(["--match-preset", args.match_preset])
@@ -3115,6 +3165,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="候选预筛锚点 n-gram 长度（默认 5）",
     )
     retake.add_argument(
+        "--match-debug",
+        action="store_true",
+        help="输出每行匹配详情 TSV（默认关闭）",
+    )
+    retake.add_argument(
         "--fallback-policy",
         choices=["safe", "keep-all", "align-greedy", "greedy", "greedy+expand"],
         default="greedy",
@@ -3421,6 +3476,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=6,
         help="候选预筛锚点 n-gram 长度（默认 6）",
+    )
+    pipeline.add_argument(
+        "--match-debug",
+        action="store_true",
+        help="输出每行匹配详情 TSV（默认关闭）",
     )
     pipeline.add_argument(
         "--fallback-policy",

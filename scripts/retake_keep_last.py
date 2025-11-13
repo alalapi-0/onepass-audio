@@ -27,6 +27,7 @@ from onepass.retake_keep_last import (
     export_srt,
     export_txt,
 )
+from onepass.canonicalize import load_alias_map as load_match_alias_map
 from onepass.text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir, setup_logger
 
@@ -66,7 +67,9 @@ def main(argv: list[str] | None = None) -> int:
     text_path = Path(args.text)
     out_dir = Path(args.out)
 
-    alias_map = load_alias_map(Path(args.alias_map))
+    alias_map_path = Path(args.alias_map)
+    alias_map = load_alias_map(alias_map_path)
+    match_alias_map = load_match_alias_map(alias_map_path)
 
     logger.info(
         "启动保留最后一遍导出",
@@ -83,7 +86,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # 调用核心策略，传入词序列与原文路径
-        result = compute_retake_keep_last(list(doc), text_path, alias_map=alias_map)
+        result = compute_retake_keep_last(
+            list(doc), text_path, alias_map=alias_map, match_alias_map=match_alias_map
+        )
     except Exception as exc:  # pragma: no cover - CLI 交互路径
         logger.exception("保留最后一遍计算失败")
         print(f"保留最后一遍计算失败: {exc}", file=sys.stderr)
