@@ -170,6 +170,7 @@ def smart_split(
     if hard_set:
         escaped = re.escape("".join(sorted(hard_set)))
         hard_regex = rf"([{escaped}])"
+    pending_prefix = ""
     for idx, seg in enumerate(out):
         base_reason = ""
         if debug_rows is not None and idx < len(debug_rows):
@@ -193,19 +194,44 @@ def smart_split(
         for part in parts:
             if not part:
                 continue
+            if pending_prefix and not attach_left:
+                part = pending_prefix + part
+                pending_prefix = ""
             cur += part
             if part[-1] in hard_set:
-                token = cur.strip()
+                if attach_left:
+                    token = cur.strip()
+                    if token:
+                        final_out.append(token)
+                        if debug_rows is not None:
+                            final_dbg.append((token, len(token), "POST_SPLIT_HARD"))
+                    cur = ""
+                    continue
+                token = cur[: -len(part)].strip()
                 if token:
                     final_out.append(token)
                     if debug_rows is not None:
                         final_dbg.append((token, len(token), "POST_SPLIT_HARD"))
+                pending_prefix = part
                 cur = ""
         remainder = cur.strip()
         if remainder:
             final_out.append(remainder)
             if debug_rows is not None:
                 final_dbg.append((remainder, len(remainder), "POST_TAIL"))
+        if not attach_left and pending_prefix:
+            if final_out:
+                final_out[-1] = final_out[-1] + pending_prefix
+                if debug_rows is not None and final_dbg:
+                    last_reason = final_dbg[-1][2]
+                    final_dbg[-1] = (final_out[-1], len(final_out[-1]), last_reason)
+            else:
+                token = pending_prefix.strip()
+                if token:
+                    final_out.append(token)
+                    if debug_rows is not None:
+                        final_dbg.append((token, len(token), "POST_TAIL_ATTACH_RIGHT"))
+            pending_prefix = ""
 
     if return_debug:
         return final_out, final_dbg
