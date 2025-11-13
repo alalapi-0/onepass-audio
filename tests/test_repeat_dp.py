@@ -118,3 +118,31 @@ def test_smart_split_honors_hard_punct_left_attach() -> None:
         punct_attach="left",
     )
     assert segments == ["甲。", "乙。", "丙，丁。"]
+
+
+def test_smart_split_honors_hard_punct_right_attach() -> None:
+    text = "甲。乙？丙。"
+    segments = smart_split(
+        text,
+        min_len=1,
+        max_len=10,
+        hard_max=12,
+        hard_punct="。？",
+        soft_punct="，",
+        punct_attach="right",
+    )
+    assert segments == ["甲", "。乙", "？丙。"]
+
+
+def test_smart_split_right_attach_trailing_punct() -> None:
+    text = "甲。"
+    segments = smart_split(
+        text,
+        min_len=1,
+        max_len=10,
+        hard_max=12,
+        hard_punct="。",
+        soft_punct="，",
+        punct_attach="right",
+    )
+    assert segments == ["甲。"]
