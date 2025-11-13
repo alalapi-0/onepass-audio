@@ -3,10 +3,9 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 from typing import List, Tuple
-
-from .utils.subproc import run_cmd
 
 __all__ = ["probe_silence_ffmpeg"]
 
@@ -32,23 +31,22 @@ def probe_silence_ffmpeg(audio: Path, noise_db: int = -35, min_d: float = 0.28) 
         "-",
     ]
     try:
-        cp = run_cmd(cmd)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=False,
+            check=False,
+        )
     except FileNotFoundError:
         LOGGER.warning("未找到 ffmpeg，无法探测静音。")
         return []
-    if cp.returncode != 0:
-        stderr_lines = (cp.stderr or "").strip().splitlines()[:3]
-        LOGGER.warning(
-            "silence_probe: ffmpeg 返回码 %s，回退为空列表。stderr=%s",
-            cp.returncode,
-            stderr_lines,
-        )
-        return []
+    stderr_bytes = result.stderr or b""
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
     silence_start = re.compile(r"silence_start:\s*([0-9.]+)")
     silence_end = re.compile(r"silence_end:\s*([0-9.]+)")
     ranges: List[Tuple[float, float]] = []
     pending: float | None = None
-    for raw_line in (cp.stderr or "").splitlines():
+    for raw_line in stderr.splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -69,4 +67,18 @@ def probe_silence_ffmpeg(audio: Path, noise_db: int = -35, min_d: float = 0.28) 
             if end_val > pending:
                 ranges.append((pending, end_val))
             pending = None
+    if result.returncode != 0 and not ranges:
+        stderr_lines = stderr.strip().splitlines()[:3]
+        LOGGER.warning(
+            "silence_probe: ffmpeg 返回码 %s，未解析到静音区间。stderr=%s",
+            result.returncode,
+            stderr_lines,
+        )
+        return []
+    if result.returncode != 0 and ranges:
+        LOGGER.warning(
+            "silence_probe: ffmpeg 返回码 %s，但成功解析到 %s 个静音区间。",
+            result.returncode,
+            len(ranges),
+        )
     return ranges

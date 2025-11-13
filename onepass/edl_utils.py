@@ -60,28 +60,51 @@ def edl_to_keep_intervals(
 ) -> List[Tuple[float, float]]:
     """将剪切动作求补，得到需要保留的时间区间列表。"""  # 函数说明
 
-    actions = edl.get("actions")  # 读取剪切动作列表
-    if not isinstance(actions, list):  # 校验结构
-        raise ValueError("EDL JSON 缺少 'actions' 列表")
-
+    segments_field = edl.get("segments")
+    keep_segments: List[Tuple[float, float]] = []
     cut_intervals: List[Tuple[float, float]] = []  # 收集剪切区间
-    for action in actions:  # 遍历每条动作
-        if not isinstance(action, dict):  # 跳过非法结构
-            continue
-        if action.get("type") != "cut":  # 仅处理剪切动作
-            continue
+    if isinstance(segments_field, list):
+        for segment in segments_field:
+            if not isinstance(segment, dict):
+                continue
+            try:
+                start = float(segment.get("start", 0.0))
+                end = float(segment.get("end", start))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("EDL 段落中的 start/end 无法解析") from exc
+            start = max(0.0, start)
+            end = max(0.0, end)
+            if end <= start:
+                continue
+            action = str(segment.get("action", "keep")).lower()
+            if action == "keep":
+                keep_segments.append((start, end))
+            elif action in {"cut", "drop"}:
+                cut_intervals.append((start, end))
+    if not keep_segments and not cut_intervals:
+        actions = edl.get("actions")
+        if not isinstance(actions, list):
+            raise ValueError("EDL JSON 缺少有效的 segments/actions 描述")
+        for action in actions:  # 遍历每条动作
+            if not isinstance(action, dict):  # 跳过非法结构
+                continue
+            if action.get("type") != "cut":  # 仅处理剪切动作
+                continue
 
-        try:
-            start = float(action.get("start", 0.0))  # 解析开始时间
-            end = float(action.get("end", start))  # 解析结束时间，默认不小于 start
-        except (TypeError, ValueError) as exc:  # 防御性捕获异常
-            raise ValueError("EDL 动作中的 start/end 无法解析") from exc
+            try:
+                start = float(action.get("start", 0.0))  # 解析开始时间
+                end = float(action.get("end", start))  # 解析结束时间，默认不小于 start
+            except (TypeError, ValueError) as exc:  # 防御性捕获异常
+                raise ValueError("EDL 动作中的 start/end 无法解析") from exc
 
-        start = max(0.0, start)  # 保证非负
-        end = max(0.0, end)  # 保证非负
-        if end <= start:  # 忽略无效区间
-            continue
-        cut_intervals.append((start, end))  # 收集有效剪切区间
+            start = max(0.0, start)  # 保证非负
+            end = max(0.0, end)  # 保证非负
+            if end <= start:  # 忽略无效区间
+                continue
+            cut_intervals.append((start, end))  # 收集有效剪切区间
+
+    if keep_segments:
+        return _merge_small_gaps(keep_segments)
 
     max_end_candidates: List[float] = []  # 准备候选音频结束时间
     if audio_duration is not None and audio_duration > 0:  # 若显式提供时长

@@ -12,6 +12,9 @@ from dataclasses import dataclass  # 构建结构化数据模型
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Literal
 
+from .edl import SegmentEDL as UnifiedSegmentEDL
+from .edl import load as load_segment_edl
+
 __all__ = [
     "EDLSegment",
     "EDLDoc",
@@ -76,37 +79,12 @@ def _derive_stem_from_path(edl_path: Path) -> str:
     return base
 
 
-def _to_float(value: object, field: str) -> float:
-    """将任意对象转换为浮点数，失败时抛出带字段名的异常。"""
-
-    try:  # 尝试直接转换
-        return float(value)
-    except (TypeError, ValueError) as exc:  # 转换失败时构造错误信息
-        raise ValueError(f"字段 `{field}` 无法解析为浮点数: {value!r}") from exc
-
-
 def _format_ts(value: float) -> str:
     """把秒数格式化为 ffmpeg 友好的字符串。"""
 
     # 保留 6 位小数，同时去掉结尾多余的零
     formatted = f"{value:.6f}"
     return formatted.rstrip("0").rstrip(".") if "." in formatted else formatted
-
-
-def _normalise_action(segment: dict) -> Literal["keep", "drop"]:
-    """兼容 action/keep 两种字段并统一为 keep/drop。"""
-
-    # 优先读取新式 action 字段
-    action = segment.get("action")
-    if isinstance(action, str):
-        lowered = action.lower()
-        if lowered in {"keep", "drop"}:
-            return "keep" if lowered == "keep" else "drop"
-    # 兼容旧式 keep 布尔字段
-    keep_flag = segment.get("keep")
-    if isinstance(keep_flag, bool):
-        return "keep" if keep_flag else "drop"
-    raise ValueError("片段需包含 action 或 keep 字段，且取值合法。")
 
 
 def _merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -129,87 +107,28 @@ def _merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[flo
 def load_edl(edl_path: Path) -> EDLDoc:
     """加载并校验 EDL JSON，兼容新旧段落结构。"""
 
-    if not edl_path.exists():  # 若文件不存在提前报错
-        raise FileNotFoundError(f"未找到 EDL 文件: {edl_path}")
-
-    data = json.loads(edl_path.read_text(encoding="utf-8", errors="replace"))  # 读取 JSON 文本
-
-    # 兼容新旧字段名 source_audio/audio
-    source_audio_raw = (
-        data.get("source_audio")
-        or data.get("audio")
-        or data.get("audio_stem")
-        or ""
-    )
-    if not isinstance(source_audio_raw, str):  # 确保字段为字符串
-        raise ValueError("EDL 文件需包含字符串类型的 source_audio/audio 字段。")
-
-    # 解析采样率与声道设置
-    samplerate = data.get("samplerate") or data.get("sample_rate")
-    samplerate_int = int(samplerate) if isinstance(samplerate, (int, float)) else None
-    source_samplerate = data.get("source_samplerate")
-    source_samplerate_int = (
-        int(source_samplerate) if isinstance(source_samplerate, (int, float)) else None
-    )
-    channels = data.get("channels")
-    channels_int = int(channels) if isinstance(channels, (int, float)) else None
-    version = data.get("version")
-    version_int = int(version) if isinstance(version, (int, float)) else None
-    stem_field = data.get("stem")
-    stem_value = stem_field.strip() if isinstance(stem_field, str) else ""
-    if not stem_value:
-        stem_value = _derive_stem_from_path(edl_path)
-
-    path_style_raw = data.get("path_style")
-    path_style_value = path_style_raw.strip().lower() if isinstance(path_style_raw, str) else ""
-    if path_style_value not in {"posix", "windows"}:
-        path_style_value = "posix"
-
-    basename_raw = data.get("source_audio_basename")
-    basename_value = basename_raw.strip() if isinstance(basename_raw, str) and basename_raw.strip() else None
-
-    raw_segments = data.get("segments")  # 尝试读取新式片段列表
-    if not isinstance(raw_segments, list):  # 当缺失时兼容旧式 actions
-        raw_segments = []
-        actions = data.get("actions")
-        if isinstance(actions, list):
-            for action in actions:  # 将旧式 cut 动作为 drop 片段
-                if not isinstance(action, dict):
-                    continue
-                if action.get("type") not in {None, "cut"}:  # 仅处理剪切动作
-                    continue
-                start = _to_float(action.get("start"), "start")
-                end = _to_float(action.get("end"), "end")
-                raw_segments.append({"start": start, "end": end, "action": "drop"})
-
-    original_segment_count = len(raw_segments)
-    if not raw_segments:
-        raise ValueError("EDL 缺少有效 segments")
-
-    segments: list[EDLSegment] = []  # 存放转换后的片段
-    for item in raw_segments:  # 遍历每个片段定义
-        if not isinstance(item, dict):  # 忽略非法条目
-            continue
-        action = _normalise_action(item)  # 统一动作类型
-        start = _to_float(item.get("start"), "start")  # 读取起始时间
-        end = _to_float(item.get("end"), "end")  # 读取结束时间
-        if end <= start:
-            continue  # 去掉零长度或时间倒置片段
-        segments.append(EDLSegment(start=start, end=end, action=action))  # 保存片段
-
-    if not segments and original_segment_count > 0:
-        raise ValueError("EDL 片段全为零长度或非法定义，无法继续。")
-
+    unified: UnifiedSegmentEDL = load_segment_edl(edl_path)
+    segments: list[EDLSegment] = [
+        EDLSegment(
+            start=segment.start,
+            end=segment.end,
+            action="keep" if segment.action == "keep" else "drop",
+        )
+        for segment in unified.segments
+    ]
+    if not segments:
+        raise ValueError(f"EDL 中未找到有效片段: {edl_path}")
+    source_audio = unified.source_audio or ""
     return EDLDoc(
-        source_audio=source_audio_raw,
+        source_audio=source_audio,
         segments=segments,
-        samplerate=samplerate_int,
-        channels=channels_int,
-        stem=stem_value,
-        version=version_int,
-        source_samplerate=source_samplerate_int,
-        source_audio_basename=basename_value,
-        path_style=path_style_value,
+        samplerate=unified.samplerate,
+        channels=unified.channels,
+        stem=unified.stem,
+        version=unified.version,
+        source_samplerate=unified.source_samplerate,
+        source_audio_basename=unified.source_audio_basename,
+        path_style=unified.path_style,
     )
 
 
