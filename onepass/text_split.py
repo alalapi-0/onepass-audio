@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import re
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-HARD_END = set("。！？!?")
-SOFT_END = set("；：…;:")
-WEAK_SEP = set("，、,")
+DEFAULT_HARD_PUNCT = "。！？!?．.;；"
+DEFAULT_SOFT_PUNCT = "，、,:：；;……—"
 JOIN_WITH_NEXT_PREFIXES = (
     "例如",
     "比如",
@@ -21,6 +20,22 @@ JOIN_WITH_NEXT_PREFIXES = (
     "总之",
     "也就是说",
 )
+
+
+def _char_set(value: str | Sequence[str] | None, fallback: str) -> set[str]:
+    source = value if value is not None else fallback
+    chars: set[str] = set()
+    if isinstance(source, str):
+        chars.update(ch for ch in source if ch and not ch.isspace())
+        return chars
+    for item in source:
+        if not item:
+            continue
+        if isinstance(item, str):
+            chars.update(ch for ch in item if ch and not ch.isspace())
+    if not chars and fallback:
+        chars.update(ch for ch in fallback if ch and not ch.isspace())
+    return chars
 
 
 def _normalize(text: str) -> str:
@@ -66,47 +81,53 @@ def smart_split(
     min_len: int = 8,
     max_len: int = 24,
     hard_max: int = 32,
+    *,
+    hard_punct: str | Sequence[str] | None = None,
+    soft_punct: str | Sequence[str] | None = None,
+    punct_attach: str = "left",
     return_debug: bool = False,
 ) -> List[str] | Tuple[List[str], List[Tuple[str, int, str]]]:
     text = _normalize(text)
+    hard_set = _char_set(hard_punct, DEFAULT_HARD_PUNCT)
+    soft_set = _char_set(soft_punct, DEFAULT_SOFT_PUNCT)
+    if soft_set:
+        soft_set.difference_update(hard_set)
+    attach_left = (punct_attach or "left").lower() != "right"
     out: List[str] = []
     debug_rows: Optional[List[Tuple[str, int, str]]] = [] if return_debug else None
     buf: List[str] = []
     last_soft_idx: Optional[int] = None
-    last_weak_idx: Optional[int] = None
 
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
-        buf.append(ch)
-        if ch in SOFT_END:
-            last_soft_idx = len(buf)
-        elif ch in WEAK_SEP:
-            last_weak_idx = len(buf)
-        if ch in HARD_END:
-            _flush(buf, out, "HARD_END", debug_rows)
+        if ch in hard_set:
+            if attach_left:
+                buf.append(ch)
+                _flush(buf, out, f"HARD:{ch}", debug_rows)
+            else:
+                _flush(buf, out, f"HARD:{ch}", debug_rows)
+                buf.append(ch)
             last_soft_idx = None
-            last_weak_idx = None
             i += 1
             continue
+        buf.append(ch)
+        if ch in soft_set:
+            last_soft_idx = len(buf)
         cur_len = len(buf)
         if cur_len >= hard_max:
-            cut_at = last_soft_idx or last_weak_idx or hard_max
-            _split_buffer(buf, cut_at, out, "HARD_MAX/SOFT_OR_WEAK_OR_FORCED", debug_rows)
+            cut_at = last_soft_idx or hard_max
+            _split_buffer(buf, cut_at, out, "HARD_MAX/SOFT_OR_FORCED", debug_rows)
             last_soft_idx = None
-            last_weak_idx = None
         elif cur_len >= max_len:
             if last_soft_idx:
                 cut_at = last_soft_idx
-            elif last_weak_idx:
-                cut_at = last_weak_idx
             else:
                 cut_at = cur_len
             if cut_at != cur_len:
-                _split_buffer(buf, cut_at, out, "MAX_LEN/SOFT_OR_WEAK", debug_rows)
+                _split_buffer(buf, cut_at, out, "MAX_LEN/SOFT", debug_rows)
                 last_soft_idx = None
-                last_weak_idx = None
         i += 1
 
     _flush(buf, out, "TAIL", debug_rows)
@@ -145,11 +166,22 @@ def smart_split(
 
     final_out: List[str] = []
     final_dbg: List[Tuple[str, int, str]] = []
+    hard_regex = ""
+    if hard_set:
+        escaped = re.escape("".join(sorted(hard_set)))
+        hard_regex = rf"([{escaped}])"
     for idx, seg in enumerate(out):
         base_reason = ""
         if debug_rows is not None and idx < len(debug_rows):
             base_reason = debug_rows[idx][2]
-        parts = re.split(r"([。！？!?])", seg)
+        if not hard_regex:
+            cleaned = seg.strip()
+            if cleaned:
+                final_out.append(cleaned)
+                if debug_rows is not None:
+                    final_dbg.append((cleaned, len(cleaned), base_reason or "OK"))
+            continue
+        parts = re.split(hard_regex, seg)
         if len(parts) == 1:
             cleaned = seg.strip()
             if cleaned:
@@ -162,7 +194,7 @@ def smart_split(
             if not part:
                 continue
             cur += part
-            if part[-1] in HARD_END:
+            if part[-1] in hard_set:
                 token = cur.strip()
                 if token:
                     final_out.append(token)

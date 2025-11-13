@@ -6,6 +6,7 @@ import logging
 import math
 import re
 import time
+import itertools
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,8 @@ from .sent_align import (
 from .boundary import snap_segment
 from .match_core import MatchResult, TokenStream, build_token_stream, match_line_to_tokens
 from .retake_seq import enforce_monotonic
+from .repeat_detect import cluster_candidates, supports_pinyin
+from .dp_path import select_best_path
 from .text_norm import (
     apply_alias_map,
     build_char_index_map,
@@ -102,6 +105,8 @@ class KeepSpan:
     text: str
     start: float
     end: float
+    score: float = 1.0
+    candidate_id: int = -1
 
 
 @dataclass(slots=True)
@@ -123,6 +128,8 @@ class RetakeResult:
     unmatched_samples: list[dict[str, object]] | None = None
     match_debug_rows: list[dict[str, object]] | None = None
     timeline_rows: list[dict[str, object]] | None = None
+    repeat_debug_rows: list[dict[str, object]] | None = None
+    dp_path_rows: list[dict[str, object]] | None = None
 
 
 def infer_pause_boundaries(words: list[Word], gap: float = PAUSE_GAP_SEC) -> list[tuple[float, float]]:
@@ -445,7 +452,7 @@ def _refine_segments(
     return active_indices, final_segments, stats, debug_list
 
 
-def _apply_silence_snap_and_monotonic(
+def _apply_silence_snap(
     keep_spans: Sequence[KeepSpan],
     *,
     silence_ranges: Sequence[tuple[float, float]] | None,
@@ -455,7 +462,7 @@ def _apply_silence_snap_and_monotonic(
     monotonic_mode: str,
     monotonic_epsilon: float,
 ) -> tuple[list[KeepSpan], list[dict[str, object]], dict[str, object]]:
-    """对片段执行静音吸附与全局时间约束。"""
+    """对片段执行静音吸附，返回候选行与统计。"""
 
     silence = list(silence_ranges or [])
     radius = max(0.0, float(snap_radius))
@@ -480,6 +487,8 @@ def _apply_silence_snap_and_monotonic(
             "kept": 1,
             "drop_reason": "-",
             "mono_mode": monotonic_mode,
+            "candidate_id": getattr(keep, "candidate_id", -1),
+            "score": getattr(keep, "score", 1.0),
         }
         if match_end <= match_start:
             row["drop_reason"] = "invalid"
@@ -517,20 +526,8 @@ def _apply_silence_snap_and_monotonic(
         timeline_rows.append(row)
         candidate_rows.append(row)
 
-    if candidate_rows:
-        kept_rows, dropped_rows = enforce_monotonic(
-            candidate_rows,
-            mode=monotonic_mode,
-            epsilon=monotonic_epsilon,
-        )
-    else:
-        kept_rows, dropped_rows = [], []
-    for row in dropped_rows:
-        row.setdefault("drop_reason", "pre_take")
-        row["kept"] = 0
-
     filtered_keeps: list[KeepSpan] = []
-    for row in timeline_rows:
+    for row in candidate_rows:
         if not row.get("kept"):
             continue
         start = float(row.get("snap_t0", row.get("match_t0", 0.0)) or 0.0)
@@ -541,7 +538,14 @@ def _apply_silence_snap_and_monotonic(
             invalid += 1
             continue
         filtered_keeps.append(
-            KeepSpan(line_no=int(row.get("idx", 0) or 0), text=row.get("text", ""), start=start, end=end)
+            KeepSpan(
+                line_no=int(row.get("idx", 0) or 0),
+                text=row.get("text", ""),
+                start=start,
+                end=end,
+                score=float(row.get("score", 1.0) or 1.0),
+                candidate_id=int(row.get("candidate_id", -1) or -1),
+            )
         )
 
     stats = {
@@ -553,8 +557,6 @@ def _apply_silence_snap_and_monotonic(
         "snap_dropped": total - len(filtered_keeps),
         "snap_too_short": too_short,
         "snap_invalid": invalid,
-        "monotonic_mode": (monotonic_mode or "strict").lower(),
-        "monotonic_dropped": len(dropped_rows),
     }
     return filtered_keeps, timeline_rows, stats
 
@@ -858,6 +860,14 @@ def compute_retake_keep_last(
     snap_min_duration: float = 0.22,
     monotonic_mode: str = "strict",
     monotonic_epsilon: float = 0.02,
+    dedupe_policy: str = "dp",
+    line_eq: str = "char",
+    line_dist_max: float = 0.15,
+    dedupe_window: float = 12.0,
+    dp_bonus_late: float = 1.0,
+    dp_penalty_pre: float = -0.8,
+    dp_penalty_gap: float = -0.2,
+    dp_epsilon: float = 0.02,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -963,6 +973,8 @@ def compute_retake_keep_last(
         pause_intervals_base = _merge_ranges(pause_intervals_base)
 
     active_deadline = compute_deadline
+
+    candidate_counter = itertools.count(1)
 
     def _align_once(min_sent_cutoff: int, dup_gap: float) -> dict[str, object]:
         local_keeps: list[KeepSpan] = []
@@ -1098,6 +1110,8 @@ def compute_retake_keep_last(
                         text=line,
                         start=span_start,
                         end=span_end,
+                        score=float(getattr(match_result, "score", 1.0) or 1.0),
+                        candidate_id=next(candidate_counter),
                     )
                 )
             if match_rows is not None and row_record is not None:
@@ -1138,6 +1152,10 @@ def compute_retake_keep_last(
     match_engine = "anchor-ngram"
     match_debug_rows_final: list[dict[str, object]] | None = None
     timeline_rows_final: list[dict[str, object]] | None = None
+    repeat_debug_rows_final: list[dict[str, object]] | None = None
+    dp_path_rows_final: list[dict[str, object]] | None = None
+    dp_stats: dict[str, object] = {}
+    monotonic_stats: dict[str, object] = {}
 
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
@@ -1268,7 +1286,7 @@ def compute_retake_keep_last(
         search_elapsed_total = float(alignment.get("search_elapsed_sec", 0.0))
         ascii_relaxed = int(alignment.get("ascii_relaxed_lines", 0))
 
-        processed_keeps, timeline_rows, snap_stats = _apply_silence_snap_and_monotonic(
+        snapped_keeps, timeline_rows, snap_stats = _apply_silence_snap(
             raw_keeps,
             silence_ranges=silence_ranges,
             snap_enabled=bool(snap_silence),
@@ -1278,11 +1296,244 @@ def compute_retake_keep_last(
             monotonic_epsilon=float(monotonic_epsilon),
         )
         timeline_rows_final = timeline_rows
-        raw_keeps = processed_keeps
+
+        timeline_map: dict[int, dict[str, object]] = {}
+        for row in timeline_rows:
+            cand_id = int(row.get("candidate_id", -1) or -1)
+            row["dp_in_best"] = 0
+            row["dp_drop_reason"] = row.get("drop_reason", "-") or "-"
+            if cand_id >= 0:
+                timeline_map[cand_id] = row
+
+        candidate_map = {
+            keep.candidate_id: keep
+            for keep in snapped_keeps
+            if keep.candidate_id >= 0
+        }
+
+        effective_line_eq = (line_eq or "char").lower()
+        if effective_line_eq not in {"char", "pinyin"}:
+            effective_line_eq = "char"
+        if effective_line_eq == "pinyin" and not supports_pinyin():
+            LOGGER.warning("[repeat] line-eq=pinyin 不可用，已回退为 char")
+            effective_line_eq = "char"
+
+        dedupe_matches = [
+            {
+                "candidate_id": keep.candidate_id,
+                "line_idx": keep.line_no,
+                "line_text": keep.text,
+                "t0": keep.start,
+                "t1": keep.end,
+                "score": keep.score,
+                "length": len(keep.text or ""),
+            }
+            for keep in snapped_keeps
+            if keep.candidate_id >= 0
+        ]
+
+        try:
+            clusters = cluster_candidates(
+                dedupe_matches,
+                alias_map=alias_map,
+                eq_mode=effective_line_eq,
+                dist_max=float(line_dist_max),
+                dedupe_window=float(dedupe_window),
+            )
+        except Exception:
+            LOGGER.exception("[repeat] 聚类失败，已回退到 off 策略")
+            clusters = []
+            dedupe_policy = "off"
+
+        dp_candidates = [candidate for cluster in clusters for candidate in cluster.candidates]
+        candidate_lookup = {candidate.candidate_id: candidate for candidate in dp_candidates}
+        total_candidates = len(dp_candidates)
+        effective_policy = (dedupe_policy or "dp").lower()
+        if effective_policy not in {"off", "last", "dp"}:
+            effective_policy = "dp"
+        best_ids: list[int] = []
+        dp_path_rows: list[dict[str, object]] = []
+
+        def _build_manual_path_rows(policy_label: str, selected_ids: list[int]) -> list[dict[str, object]]:
+            ordered = [candidate_lookup[cid] for cid in selected_ids if cid in candidate_lookup]
+            ordered.sort(key=lambda c: (c.t0, c.t1, c.candidate_id))
+            rows: list[dict[str, object]] = []
+            for order_idx, candidate in enumerate(ordered, start=1):
+                length_bonus = min(0.2, 0.01 * max(candidate.length, 0))
+                late_bonus = dp_bonus_late * max(1, candidate.rank)
+                pre_penalty = dp_penalty_pre if (policy_label != "off" and not candidate.is_last) else 0.0
+                value = candidate.score + length_bonus + late_bonus + pre_penalty
+                penalty_detail = []
+                if pre_penalty:
+                    penalty_detail.append(f"pre={pre_penalty:.2f}")
+                penalty_detail.append(f"policy={policy_label}")
+                rows.append(
+                    {
+                        "order": order_idx,
+                        "line_idx": candidate.line_idx,
+                        "t0": candidate.t0,
+                        "t1": candidate.t1,
+                        "value": value,
+                        "late_bonus": late_bonus,
+                        "penalties": ",".join(penalty_detail),
+                        "candidate_id": candidate.candidate_id,
+                    }
+                )
+            return rows
+
+        if effective_policy == "dp" and dp_candidates:
+            try:
+                dp_result = select_best_path(
+                    dp_candidates,
+                    epsilon=float(dp_epsilon),
+                    gap_threshold=float(dedupe_window),
+                    bonus_late=float(dp_bonus_late),
+                    penalty_pre=float(dp_penalty_pre),
+                    penalty_gap=float(dp_penalty_gap),
+                )
+                best_ids = list(dp_result.best_ids)
+                dp_path_rows = list(dp_result.path_rows)
+                if not best_ids and total_candidates:
+                    raise RuntimeError("dp-empty")
+            except Exception:
+                LOGGER.warning("[dedupe] dp failed -> fallback to last")
+                effective_policy = "last"
+
+        if effective_policy == "last" and not best_ids:
+            best_ids = [cluster.candidates[-1].candidate_id for cluster in clusters if cluster.candidates]
+            dp_path_rows = _build_manual_path_rows("last", best_ids)
+        elif effective_policy == "off":
+            ordered_all = sorted(dp_candidates, key=lambda c: (c.t0, c.t1, c.candidate_id))
+            best_ids = [candidate.candidate_id for candidate in ordered_all]
+            dp_path_rows = _build_manual_path_rows("off", best_ids)
+
+        best_set = set(best_ids)
+        repeat_debug_rows: list[dict[str, object]] = []
+        for cluster in clusters:
+            for candidate in cluster.candidates:
+                drop_reason = "-"
+                if candidate.candidate_id not in best_set and effective_policy != "off":
+                    drop_reason = "pre_take"
+                repeat_debug_rows.append(
+                    {
+                        "line_idx": candidate.line_idx,
+                        "line_key": cluster.line_key,
+                        "cand_rank": candidate.rank,
+                        "t0": candidate.t0,
+                        "t1": candidate.t1,
+                        "score": candidate.score,
+                        "is_last": candidate.is_last,
+                        "in_best": candidate.candidate_id in best_set,
+                        "drop_reason": drop_reason,
+                    }
+                )
+
+        LOGGER.info(
+            "[repeat] clusters=%s candidates=%s policy=%s",
+            len(clusters),
+            total_candidates,
+            effective_policy,
+        )
+        if effective_policy == "dp":
+            LOGGER.info(
+                "[dp] best_path=%s dropped_pre=%s bonus_late=%.2f",
+                len(best_ids),
+                max(0, total_candidates - len(best_ids)),
+                float(dp_bonus_late),
+            )
+        else:
+            LOGGER.info(
+                "[dp] policy=%s -> selected=%s/%s",
+                effective_policy,
+                len(best_ids),
+                total_candidates,
+            )
+
+        for cid in best_set:
+            row = timeline_map.get(cid)
+            if row is None:
+                continue
+            row["dp_in_best"] = 1
+            row["dp_drop_reason"] = "-"
+        for cid, row in timeline_map.items():
+            if cid in best_set:
+                continue
+            row["dp_drop_reason"] = row.get("dp_drop_reason", "pre_take") or "pre_take"
+
+        untagged_rows = [row for row in timeline_rows if int(row.get("candidate_id", -1) or -1) < 0 and row.get("kept")]
+        for row in untagged_rows:
+            row["dp_in_best"] = 1
+            row["dp_drop_reason"] = "-"
+
+        def _row_key(entry: dict[str, object]) -> tuple[float, float]:
+            start_val = float(entry.get("snap_t0", entry.get("match_t0", 0.0)) or 0.0)
+            end_val = float(entry.get("snap_t1", entry.get("match_t1", 0.0)) or 0.0)
+            return (start_val, end_val)
+
+        selected_rows = [timeline_map[cid] for cid in best_ids if cid in timeline_map and timeline_map[cid].get("kept")]
+        combined_rows = sorted(selected_rows + untagged_rows, key=_row_key)
+        if combined_rows:
+            kept_rows, dropped_rows = enforce_monotonic(
+                combined_rows,
+                mode=monotonic_mode,
+                epsilon=float(monotonic_epsilon),
+            )
+        else:
+            kept_rows, dropped_rows = [], []
+        for row in dropped_rows:
+            row.setdefault("drop_reason", "pre_take")
+            row["kept"] = 0
+            if row.get("dp_in_best"):
+                row["dp_drop_reason"] = row.get("drop_reason", "pre_take")
+
+        final_keeps: list[KeepSpan] = []
+        for row in kept_rows:
+            cand_id = int(row.get("candidate_id", -1) or -1)
+            start = float(row.get("snap_t0", row.get("match_t0", 0.0)) or 0.0)
+            end = float(row.get("snap_t1", row.get("match_t1", 0.0)) or 0.0)
+            base_keep = candidate_map.get(cand_id)
+            if base_keep is not None:
+                final_keeps.append(
+                    KeepSpan(
+                        line_no=base_keep.line_no,
+                        text=base_keep.text,
+                        start=start,
+                        end=end,
+                        score=base_keep.score,
+                        candidate_id=base_keep.candidate_id,
+                    )
+                )
+                continue
+            final_keeps.append(
+                KeepSpan(
+                    line_no=int(row.get("idx", 0) or 0),
+                    text=row.get("text", ""),
+                    start=start,
+                    end=end,
+                    score=float(row.get("score", 1.0) or 1.0),
+                    candidate_id=cand_id,
+                )
+            )
+
+        dp_stats = {
+            "repeat_clusters": len(clusters),
+            "repeat_candidates": total_candidates,
+            "dp_policy_used": effective_policy,
+            "dp_candidates": total_candidates,
+            "dp_selected": len(best_ids),
+            "dp_dropped_pre": max(0, total_candidates - len(best_ids)),
+        }
+        monotonic_stats = {
+            "monotonic_mode": (monotonic_mode or "strict").lower(),
+            "monotonic_dropped": len(dropped_rows),
+        }
+
+        repeat_debug_rows_final = repeat_debug_rows
+        dp_path_rows_final = dp_path_rows
 
         pause_intervals = list(pause_intervals_base)
         active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
-            raw_keeps,
+            final_keeps,
             audio_duration=audio_duration,
             pause_intervals=pause_intervals,
             pause_snap_limit=pause_snap_limit,
@@ -1293,7 +1544,7 @@ def compute_retake_keep_last(
             pause_align=pause_align,
             debug_label=debug_label,
         )
-        keeps = [raw_keeps[idx] for idx in range(len(raw_keeps)) if idx in active_indices]
+        keeps = [final_keeps[idx] for idx in range(len(final_keeps)) if idx in active_indices]
         keeps.sort(key=lambda item: item.start)
         edl_keep_segments = final_segments
         drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)
@@ -1324,6 +1575,8 @@ def compute_retake_keep_last(
         }
         stats.update(refine_stats)
         stats.update(snap_stats)
+        stats.update(dp_stats)
+        stats.update(monotonic_stats)
         stats["aligned_lines"] = stats["matched_lines"]
         stats["unaligned_lines"] = max(0, stats["total_lines"] - stats["matched_lines"])
         if align_line_count_read is not None:
@@ -1420,6 +1673,8 @@ def compute_retake_keep_last(
             "search_elapsed_sec": 0.0,
             "prune_rate": 0.0,
         }
+        stats.update(dp_stats)
+        stats.update(monotonic_stats)
         keeps = []
         edl_keep_segments = []
         drops = []
@@ -1617,6 +1872,8 @@ def compute_retake_keep_last(
         debug_rows=debug_rows,
         match_debug_rows=match_debug_rows_final,
         timeline_rows=timeline_rows_final,
+        repeat_debug_rows=repeat_debug_rows_final,
+        dp_path_rows=dp_path_rows_final,
         fallback_used=fallback_used,
         fallback_reason=stats.get("fallback_reason") or None,
         fallback_marker_note=fallback_note,
