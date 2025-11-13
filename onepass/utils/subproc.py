@@ -10,12 +10,15 @@ __all__ = ["run_cmd"]
 def run_cmd(cmd: Sequence[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """执行子进程并捕获输出，避免 UnicodeDecodeError。"""
 
-    return subprocess.run(
+    completed: subprocess.CompletedProcess[bytes] = subprocess.run(
         list(cmd),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        text=False,
         timeout=timeout,
         check=False,
     )
+    stdout = (completed.stdout or b"").decode("utf-8", errors="ignore")
+    stderr = (completed.stderr or b"").decode("utf-8", errors="ignore")
+    completed.stdout = stdout  # type: ignore[assignment]
+    completed.stderr = stderr  # type: ignore[assignment]
+    return completed  # type: ignore[return-value]

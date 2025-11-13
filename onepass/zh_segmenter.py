@@ -41,6 +41,23 @@ _OPEN_TO_CLOSE = {
 _SYMMETRIC_QUOTES = {"\"", "'", "“", "”", "‘", "’", "＂", "＇"}
 
 
+_CONNECTIVE_TOKENS = (
+    "但是",
+    "不过",
+    "然而",
+    "然后",
+    "而且",
+    "以及",
+    "所以",
+    "因此",
+    "如果",
+    "因为",
+    "还是",
+    "还有",
+    "就是",
+)
+
+
 def segment(
     text: str,
     *,
@@ -50,6 +67,8 @@ def segment(
     hard_max: int = 32,
     weak_punct_enable: bool = True,
     keep_quotes: bool = True,
+    prosody_gap_ms: int = 350,
+    max_clause_chars: int = 22,
 ) -> List[Segment]:
     """Split *text* into sentence segments based on punctuation and length limits."""
 
@@ -66,6 +85,11 @@ def segment(
     if hard_max < max_len:
         raise ValueError("hard_max must be >= max_len")
 
+    prosody_gap_ms = max(0, int(prosody_gap_ms))
+    clause_limit = max(0, int(max_clause_chars))
+    approx_chars = int(round(prosody_gap_ms / 70.0)) if prosody_gap_ms > 0 else 0
+    prosody_char_limit = max(3, approx_chars or 5)
+
     if mode == "punct+len":
         base_segments = _split_by_punct(
             normalized,
@@ -81,6 +105,8 @@ def segment(
             hard_max=hard_max,
             weak_enabled=weak_punct_enable,
             keep_quotes=keep_quotes,
+            max_clause_chars=clause_limit,
+            prosody_char_limit=prosody_char_limit,
         )
         return adjusted
     use_weak = mode == "all-punct"
@@ -149,12 +175,21 @@ def _apply_length_rules(
     hard_max: int,
     weak_enabled: bool,
     keep_quotes: bool,
+    max_clause_chars: int,
+    prosody_char_limit: int,
 ) -> List[Segment]:
     expanded: List[Segment] = []
     for seg in segments:
         seg_len = seg.end - seg.start
         if seg_len <= max_len:
-            expanded.append(seg)
+            clause_segments = _split_segment_by_clause(
+                text,
+                seg.start,
+                seg.end,
+                max_clause_chars=max_clause_chars,
+                prosody_char_limit=prosody_char_limit,
+            )
+            expanded.extend(clause_segments or [seg])
             continue
         expanded.extend(
             _split_segment_by_length(
@@ -167,7 +202,17 @@ def _apply_length_rules(
                 keep_quotes=keep_quotes,
             )
         )
-    merged = _merge_short_segments(expanded, min_len=min_len)
+    clause_expanded: List[Segment] = []
+    for seg in expanded:
+        clause_segments = _split_segment_by_clause(
+            text,
+            seg.start,
+            seg.end,
+            max_clause_chars=max_clause_chars,
+            prosody_char_limit=prosody_char_limit,
+        )
+        clause_expanded.extend(clause_segments or [seg])
+    merged = _merge_short_segments(clause_expanded, min_len=min_len)
     return merged
 
 
@@ -215,6 +260,73 @@ def _split_segment_by_length(
     if tail:
         segs.append(tail)
     return segs
+
+
+def _split_segment_by_clause(
+    source: str,
+    start: int,
+    end: int,
+    *,
+    max_clause_chars: int,
+    prosody_char_limit: int,
+) -> List[Segment]:
+    if start >= end:
+        return []
+    text = source[start:end]
+    if not text.strip():
+        return []
+    limit = max(0, max_clause_chars)
+    prosody_limit = max(1, prosody_char_limit)
+    breaks: list[int] = []
+    last_emit = 0
+    pending_candidate: int | None = None
+    idx = 0
+    length = len(text)
+    while idx < length:
+        ch = text[idx]
+        candidate: int | None = None
+        matched_token = None
+        for token in _CONNECTIVE_TOKENS:
+            if text.startswith(token, idx):
+                matched_token = token
+                break
+        if matched_token:
+            candidate = idx + len(matched_token)
+        elif ch in _WEAK_CHARS or ch in {",", "，", "、", ":", "：", ";", "；"}:
+            candidate = idx + 1
+        if candidate is not None:
+            if candidate - last_emit >= prosody_limit:
+                breaks.append(candidate)
+                last_emit = candidate
+                pending_candidate = None
+                idx = candidate
+                continue
+            pending_candidate = candidate
+        span_len = idx - last_emit + 1
+        if limit and span_len >= limit:
+            flush_at = pending_candidate or idx
+            if flush_at <= last_emit:
+                flush_at = idx + 1
+            breaks.append(flush_at)
+            last_emit = flush_at
+            pending_candidate = None
+            idx = flush_at
+            continue
+        idx += 1
+    segments: List[Segment] = []
+    cursor = start
+    for boundary in breaks:
+        seg = _extract_segment(source, cursor, start + boundary)
+        if seg:
+            segments.append(seg)
+        cursor = start + boundary
+    tail = _extract_segment(source, cursor, end)
+    if tail:
+        segments.append(tail)
+    if segments:
+        return segments
+    seg = _extract_segment(source, start, end)
+    return [seg] if seg else []
 
 
 def _find_forced_break(text: str, start: int, current: int, hard_max: int) -> int:

@@ -40,8 +40,14 @@ def probe_silence_ffmpeg(audio: Path, noise_db: int = -35, min_d: float = 0.28) 
     except FileNotFoundError:
         LOGGER.warning("未找到 ffmpeg，无法探测静音。")
         return []
+    except OSError as exc:
+        LOGGER.warning("调用 ffmpeg 失败，跳过静音探测: %s", exc)
+        return []
+    if result is None:
+        LOGGER.warning("silence_probe: ffmpeg 未返回结果，跳过静音探测。")
+        return []
     stderr_bytes = result.stderr or b""
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="ignore")
     silence_start = re.compile(r"silence_start:\s*([0-9.]+)")
     silence_end = re.compile(r"silence_end:\s*([0-9.]+)")
     ranges: List[Tuple[float, float]] = []
