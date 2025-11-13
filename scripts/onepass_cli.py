@@ -45,7 +45,8 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     resolve_source_audio,
 )
 from onepass.normalize import collapse_soft_linebreaks
-from onepass.segmentation import split_text
+from onepass.zh_segmenter import Segment as ZhSegment
+from onepass.zh_segmenter import segment as segment_text
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -92,6 +93,10 @@ from onepass.ui_server import open_browser_later, start_static_server
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
 DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
+DEFAULT_ALIGN_SPLIT_MODE = "punct+len"
+DEFAULT_ALIGN_MIN_LEN = 8
+DEFAULT_ALIGN_MAX_LEN = 24
+DEFAULT_ALIGN_HARD_MAX = 32
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 _UI_PROCESSES: list[object] = []
@@ -364,6 +369,12 @@ def _process_single_text(
     emit_align: bool,
     split_mode: str,
     canonical_rules: CanonicalRules | None,
+    *,
+    align_min_len: int,
+    align_max_len: int,
+    align_hard_max: int,
+    align_weak_punct: bool,
+    align_keep_quotes: bool,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -452,7 +463,15 @@ def _process_single_text(
 
     align_written = False
     align_path: Path | None = None
+    align_debug_path: Path | None = None
     align_lines: list[str] | None = None
+    align_guard_attempted = False
+    align_guard_failed = False
+    effective_split_mode = split_mode
+    effective_min_len = align_min_len
+    effective_max_len = align_max_len
+    effective_hard_max = align_hard_max
+    effective_weak = align_weak_punct
     canonical_path: Path | None = None
 
     if not dry_run:
@@ -491,7 +510,36 @@ def _process_single_text(
                 char_map=cmap,
                 preserve_newlines=True,
             )
-            align_lines = split_text(align_source, mode=split_mode)
+            align_segments: list[ZhSegment] = segment_text(
+                align_source,
+                split_mode=split_mode,
+                min_len=align_min_len,
+                max_len=align_max_len,
+                hard_max=align_hard_max,
+                weak_punct_enable=align_weak_punct,
+                keep_quotes=align_keep_quotes,
+            )
+            if len(align_segments) <= 1:
+                align_guard_attempted = True
+                guard_segments = segment_text(
+                    align_source,
+                    split_mode="punct+len",
+                    min_len=8,
+                    max_len=20,
+                    hard_max=28,
+                    weak_punct_enable=True,
+                    keep_quotes=align_keep_quotes,
+                )
+                effective_split_mode = "punct+len"
+                effective_min_len = 8
+                effective_max_len = 20
+                effective_hard_max = 28
+                effective_weak = True
+                if guard_segments:
+                    align_segments = guard_segments
+                if len(align_segments) <= 1:
+                    align_guard_failed = True
+            align_lines = [segment.text for segment in align_segments]
             align_payload = "\n".join(align_lines)
             if align_payload:
                 if "\t" in align_payload:
@@ -500,12 +548,33 @@ def _process_single_text(
                     if part != part.strip():
                         raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
+            align_debug_path = align_path.with_name(f"{align_path.stem}.debug.tsv")
             try:
                 with align_path.open("w", encoding="utf-8", newline="\n") as handle:
                     handle.write(align_payload)
                 align_written = True
             except OSError as exc:
                 LOGGER.warning("写入对齐文本失败: %s", exc)
+            if align_written:
+                try:
+                    _write_align_debug(align_debug_path, align_segments)
+                except OSError as exc:
+                    LOGGER.warning("写入对齐调试文件失败: %s", exc)
+            align_total_lines = len(align_lines)
+            LOGGER.info(
+                "[align] stem=%s lines=%s split_mode=%s min=%s max=%s hard=%s",
+                relative.stem,
+                align_total_lines,
+                effective_split_mode,
+                effective_min_len,
+                effective_max_len,
+                effective_hard_max,
+            )
+            if align_guard_attempted and align_guard_failed:
+                LOGGER.warning(
+                    "[align-guard] stem=%s fallback未能拆分，多句对齐将在 R3 兜底路径处理。",
+                    relative.stem,
+                )
 
             if align_written and canonical_rules and align_lines is not None:
                 canonical_path = out_dir / relative.parent / f"{relative.stem}.canonical.txt"
@@ -527,6 +596,7 @@ def _process_single_text(
                 # line_spans and index_map are computed for future alignment steps.
 
     return {
+        "stem": relative.stem,
         "file": str(path),
         "orig_len": len(raw_text),
         "norm_len": len(payload_text),
@@ -540,10 +610,33 @@ def _process_single_text(
         "suspects_examples": suspects_examples,
         "align_written": str(align_written).lower(),
         "align_path": str(align_path) if align_written and align_path else "",
+        "align_debug_path": str(align_debug_path) if align_written and align_debug_path else "",
         "canonical_path": str(canonical_path) if canonical_path else "",
+        "align_total_lines": len(align_lines) if align_lines is not None else 0,
+        "split_mode": effective_split_mode,
+        "min_len": effective_min_len,
+        "max_len": effective_max_len,
+        "hard_max": effective_hard_max,
+        "weak_punct_enable": bool(effective_weak),
+        "keep_quotes": bool(align_keep_quotes),
+        "align_guard_triggered": align_guard_attempted,
+        "align_guard_failed": align_guard_failed,
         "status": "ok",
         "message": "；".join(message_parts),
     }
+
+
+def _write_align_debug(path: Path, segments: Sequence[ZhSegment]) -> None:
+    """Write a TSV with segmentation spans for quick inspection."""
+
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("idx\tstart_char\tend_char\ttext_preview\n")
+        for idx, segment in enumerate(segments, 1):
+            preview = segment.text.strip()
+            if len(preview) > 30:
+                preview = preview[:30]
+            preview = preview.replace("\t", " ").replace("\n", " ")
+            handle.write(f"{idx}\t{segment.start}\t{segment.end}\t{preview}\n")
 
 
 def run_prep_norm(
@@ -557,7 +650,12 @@ def run_prep_norm(
     emit_align: bool,
     *,
     allow_missing_char_map: bool = False,
-    split_mode: str = "all-punct",
+    split_mode: str = DEFAULT_ALIGN_SPLIT_MODE,
+    align_min_len: int = DEFAULT_ALIGN_MIN_LEN,
+    align_max_len: int = DEFAULT_ALIGN_MAX_LEN,
+    align_hard_max: int = DEFAULT_ALIGN_HARD_MAX,
+    align_weak_punct: bool = True,
+    align_keep_quotes: bool = True,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -614,6 +712,11 @@ def run_prep_norm(
             emit_align,
             split_mode,
             canonical_rules if emit_align else None,
+            align_min_len=align_min_len,
+            align_max_len=align_max_len,
+            align_hard_max=align_hard_max,
+            align_weak_punct=align_weak_punct,
+            align_keep_quotes=align_keep_quotes,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -657,7 +760,12 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         ]
         + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
         + (["--emit-align"] if args.emit_align else [])
-        + (["--split-mode", args.split_mode] if args.split_mode != "all-punct" else [])
+        + (["--split-mode", args.split_mode] if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE else [])
+        + (["--min-len", str(args.min_len)] if args.min_len != DEFAULT_ALIGN_MIN_LEN else [])
+        + (["--max-len", str(args.max_len)] if args.max_len != DEFAULT_ALIGN_MAX_LEN else [])
+        + (["--hard-max", str(args.hard_max)] if args.hard_max != DEFAULT_ALIGN_HARD_MAX else [])
+        + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
+        + (["--no-keep-quotes"] if not args.keep_quotes else [])
         + (["--dry-run"] if args.dry_run else []),
     )
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
@@ -673,6 +781,11 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.collapse_lines,
             args.emit_align,
             split_mode=args.split_mode,
+            align_min_len=args.min_len,
+            align_max_len=args.max_len,
+            align_hard_max=args.hard_max,
+            align_weak_punct=args.weak_punct_enable,
+            align_keep_quotes=args.keep_quotes,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -1997,7 +2110,12 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
 
     norm_pattern = _casefold_pattern(args.norm_glob)
     norm_out_dir = out_dir / "norm"
-    split_mode = getattr(args, "split_mode", "all-punct")
+    split_mode = getattr(args, "split_mode", DEFAULT_ALIGN_SPLIT_MODE)
+    align_min_len = int(getattr(args, "min_len", DEFAULT_ALIGN_MIN_LEN))
+    align_max_len = int(getattr(args, "max_len", DEFAULT_ALIGN_MAX_LEN))
+    align_hard_max = int(getattr(args, "hard_max", DEFAULT_ALIGN_HARD_MAX))
+    align_weak = bool(getattr(args, "weak_punct_enable", True))
+    align_keep = bool(getattr(args, "keep_quotes", True))
     LOGGER.info(_safe_text(f"开始规范化文本 → {norm_out_dir}"))
     norm_result = run_prep_norm(
         input_dir,
@@ -2010,6 +2128,11 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         emit_align=args.emit_align,
         allow_missing_char_map=True,
         split_mode=split_mode,
+        align_min_len=align_min_len,
+        align_max_len=align_max_len,
+        align_hard_max=align_hard_max,
+        align_weak_punct=align_weak,
+        align_keep_quotes=align_keep,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -2405,8 +2528,18 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-audio",
         args.glob_audio,
     ]
-    if args.split_mode != "all-punct":
+    if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE:
         parts.extend(["--split-mode", args.split_mode])
+    if args.min_len != DEFAULT_ALIGN_MIN_LEN:
+        parts.extend(["--min-len", str(args.min_len)])
+    if args.max_len != DEFAULT_ALIGN_MAX_LEN:
+        parts.extend(["--max-len", str(args.max_len)])
+    if args.hard_max != DEFAULT_ALIGN_HARD_MAX:
+        parts.extend(["--hard-max", str(args.hard_max)])
+    if not args.weak_punct_enable:
+        parts.append("--no-weak-punct-enable")
+    if not args.keep_quotes:
+        parts.append("--no-keep-quotes")
     if args.audio_root:
         parts.extend(["--audio-root", str(Path(args.audio_root))])
     if not args.prefer_relative_audio:
@@ -2549,9 +2682,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prep.add_argument(
         "--split-mode",
-        choices=["all-punct", "period-only"],
-        default="all-punct",
-        help="对齐文本切句策略 (默认 all-punct)",
+        choices=["punct", "all-punct", "punct+len"],
+        default=DEFAULT_ALIGN_SPLIT_MODE,
+        help="对齐文本切句策略 (默认 punct+len)",
+    )
+    prep.add_argument(
+        "--min-len",
+        type=int,
+        default=DEFAULT_ALIGN_MIN_LEN,
+        help=f"punct+len 模式短句合并阈值（默认 {DEFAULT_ALIGN_MIN_LEN}）",
+    )
+    prep.add_argument(
+        "--max-len",
+        type=int,
+        default=DEFAULT_ALIGN_MAX_LEN,
+        help=f"punct+len 模式首轮长度上限（默认 {DEFAULT_ALIGN_MAX_LEN}）",
+    )
+    prep.add_argument(
+        "--hard-max",
+        type=int,
+        default=DEFAULT_ALIGN_HARD_MAX,
+        help=f"punct+len 强制断句上限（默认 {DEFAULT_ALIGN_HARD_MAX}）",
+    )
+    prep.add_argument(
+        "--weak-punct-enable",
+        dest="weak_punct_enable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="弱标点可作为断句点（默认开启）",
+    )
+    prep.add_argument(
+        "--keep-quotes",
+        dest="keep_quotes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="括号/引号内默认不在弱标点处断句（默认开启）",
     )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
@@ -2865,9 +3030,41 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--split-mode",
         dest="split_mode",
-        choices=["all-punct", "period-only"],
-        default="all-punct",
-        help="规范化阶段输出 .align.txt 时的切句策略",
+        choices=["punct", "all-punct", "punct+len"],
+        default=DEFAULT_ALIGN_SPLIT_MODE,
+        help="规范化阶段输出 .align.txt 时的切句策略 (默认 punct+len)",
+    )
+    pipeline.add_argument(
+        "--min-len",
+        type=int,
+        default=DEFAULT_ALIGN_MIN_LEN,
+        help=f"punct+len 模式短句合并阈值（默认 {DEFAULT_ALIGN_MIN_LEN}）",
+    )
+    pipeline.add_argument(
+        "--max-len",
+        type=int,
+        default=DEFAULT_ALIGN_MAX_LEN,
+        help=f"punct+len 模式首轮长度上限（默认 {DEFAULT_ALIGN_MAX_LEN}）",
+    )
+    pipeline.add_argument(
+        "--hard-max",
+        type=int,
+        default=DEFAULT_ALIGN_HARD_MAX,
+        help=f"punct+len 强制断句上限（默认 {DEFAULT_ALIGN_HARD_MAX}）",
+    )
+    pipeline.add_argument(
+        "--weak-punct-enable",
+        dest="weak_punct_enable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="规范化阶段弱标点是否可断句（默认开启）",
+    )
+    pipeline.add_argument(
+        "--keep-quotes",
+        dest="keep_quotes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="括号/引号内默认不在弱标点处断句（默认开启）",
     )
     pipeline.add_argument(
         "--glob-words",
