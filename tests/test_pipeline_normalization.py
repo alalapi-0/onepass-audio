@@ -242,3 +242,23 @@ def test_retake_align_line_count_preserved(tmp_path: Path) -> None:
     count = result.stats.get("align_line_count_read")
     assert isinstance(count, int)
     assert count >= 80
+
+
+def test_retake_align_alias_map_applied(tmp_path: Path) -> None:
+    align_path = tmp_path / "alias.align.txt"
+    variant_line = "这是一个你好别名测试句子包含足够字符"
+    align_path.write_text(variant_line + "\n", encoding="utf-8")
+    canonical_line = variant_line.replace("你好", "您好")
+    words = [Word(text=canonical_line, start=0.0, end=5.0)]
+    alias_map = {"您好": ["你好"]}
+    result = compute_retake_keep_last(
+        words,
+        align_path,
+        alias_map=alias_map,
+        no_collapse_align=True,
+        pause_align=False,
+        pad_before=0.0,
+        pad_after=0.0,
+        merge_gap_sec=0.0,
+    )
+    assert result.stats["matched_lines"] >= 1
