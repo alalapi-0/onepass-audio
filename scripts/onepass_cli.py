@@ -375,6 +375,8 @@ def _process_single_text(
     align_hard_max: int,
     align_weak_punct: bool,
     align_keep_quotes: bool,
+    prosody_gap_ms: int,
+    max_clause_chars: int,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -518,6 +520,8 @@ def _process_single_text(
                 hard_max=align_hard_max,
                 weak_punct_enable=align_weak_punct,
                 keep_quotes=align_keep_quotes,
+                prosody_gap_ms=prosody_gap_ms,
+                max_clause_chars=max_clause_chars,
             )
             if len(align_segments) <= 1:
                 align_guard_attempted = True
@@ -529,6 +533,8 @@ def _process_single_text(
                     hard_max=28,
                     weak_punct_enable=True,
                     keep_quotes=align_keep_quotes,
+                    prosody_gap_ms=prosody_gap_ms,
+                    max_clause_chars=max_clause_chars,
                 )
                 effective_split_mode = "punct+len"
                 effective_min_len = 8
@@ -656,6 +662,8 @@ def run_prep_norm(
     align_hard_max: int = DEFAULT_ALIGN_HARD_MAX,
     align_weak_punct: bool = True,
     align_keep_quotes: bool = True,
+    prosody_gap_ms: int = 350,
+    max_clause_chars: int = 22,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -717,6 +725,8 @@ def run_prep_norm(
             align_hard_max=align_hard_max,
             align_weak_punct=align_weak_punct,
             align_keep_quotes=align_keep_quotes,
+            prosody_gap_ms=prosody_gap_ms,
+            max_clause_chars=max_clause_chars,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -786,6 +796,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             align_hard_max=args.hard_max,
             align_weak_punct=args.weak_punct_enable,
             align_keep_quotes=args.keep_quotes,
+            prosody_gap_ms=args.prosody_gap_ms,
+            max_clause_chars=args.max_clause_chars,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -1620,6 +1632,16 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     payload["path_style"] = path_style
     retake_stats = [_build_retake_stats_from_item(item) for item in items]
     payload["retake_stats"] = [asdict(stat) for stat in retake_stats]
+    total_cut_seconds = sum(stat.cut_seconds for stat in retake_stats)
+    total_edl_segments = sum(
+        int(item.get("stats", {}).get("edl_segments_count", 0))
+        for item in items
+        if item.get("status") == "ok"
+    )
+    payload["stats"] = {
+        "cut_seconds": total_cut_seconds,
+        "edl_segments_count": total_edl_segments,
+    }
     stat_keys = [
         "total_words",
         "total_lines",
@@ -1682,6 +1704,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         params_section = existing.setdefault("params", {})
         params_section["no_collapse_align"] = bool(args.no_collapse_align)
         existing["retake_keep_last"] = payload
+        stats_section = existing.setdefault("stats", {})
+        stats_section["cut_seconds"] = total_cut_seconds
+        stats_section["edl_segments_count"] = total_edl_segments
         write_json(report_path, existing)
     return payload
 
@@ -1880,6 +1905,15 @@ def _process_render_item(
             }
         duration = probe_duration(source_audio)  # 探测音频时长
         keeps = normalize_segments(edl.segments, duration)  # 归一化保留片段
+        try:
+            resolved_path = source_audio.resolve()
+        except OSError:
+            resolved_path = source_audio
+        LOGGER.info(
+            "[render] source_audio_resolved=%s segments=%s",
+            resolved_path,
+            len(keeps),
+        )
         actual_samplerate = samplerate or edl.samplerate  # 采样率优先使用命令行
         actual_channels = channels or edl.channels  # 声道数优先使用命令行
         output_path = render_audio(
@@ -2132,6 +2166,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         align_hard_max=align_hard_max,
         align_weak_punct=align_weak,
         align_keep_quotes=align_keep,
+        prosody_gap_ms=int(getattr(args, "prosody_gap_ms", 350)),
+        max_clause_chars=int(getattr(args, "max_clause_chars", 22)),
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -2463,6 +2499,12 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         report["ui_manifest"] = str(manifest_path)
         report["summary"]["ui_manifest"] = str(manifest_path)
     report["summary"]["stems"] = stems
+    stats_section = report.setdefault("stats", {})
+    retake_stats_section = (report.get("retake_keep_last") or {}).get("stats", {})
+    stats_section["cut_seconds"] = float(retake_stats_section.get("cut_seconds", 0.0))
+    stats_section["edl_segments_count"] = int(retake_stats_section.get("edl_segments_count", 0))
+    stats_section["prosody_gap_ms"] = int(getattr(args, "prosody_gap_ms", 350))
+    stats_section["max_clause_chars"] = int(getattr(args, "max_clause_chars", 22))
     write_json(report_path, report)
 
     LOGGER.info(_safe_text(f"处理结果：成功 {success_items}/{total_items}"))
@@ -2711,6 +2753,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="括号/引号内默认不在弱标点处断句（默认开启）",
+    )
+    prep.add_argument(
+        "--prosody-gap-ms",
+        type=int,
+        default=350,
+        help="虚拟气口长度阈值，越小越易在弱标点处分句（默认 350）",
+    )
+    prep.add_argument(
+        "--max-clause-chars",
+        type=int,
+        default=22,
+        help="单条子句的最大字符数，超出后会在弱标点或连接词处分裂（默认 22）",
     )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
@@ -3075,6 +3129,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="括号/引号内默认不在弱标点处断句（默认开启）",
+    )
+    pipeline.add_argument(
+        "--prosody-gap-ms",
+        type=int,
+        default=350,
+        help="虚拟气口长度阈值，越小越易在弱标点处分句（默认 350）",
+    )
+    pipeline.add_argument(
+        "--max-clause-chars",
+        type=int,
+        default=22,
+        help="单条子句最大字符数（默认 22）",
     )
     pipeline.add_argument(
         "--glob-words",
