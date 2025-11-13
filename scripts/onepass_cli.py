@@ -722,6 +722,28 @@ def _write_match_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
             )
 
 
+def _write_timeline_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    """Write TSV rows describing snap/monotonic decisions."""
+
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "idx\tmatch_t0\tmatch_t1\tsnap_t0\tsnap_t1\tsnapped\tdur\tkept\tdrop_reason\tmono_mode\n"
+        )
+        for row in rows:
+            match_t0 = float(row.get("match_t0", 0.0) or 0.0)
+            match_t1 = float(row.get("match_t1", 0.0) or 0.0)
+            snap_t0 = float(row.get("snap_t0", match_t0) or match_t0)
+            snap_t1 = float(row.get("snap_t1", match_t1) or match_t1)
+            duration = max(0.0, snap_t1 - snap_t0)
+            kept = int(1 if row.get("kept") else 0)
+            drop_reason = str(row.get("drop_reason", "-") or "-")
+            handle.write(
+                f"{int(row.get('idx', 0))}\t{match_t0:.3f}\t{match_t1:.3f}\t{snap_t0:.3f}\t{snap_t1:.3f}\t"
+                f"{row.get('snapped', 'no-snap')}\t{duration:.3f}\t{kept}\t{drop_reason}\t"
+                f"{row.get('mono_mode', '')}\n"
+            )
+
+
 def run_prep_norm(
     input_path: Path,
     output_dir: Path,
@@ -1026,8 +1048,12 @@ def _process_retake_item(
     min_segment_sec: float,
     merge_gap_sec: float,
     silence_probe_enabled: bool,
-    noise_db: int,
+    silence_noise_db: float,
     silence_min_d: float,
+    snap_silence: bool,
+    snap_radius: float,
+    min_seg_dur: float,
+    monotonic_mode: str,
     overcut_guard: bool,
     overcut_mode: str,
     overcut_threshold: float,
@@ -1058,9 +1084,23 @@ def _process_retake_item(
             source_audio_name = resolved_candidate.name
             if resolved_candidate.exists():
                 audio_path = resolved_candidate
-        silence_ranges: list[tuple[float, float]] | None = None
-        if pause_align and silence_probe_enabled and audio_path is not None:
-            silence_ranges = probe_silence_ffmpeg(audio_path, noise_db=noise_db, min_d=silence_min_d)
+        silence_ranges: list[tuple[float, float]] | None = []
+        probe_needed = silence_probe_enabled and audio_path is not None and (pause_align or snap_silence)
+        if probe_needed:
+            silence_ranges = probe_silence_ffmpeg(
+                audio_path,
+                noise_db=silence_noise_db,
+                min_d=silence_min_d,
+            )
+        else:
+            silence_ranges = []
+        LOGGER.info(
+            "[silence] stem=%s ranges=%s n=%.0fdB d=%.2fs",
+            stem,
+            len(silence_ranges or []),
+            silence_noise_db,
+            silence_min_d,
+        )
         effective_silence = silence_ranges if pause_align else None
 
         current_min_sent = min_sent_chars
@@ -1122,6 +1162,11 @@ def _process_retake_item(
                 no_collapse_align=no_collapse_align,
                 drop_ascii_parens=drop_ascii_parens,
                 collect_match_debug=match_debug,
+                snap_silence=snap_silence,
+                snap_radius=snap_radius,
+                snap_min_duration=min_seg_dur,
+                monotonic_mode=monotonic_mode,
+                monotonic_epsilon=0.02,
             )
 
         def _load_context_preview() -> str:
@@ -1165,6 +1210,29 @@ def _process_retake_item(
                 stats["match_debug_path"] = str(match_debug_path)
             except OSError as exc:
                 LOGGER.warning("写入 match 调试文件失败: %s", exc)
+        if match_debug and isinstance(getattr(result, "timeline_rows", None), list):
+            timeline_path = out_dir / f"{stem}.keepLast.timeline.tsv"
+            try:
+                _write_timeline_debug(timeline_path, result.timeline_rows or [])
+                stats["timeline_debug_path"] = str(timeline_path)
+            except OSError as exc:
+                LOGGER.warning("写入 timeline 调试文件失败: %s", exc)
+        if not sentence_strict:
+            snap_total = int(stats.get("snap_total", 0))
+            snap_hits = int(stats.get("snap_hits", 0))
+            LOGGER.info(
+                "[snap] stem=%s applied=%s/%s radius=%.2fs",
+                stem,
+                snap_hits,
+                snap_total,
+                snap_radius,
+            )
+            LOGGER.info(
+                "[monotonic] mode=%s kept=%s dropped_pre_take=%s",
+                stats.get("monotonic_mode", monotonic_mode),
+                int(stats.get("snap_kept", 0)),
+                int(stats.get("monotonic_dropped", 0)),
+            )
         cut_ratio = float(stats.get("cut_ratio", 0.0))
         action = "none"
         if overcut_guard and stats.get("audio_duration", 0.0) > 0 and cut_ratio > overcut_threshold:
@@ -1389,8 +1457,12 @@ def _run_retake_batch(
     min_segment_sec: float,
     merge_gap_sec: float,
     silence_probe_enabled: bool,
-    noise_db: int,
+    silence_noise_db: float,
     silence_min_d: float,
+    snap_silence: bool,
+    snap_radius: float,
+    min_seg_dur: float,
+    monotonic_mode: str,
     overcut_guard: bool,
     overcut_mode: str,
     overcut_threshold: float,
@@ -1477,8 +1549,12 @@ def _run_retake_batch(
                         min_segment_sec=min_segment_sec,
                         merge_gap_sec=merge_gap_sec,
                         silence_probe_enabled=silence_probe_enabled,
-                        noise_db=noise_db,
+                        silence_noise_db=silence_noise_db,
                         silence_min_d=silence_min_d,
+                        snap_silence=snap_silence,
+                        snap_radius=snap_radius,
+                        min_seg_dur=min_seg_dur,
+                        monotonic_mode=monotonic_mode,
                         overcut_guard=overcut_guard,
                         overcut_mode=overcut_mode,
                         overcut_threshold=overcut_threshold,
@@ -1555,8 +1631,12 @@ def _run_retake_batch(
                     min_segment_sec=min_segment_sec,
                     merge_gap_sec=merge_gap_sec,
                     silence_probe_enabled=silence_probe_enabled,
-                    noise_db=noise_db,
+                    silence_noise_db=silence_noise_db,
                     silence_min_d=silence_min_d,
+                    snap_silence=snap_silence,
+                    snap_radius=snap_radius,
+                    min_seg_dur=min_seg_dur,
+                    monotonic_mode=monotonic_mode,
                     overcut_guard=overcut_guard,
                     overcut_mode=overcut_mode,
                     overcut_threshold=overcut_threshold,
@@ -1602,8 +1682,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     min_segment_sec = float(args.min_segment_sec)
     merge_gap_sec = float(args.merge_gap_sec)
     silence_probe_enabled = not args.no_silence_probe
-    noise_db = int(args.noise_db)
+    silence_noise_db = float(args.silence_noise_db)
     silence_min_d = float(args.silence_min_d)
+    snap_silence = bool(getattr(args, "snap_silence", True))
+    snap_radius = float(getattr(args, "snap_radius", 0.35))
+    min_seg_dur = float(getattr(args, "min_seg_dur", 0.22))
+    monotonic_mode = str(getattr(args, "monotonic", "strict") or "strict")
     overcut_guard = not args.no_overcut_guard
     overcut_mode = args.overcut_mode
     overcut_threshold = float(args.overcut_threshold)
@@ -1694,8 +1778,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             min_segment_sec=min_segment_sec,
             merge_gap_sec=merge_gap_sec,
             silence_probe_enabled=silence_probe_enabled,
-            noise_db=noise_db,
+            silence_noise_db=silence_noise_db,
             silence_min_d=silence_min_d,
+            snap_silence=snap_silence,
+            snap_radius=snap_radius,
+            min_seg_dur=min_seg_dur,
+            monotonic_mode=monotonic_mode,
             overcut_guard=overcut_guard,
             overcut_mode=overcut_mode,
             overcut_threshold=overcut_threshold,
@@ -1751,8 +1839,12 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             min_segment_sec,
             merge_gap_sec,
             silence_probe_enabled,
-            noise_db,
+            silence_noise_db,
             silence_min_d,
+            snap_silence,
+            snap_radius,
+            min_seg_dur,
+            monotonic_mode,
             overcut_guard,
             overcut_mode,
             overcut_threshold,
@@ -1917,10 +2009,18 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--merge-gap-sec", str(args.merge_gap_sec)])
     if args.no_silence_probe:
         parts.append("--no-silence-probe")
-    if int(args.noise_db) != -35:
-        parts.extend(["--noise-db", str(args.noise_db)])
-    if float(args.silence_min_d) != 0.28:
+    if float(args.silence_noise_db) != -35.0:
+        parts.extend(["--silence-noise-db", str(args.silence_noise_db)])
+    if float(args.silence_min_d) != 0.18:
         parts.extend(["--silence-min-d", str(args.silence_min_d)])
+    if not args.snap_silence:
+        parts.append("--no-snap-silence")
+    if float(args.snap_radius) != 0.35:
+        parts.extend(["--snap-radius", str(args.snap_radius)])
+    if float(args.min_seg_dur) != 0.22:
+        parts.extend(["--min-seg-dur", str(args.min_seg_dur)])
+    if (args.monotonic or "strict").lower() != "strict":
+        parts.extend(["--monotonic", args.monotonic])
     if args.no_overcut_guard:
         parts.append("--no-overcut-guard")
     if args.overcut_mode != "ask":
@@ -2472,8 +2572,12 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             min_segment_sec=MIN_SEGMENT_SEC,
             merge_gap_sec=MERGE_GAP_SEC,
             silence_probe_enabled=True,
-            noise_db=-35,
+            silence_noise_db=-35.0,
             silence_min_d=0.28,
+            snap_silence=True,
+            snap_radius=0.35,
+            min_seg_dur=0.22,
+            monotonic_mode="strict",
             overcut_guard=True,
             overcut_mode="ask",
             overcut_threshold=0.60,
@@ -3182,16 +3286,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
+        "--silence-noise-db",
         "--noise-db",
-        type=int,
-        default=-35,
+        dest="silence_noise_db",
+        type=float,
+        default=-35.0,
         help="静音检测噪声阈值，单位 dB（默认 -35）",
     )
     retake.add_argument(
         "--silence-min-d",
         type=float,
-        default=0.28,
-        help="静音检测的最小时长，秒（默认 0.28）",
+        default=0.18,
+        help="静音检测的最小时长，秒（默认 0.18）",
+    )
+    retake.add_argument(
+        "--snap-silence",
+        dest="snap_silence",
+        action="store_true",
+        default=True,
+        help="启用静音吸附（默认开启）",
+    )
+    retake.add_argument(
+        "--no-snap-silence",
+        dest="snap_silence",
+        action="store_false",
+        help="关闭静音吸附",
+    )
+    retake.add_argument(
+        "--snap-radius",
+        type=float,
+        default=0.35,
+        help="静音边界吸附半径，秒（默认 0.35）",
+    )
+    retake.add_argument(
+        "--min-seg-dur",
+        type=float,
+        default=0.22,
+        help="静音吸附后保留段的最小时长，秒（默认 0.22）",
+    )
+    retake.add_argument(
+        "--monotonic",
+        choices=["off", "soft", "strict"],
+        default="strict",
+        help="对齐后的全局时间单调策略（默认 strict）",
     )
     retake.add_argument("--no-overcut-guard", action="store_true", help="关闭过裁剪保护")
     retake.add_argument(
