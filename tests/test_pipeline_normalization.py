@@ -15,7 +15,7 @@ import json
 import re
 
 from onepass.alignment.canonical import CanonicalRules, concat_and_index
-from onepass.asr_loader import Word
+from onepass.asr_loader import Word, load_words
 from onepass.retake_keep_last import compute_retake_keep_last
 from onepass.text_norm import collapse_and_resplit
 from scripts.onepass_cli import DEFAULT_CHAR_MAP, run_all_in_one, run_prep_norm
@@ -217,3 +217,28 @@ def test_compute_retake_keep_last_triggers_fallback(tmp_path: Path) -> None:
     assert fallback_entries, "fallback entry should be recorded in degrade history"
     assert fallback_entries[0].get("policy")
     assert "no-match" in fallback_entries[0].get("fallback_reasons", [])
+
+
+def test_retake_align_line_count_preserved(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    input_txt = repo_root / "materials" / "001序言01.txt"
+    words_path = repo_root / "materials" / "001序言01.json"
+    out_dir = repo_root / "out" / "tests" / tmp_path.name / "align"
+    run_prep_norm(
+        input_txt,
+        out_dir,
+        DEFAULT_CHAR_MAP,
+        "none",
+        "*.txt",
+        dry_run=False,
+        collapse_lines=True,
+        emit_align=True,
+        allow_missing_char_map=False,
+    )
+    align_path = out_dir / "001序言01.align.txt"
+    assert align_path.exists(), "align file should be generated"
+    words = list(load_words(words_path))
+    result = compute_retake_keep_last(words, align_path, no_collapse_align=True)
+    count = result.stats.get("align_line_count_read")
+    assert isinstance(count, int)
+    assert count >= 80

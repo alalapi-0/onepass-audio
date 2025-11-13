@@ -912,6 +912,7 @@ def _process_retake_item(
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
+    no_collapse_align: bool,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -987,6 +988,7 @@ def _process_retake_item(
                     silence_ranges=effective_silence,
                     audio_path=audio_path,
                     debug_label=stem,
+                    no_collapse_align=no_collapse_align,
                 )
             return compute_retake_keep_last(
                 words,
@@ -1014,6 +1016,7 @@ def _process_retake_item(
                 compute_timeout_sec=compute_timeout_sec,
                 coarse_threshold=coarse_threshold,
                 coarse_len_tolerance=coarse_len_tolerance,
+                no_collapse_align=no_collapse_align,
             )
 
         def _load_context_preview() -> str:
@@ -1264,6 +1267,7 @@ def _run_retake_batch(
     prefer_relative_audio: bool,
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
+    no_collapse_align: bool,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -1350,6 +1354,7 @@ def _run_retake_batch(
                         prefer_relative_audio,
                         path_style,
                         alias_map,
+                        no_collapse_align,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1425,6 +1430,8 @@ def _run_retake_batch(
                     coarse_len_tolerance,
                     prefer_relative_audio,
                     path_style,
+                    alias_map,
+                    no_collapse_align,
                     pause_align=pause_align,
                     pause_gap_sec=pause_gap_sec,
                     pause_snap_limit=pause_snap_limit,
@@ -1504,6 +1511,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     if path_style not in {"auto", "posix", "windows"}:
         raise ValueError("--path-style 仅支持 auto/posix/windows")
     alias_map = load_alias_map(Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)))
+    no_collapse_align = bool(getattr(args, "no_collapse_align", True))
     if args.audio_root:
         audio_root_path = Path(args.audio_root).expanduser().resolve()
     elif args.words_json:
@@ -1546,6 +1554,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             prefer_relative_audio,
             path_style,
             alias_map,
+            no_collapse_align,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1601,6 +1610,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             prefer_relative_audio,
             path_style,
             alias_map,
+            no_collapse_align,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1629,6 +1639,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     stat_keys = [
         "total_words",
         "total_lines",
+        "align_line_count_read",
         "matched_lines",
         "strict_matches",
         "fallback_matches",
@@ -1681,6 +1692,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         existing = {}
         if report_path.exists():
             existing = json.loads(report_path.read_text(encoding="utf-8-sig", errors="replace"))
+        params_section = existing.setdefault("params", {})
+        params_section["no_collapse_align"] = bool(args.no_collapse_align)
         existing["retake_keep_last"] = payload
         write_json(report_path, existing)
     return payload
@@ -1770,6 +1783,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.append("--review-only")
     if getattr(args, "no_interaction", False):
         parts.append("--no-interaction")
+    parts.append("--no-collapse-align" if args.no_collapse_align else "--collapse-align")
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
@@ -1794,6 +1808,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         "prefer_relative_audio": args.prefer_relative_audio,
         "path_style": args.path_style,
         "alias_map": str(args.alias_map),
+        "no_collapse_align": args.no_collapse_align,
         "fast_match": args.fast_match,
         "workers": args.workers,
         "max_windows": args.max_windows,
@@ -2089,7 +2104,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "batch_report.json"
-    report: dict[str, dict] = {}
+    no_collapse_align = bool(getattr(args, "no_collapse_align", True))
+    report: dict[str, dict] = {"params": {"no_collapse_align": no_collapse_align}}
     stage_summary: dict[str, dict] = {}
     pipeline_records: list[dict] = []
     start = time.perf_counter()
@@ -2259,6 +2275,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             prefer_relative_audio,
             path_style,
             alias_map,
+            no_collapse_align,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -2569,6 +2586,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--open-ui")
     if args.open_browser:
         parts.append("--open-browser")
+    parts.append("--no-collapse-align" if args.no_collapse_align else "--collapse-align")
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
@@ -2593,6 +2611,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "glob_audio": args.glob_audio,
         "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
+        "no_collapse_align": args.no_collapse_align,
         "split_mode": args.split_mode,
         "render": canonical_render,
         "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
@@ -2759,6 +2778,20 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="规范化文本是否已折叠换行（默认开启，用于诊断时可关闭）",
+    )
+    align_group = retake.add_mutually_exclusive_group()
+    align_group.add_argument(
+        "--no-collapse-align",
+        dest="no_collapse_align",
+        action="store_true",
+        default=True,
+        help="读取 *.align.txt 时保留原始换行与空白（默认开启）",
+    )
+    align_group.add_argument(
+        "--collapse-align",
+        dest="no_collapse_align",
+        action="store_false",
+        help="兼容旧版行为：读取 *.align.txt 时继续折行/空白规范化",
     )
     retake.add_argument(
         "--no-interaction",
@@ -3026,6 +3059,20 @@ def build_parser() -> argparse.ArgumentParser:
         dest="norm_glob",
         default="*.txt",
         help="规范化阶段的文本匹配模式",
+    )
+    pipeline_align_group = pipeline.add_mutually_exclusive_group()
+    pipeline_align_group.add_argument(
+        "--no-collapse-align",
+        dest="no_collapse_align",
+        action="store_true",
+        default=True,
+        help="读取 *.align.txt 时保留原样，不再额外折叠（默认开启）",
+    )
+    pipeline_align_group.add_argument(
+        "--collapse-align",
+        dest="no_collapse_align",
+        action="store_false",
+        help="兼容旧版行为：读取 *.align.txt 时继续折行/空白规范化",
     )
     pipeline.add_argument(
         "--split-mode",

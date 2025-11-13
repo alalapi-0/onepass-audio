@@ -55,6 +55,16 @@ __all__ = [
     "infer_pause_boundaries",
 ]
 
+
+def _is_align_text(path: Path) -> bool:
+    """Return True if the given path points to a *.align.txt variant."""
+
+    try:
+        name = path.name.lower()
+    except Exception:
+        return False
+    return name.endswith(".align.txt")
+
 MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
 MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
 MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
@@ -967,6 +977,7 @@ def compute_retake_keep_last(
     compute_timeout_sec: float = 300.0,
     coarse_threshold: float = 0.20,
     coarse_len_tolerance: float = 0.45,
+    no_collapse_align: bool = True,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
@@ -979,13 +990,19 @@ def compute_retake_keep_last(
     except OSError as exc:  # 其他 I/O 异常
         raise OSError(f"读取原文 TXT 失败: {exc}. 请检查文件权限或关闭占用程序。") from exc
 
-    normalized_text = normalize_text(
-        raw_text,
-        collapse_lines=False,
-        drop_foreign_brackets=False,
-        alias_map=alias_map,
-    )
-    lines = normalized_text.splitlines()  # 按行拆分原文
+    align_line_count_read: int | None = None
+    if no_collapse_align and _is_align_text(original_txt):
+        lines = raw_text.splitlines()
+        align_line_count_read = len(lines)
+        LOGGER.info("[align] read lines=%s file=%s", align_line_count_read, original_txt)
+    else:
+        normalized_text = normalize_text(
+            raw_text,
+            collapse_lines=False,
+            drop_foreign_brackets=False,
+            alias_map=alias_map,
+        )
+        lines = normalized_text.splitlines()  # 按行拆分原文
     fallback_policy_input = str(fallback_policy or "greedy")
     fallback_policy = fallback_policy_input.strip().lower()
     if fallback_policy == "greedy":
@@ -1012,6 +1029,7 @@ def compute_retake_keep_last(
         "coarse_threshold": float(coarse_threshold),
         "coarse_len_tolerance": float(coarse_len_tolerance),
         "alias_map": bool(alias_map),
+        "no_collapse_align": bool(no_collapse_align),
     }
     LOGGER.info("参数快照: %s", json.dumps(params_snapshot, ensure_ascii=False, sort_keys=True))
 
@@ -1357,6 +1375,8 @@ def compute_retake_keep_last(
             "search_elapsed_sec": search_elapsed_total,
         }
         stats.update(refine_stats)
+        if align_line_count_read is not None:
+            stats["align_line_count_read"] = align_line_count_read
         if unmatched >= 3 and mismatch_samples:
             preview = "; ".join(
                 f"L{sample['line_no']}: {sample['text']}" for sample in mismatch_samples[:3]
@@ -1660,6 +1680,7 @@ def compute_sentence_review(
     audio_path: Path | None = None,
     alias_map: Mapping[str, Sequence[str]] | None = None,
     debug_label: str | None = None,
+    no_collapse_align: bool = True,
 ) -> SentenceReviewResult:
     """执行句子级审阅模式的匹配与统计。"""
 
@@ -1671,6 +1692,11 @@ def compute_sentence_review(
         raise FileNotFoundError(f"未找到原文 TXT: {original_txt}. 请确认路径是否正确。") from exc
     except OSError as exc:
         raise OSError(f"读取原文 TXT 失败: {exc}. 请检查文件权限或是否被占用。") from exc
+
+    align_line_count_read: int | None = None
+    if no_collapse_align and _is_align_text(original_txt):
+        align_line_count_read = len(raw_text.splitlines())
+        LOGGER.info("[align] read lines=%s file=%s", align_line_count_read, original_txt)
 
     align_result = align_sentences_from_text(
         raw_text,
@@ -1736,6 +1762,8 @@ def compute_sentence_review(
         }
     )
     stats.update(refine_stats)
+    if align_line_count_read is not None:
+        stats["align_line_count_read"] = align_line_count_read
     if audio_duration > 0:
         stats["cut_ratio"] = max(0.0, min(1.0, (audio_duration - stats["keep_duration"]) / audio_duration))
     else:
