@@ -572,6 +572,16 @@ def _preview_text(text: str, limit: int = 120) -> str:
     return text[: limit - 1] + "…"
 
 
+def _ascii_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    cleaned = [ch for ch in text if not ch.isspace()]
+    if not cleaned:
+        return 0.0
+    ascii_count = sum(1 for ch in cleaned if ord(ch) < 128)
+    return ascii_count / len(cleaned)
+
+
 def _char_range_to_word_range(char_range: tuple[int, int], char_map: list[tuple[int, int]]) -> tuple[int, int] | None:
     """将字符区间映射为词索引区间。"""
 
@@ -626,6 +636,7 @@ def _fallback_align_greedy(
     *,
     min_anchor_ngram: int,
     max_windows: int,
+    expand_window: bool = False,
 ) -> list[KeepSpan]:
     """贪心对齐兜底：使用锚点快速吸附文本行。"""
 
@@ -657,7 +668,14 @@ def _fallback_align_greedy(
         word_range = _char_range_to_word_range((window_start, window_end), char_map)
         if word_range is None:
             continue
-        start_time, end_time = _word_range_to_time(word_range, word_list)
+        if expand_window:
+            expand = max(1, min_anchor_ngram)
+            start_idx = max(0, word_range[0] - expand)
+            end_idx = min(len(word_list) - 1, word_range[1] + expand)
+            start_time = word_list[start_idx].start
+            end_time = word_list[end_idx].end
+        else:
+            start_time, end_time = _word_range_to_time(word_range, word_list)
         if keeps and start_time < keeps[-1].end:
             start_time = keeps[-1].end
         if end_time < start_time:
@@ -714,9 +732,11 @@ def compute_retake_keep_last(
     fallback_policy: str = "greedy",
     compute_timeout_sec: float = 300.0,
     no_collapse_align: bool = True,
+    drop_ascii_parens: bool = False,
 ) -> RetakeResult:
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
+    drop_ascii_parens = bool(drop_ascii_parens)
     if not words:  # 无词序列时无法继续
         raise ValueError("词序列为空，无法执行保留最后一遍逻辑。请先导入有效的 ASR JSON。")
     try:
@@ -743,7 +763,9 @@ def compute_retake_keep_last(
     fallback_policy = fallback_policy_input.strip().lower()
     if fallback_policy == "greedy":
         fallback_policy = "align-greedy"
-    if fallback_policy not in {"safe", "keep-all", "align-greedy"}:
+    elif fallback_policy == "greedy+expand":
+        fallback_policy = "align-greedy-expand"
+    if fallback_policy not in {"safe", "keep-all", "align-greedy", "align-greedy-expand"}:
         LOGGER.warning("未知 fallback_policy=%s，已回退为 align-greedy", fallback_policy)
         fallback_policy = "align-greedy"
     _, asr_norm_str, char_map = _normalize_words(words, alias_map)  # 获取规范化词串与索引
@@ -813,6 +835,7 @@ def compute_retake_keep_last(
         fine_evaluated = 0
         pruned_candidates = 0
         search_elapsed = 0.0
+        ascii_relaxed = 0
         for index, line in enumerate(lines, start=1):
             if active_deadline and time.monotonic() > active_deadline:
                 raise TimeoutError("match deadline")
@@ -838,9 +861,13 @@ def compute_retake_keep_last(
                         local_deadline = candidate_deadline
                     else:
                         local_deadline = min(local_deadline, candidate_deadline)
+                line_ratio = current_distance_ratio
+                if drop_ascii_parens and _ascii_ratio(line) > 0.6:
+                    line_ratio = max(line_ratio, 0.5)
+                    ascii_relaxed += 1
                 match_request = MatchRequest(
                     target_text=units,
-                    max_distance_ratio=current_distance_ratio,
+                    max_distance_ratio=line_ratio,
                     min_anchor_ngram=current_anchor_ngram,
                     max_windows=window_limit,
                     deadline=local_deadline,
@@ -909,21 +936,22 @@ def compute_retake_keep_last(
                         end=span_end,
                     )
                 )
-        return {
-            "keeps": local_keeps,
-            "strict_matches": strict_count,
-            "fallback_matches": fuzzy_count,
-            "unmatched": unmatched_count,
-            "len_gate_skipped": len_gate_skip,
-            "neighbor_gap_skipped": neighbor_skip,
-            "mismatch_samples": mismatch_details,
-            "unmatched_examples": unmatched_details,
-            "coarse_total": coarse_total,
-            "coarse_passed": coarse_passed,
-            "fine_evaluated": fine_evaluated,
-            "pruned_candidates": pruned_candidates,
-            "search_elapsed_sec": search_elapsed,
-        }
+            return {
+                "keeps": local_keeps,
+                "strict_matches": strict_count,
+                "fallback_matches": fuzzy_count,
+                "unmatched": unmatched_count,
+                "len_gate_skipped": len_gate_skip,
+                "neighbor_gap_skipped": neighbor_skip,
+                "mismatch_samples": mismatch_details,
+                "unmatched_examples": unmatched_details,
+                "coarse_total": coarse_total,
+                "coarse_passed": coarse_passed,
+                "fine_evaluated": fine_evaluated,
+                "pruned_candidates": pruned_candidates,
+                "search_elapsed_sec": search_elapsed,
+                "ascii_relaxed_lines": ascii_relaxed,
+            }
 
     keeps: list[KeepSpan] = []
     edl_keep_segments: list[tuple[float, float]] = []
@@ -950,6 +978,7 @@ def compute_retake_keep_last(
     fine_evaluated_total = 0
     pruned_candidates_total = 0
     search_elapsed_total = 0.0
+    ascii_relaxed = 0
 
     degrade_reason: str | None = None
     degrade_history: list[dict[str, object]] = []
@@ -1020,6 +1049,39 @@ def compute_retake_keep_last(
                 fallback_policy,
             )
             break
+        if not alignment:
+            degrade_reason = degrade_reason or "no-match"
+            stage_index += 1
+            if stage_index < len(stage_plan):
+                next_stage = stage_plan[stage_index]
+                degrade_history.append(
+                    {
+                        "reason": "no-match",
+                        "stage": stage["label"],
+                        "next_stage": next_stage["label"],
+                        "anchor_ngram": current_anchor_ngram,
+                        "distance_ratio": current_distance_ratio,
+                    }
+                )
+                LOGGER.warning(
+                    "降级: stem=%s reason=no-match -> stage=%s anchor=%s ratio=%.2f",
+                    debug_label or "-",
+                    next_stage["label"],
+                    next_stage["anchor"],
+                    next_stage["ratio"],
+                )
+                if compute_timeout_sec and compute_timeout_sec > 0:
+                    compute_deadline = time.monotonic() + compute_timeout_sec
+                else:
+                    compute_deadline = None
+                active_deadline = compute_deadline
+                continue
+            LOGGER.warning(
+                "降级失败: stem=%s reason=no-match -> 启用回退策略 %s",
+                debug_label or "-",
+                fallback_policy,
+            )
+            break
         raw_keeps = list(alignment.get("keeps", []))
         strict_matches = int(alignment.get("strict_matches", 0))
         fallback_matches = int(alignment.get("fallback_matches", 0))
@@ -1033,6 +1095,7 @@ def compute_retake_keep_last(
         fine_evaluated_total = int(alignment.get("fine_evaluated", 0))
         pruned_candidates_total = int(alignment.get("pruned_candidates", 0))
         search_elapsed_total = float(alignment.get("search_elapsed_sec", 0.0))
+        ascii_relaxed = int(alignment.get("ascii_relaxed_lines", 0))
 
         pause_intervals = list(pause_intervals_base)
         active_indices, final_segments, refine_stats, debug_rows = _refine_segments(
@@ -1074,6 +1137,7 @@ def compute_retake_keep_last(
             "fine_evaluated": fine_evaluated_total,
             "pruned_candidates": pruned_candidates_total,
             "search_elapsed_sec": search_elapsed_total,
+            "ascii_relaxed_lines": ascii_relaxed,
         }
         stats.update(refine_stats)
         stats["aligned_lines"] = stats["matched_lines"]
@@ -1206,7 +1270,7 @@ def compute_retake_keep_last(
                 debug_label or "-",
                 fallback_policy,
             )
-        if fallback_policy in {"safe", "align-greedy"}:
+        if fallback_policy in {"safe", "align-greedy", "align-greedy-expand"}:
             fallback_keeps = _fallback_align_greedy(
                 words,
                 lines,
@@ -1214,11 +1278,12 @@ def compute_retake_keep_last(
                 char_map,
                 min_anchor_ngram=min_anchor_ngram,
                 max_windows=max_windows,
+                expand_window=fallback_policy == "align-greedy-expand",
             )
             if fallback_keeps:
                 fallback_engine = "fallback-align-greedy"
                 fallback_note = "NO_MATCH_FALLBACK_ALIGN_GREEDY"
-        if not fallback_keeps and fallback_policy in {"safe", "keep-all", "align-greedy"}:
+        if not fallback_keeps and fallback_policy in {"safe", "keep-all", "align-greedy", "align-greedy-expand"}:
             fallback_keeps = _fallback_keep_all(words, audio_duration, lines)
             fallback_engine = "fallback-keep-all"
             fallback_note = "NO_MATCH_FALLBACK_KEEP_ALL"

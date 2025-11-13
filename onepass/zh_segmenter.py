@@ -58,6 +58,21 @@ _CONNECTIVE_TOKENS = (
 )
 
 
+def _is_cjk_char(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return 0x3400 <= code <= 0x9FFF or 0xF900 <= code <= 0xFAFF or 0x20000 <= code <= 0x2FFFF
+
+
+def _segment_has_cjk_ascii_mix(text: str) -> bool:
+    if not text:
+        return False
+    has_cjk = any(_is_cjk_char(ch) for ch in text)
+    has_ascii = any(ord(ch) < 128 and not ch.isspace() for ch in text)
+    return has_cjk and has_ascii
+
+
 def segment(
     text: str,
     *,
@@ -181,7 +196,12 @@ def _apply_length_rules(
     expanded: List[Segment] = []
     for seg in segments:
         seg_len = seg.end - seg.start
-        if seg_len <= max_len:
+        local_max_len = max_len
+        local_hard_max = hard_max
+        if seg.text and _segment_has_cjk_ascii_mix(seg.text) and max_len < 28:
+            local_max_len = 28
+            local_hard_max = max(hard_max, 28)
+        if seg_len <= local_max_len:
             clause_segments = _split_segment_by_clause(
                 text,
                 seg.start,
@@ -196,8 +216,8 @@ def _apply_length_rules(
                 text,
                 seg.start,
                 seg.end,
-                max_len=max_len,
-                hard_max=hard_max,
+                max_len=local_max_len,
+                hard_max=local_hard_max,
                 weak_enabled=weak_enabled,
                 keep_quotes=keep_quotes,
             )

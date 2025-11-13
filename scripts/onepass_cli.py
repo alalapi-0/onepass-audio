@@ -358,6 +358,24 @@ def _load_canonical_rules(char_map_path: Path) -> CanonicalRules:
     return CanonicalRules(char_map=mapping)
 
 
+def _resolve_match_parameters(
+    preset: str | None,
+    ratio: float,
+    anchor: int,
+    fallback: str,
+) -> tuple[float, int, str]:
+    preset_name = (preset or "").strip().lower()
+    if not preset_name:
+        return ratio, anchor, fallback
+    if preset_name == "tolerant":
+        LOGGER.info(
+            "match preset tolerant -> max_distance_ratio=0.45 min_anchor_ngram=4 fallback=greedy+expand"
+        )
+        return 0.45, 4, "greedy+expand"
+    LOGGER.warning("未知 match preset=%s，使用显式参数。", preset_name)
+    return ratio, anchor, fallback
+
+
 def _process_single_text(
     path: Path,
     base_dir: Path,
@@ -377,6 +395,8 @@ def _process_single_text(
     align_keep_quotes: bool,
     prosody_gap_ms: int,
     max_clause_chars: int,
+    drop_ascii_parens: bool,
+    squash_mixed_english: bool,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -438,7 +458,12 @@ def _process_single_text(
     if collapse_lines and sentence_lines:
         validate_sentence_lines(sentence_lines)
     converted_text = "\n".join(sentence_lines)
-    converted_text = normalize_chinese_text(converted_text, collapse_lines=collapse_lines)
+    converted_text = normalize_chinese_text(
+        converted_text,
+        collapse_lines=collapse_lines,
+        drop_ascii_parens=drop_ascii_parens,
+        squash_mixed_english=squash_mixed_english,
+    )
     payload_text = converted_text.replace("\r\n", "\n").replace("\r", "\n")
     if collapse_lines:
         payload_text = collapse_soft_linebreaks(payload_text)
@@ -664,6 +689,8 @@ def run_prep_norm(
     align_keep_quotes: bool = True,
     prosody_gap_ms: int = 350,
     max_clause_chars: int = 22,
+    drop_ascii_parens: bool = True,
+    squash_mixed_english: bool = True,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -706,6 +733,8 @@ def run_prep_norm(
     else:
         LOGGER.info("[normalize] collapse-lines=off (preserve original line breaks)")
     start = time.perf_counter()  # 记录起始时间
+    LOGGER.info("[normalize] drop-ascii-parens=%s", "on" if drop_ascii_parens else "off")
+    LOGGER.info("[normalize] squash-mixed-english=%s", "on" if squash_mixed_english else "off")
     last_progress = start
     processed = 0
     for path in files:  # 遍历每个文件
@@ -727,6 +756,8 @@ def run_prep_norm(
             align_keep_quotes=align_keep_quotes,
             prosody_gap_ms=prosody_gap_ms,
             max_clause_chars=max_clause_chars,
+            drop_ascii_parens=drop_ascii_parens,
+            squash_mixed_english=squash_mixed_english,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -776,6 +807,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         + (["--hard-max", str(args.hard_max)] if args.hard_max != DEFAULT_ALIGN_HARD_MAX else [])
         + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
         + (["--no-keep-quotes"] if not args.keep_quotes else [])
+        + (["--no-drop-ascii-parens"] if not args.drop_ascii_parens else [])
+        + (["--no-squash-mixed-english"] if not args.squash_mixed_english else [])
         + (["--dry-run"] if args.dry_run else []),
     )
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
@@ -798,6 +831,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             align_keep_quotes=args.keep_quotes,
             prosody_gap_ms=args.prosody_gap_ms,
             max_clause_chars=args.max_clause_chars,
+            drop_ascii_parens=args.drop_ascii_parens,
+            squash_mixed_english=args.squash_mixed_english,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -923,6 +958,7 @@ def _process_retake_item(
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
     no_collapse_align: bool,
+    drop_ascii_parens: bool,
     *,
     pause_align: bool,
     pause_gap_sec: float,
@@ -1025,6 +1061,7 @@ def _process_retake_item(
                 fallback_policy=fallback_policy,
                 compute_timeout_sec=compute_timeout_sec,
                 no_collapse_align=no_collapse_align,
+                drop_ascii_parens=drop_ascii_parens,
             )
 
         def _load_context_preview() -> str:
@@ -1274,6 +1311,7 @@ def _run_retake_batch(
     path_style: str,
     alias_map: Mapping[str, Sequence[str]] | None,
     no_collapse_align: bool,
+    drop_ascii_parens: bool,
     pause_align: bool,
     pause_gap_sec: float,
     pause_snap_limit: float,
@@ -1359,6 +1397,7 @@ def _run_retake_batch(
                         path_style,
                         alias_map,
                         no_collapse_align,
+                        args.drop_ascii_parens,
                         pause_align=pause_align,
                         pause_gap_sec=pause_gap_sec,
                         pause_snap_limit=pause_snap_limit,
@@ -1434,6 +1473,7 @@ def _run_retake_batch(
                     path_style,
                     alias_map,
                     no_collapse_align,
+                    drop_ascii_parens,
                     pause_align=pause_align,
                     pause_gap_sec=pause_gap_sec,
                     pause_snap_limit=pause_snap_limit,
@@ -1501,6 +1541,20 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     max_distance_ratio = float(args.max_distance_ratio)
     min_anchor_ngram = int(args.min_anchor_ngram)
     fallback_policy = args.fallback_policy
+    match_preset = getattr(args, "match_preset", None)
+    (
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+    ) = _resolve_match_parameters(
+        match_preset,
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+    )
+    args.max_distance_ratio = max_distance_ratio
+    args.min_anchor_ngram = min_anchor_ngram
+    args.fallback_policy = fallback_policy
     debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
     if debug_csv and args.workers and args.workers > 1:
         LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
@@ -1511,6 +1565,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     if path_style not in {"auto", "posix", "windows"}:
         raise ValueError("--path-style 仅支持 auto/posix/windows")
     alias_map = load_alias_map(Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)))
+    drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
     no_collapse_align = bool(getattr(args, "no_collapse_align", True))
     if args.audio_root:
         audio_root_path = Path(args.audio_root).expanduser().resolve()
@@ -1553,6 +1608,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             path_style,
             alias_map,
             no_collapse_align,
+            drop_ascii_parens,
             pause_align=pause_align,
             pause_gap_sec=pause_gap_sec,
             pause_snap_limit=pause_snap_limit,
@@ -1607,6 +1663,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             path_style,
             alias_map,
             no_collapse_align,
+            drop_ascii_parens,
             pause_align,
             pause_gap_sec,
             pause_snap_limit,
@@ -1703,6 +1760,8 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             existing = json.loads(report_path.read_text(encoding="utf-8-sig", errors="replace"))
         params_section = existing.setdefault("params", {})
         params_section["no_collapse_align"] = bool(args.no_collapse_align)
+        params_section["drop_ascii_parens"] = bool(getattr(args, "drop_ascii_parens", True))
+        params_section["match_preset"] = getattr(args, "match_preset", "") or ""
         existing["retake_keep_last"] = payload
         stats_section = existing.setdefault("stats", {})
         stats_section["cut_seconds"] = total_cut_seconds
@@ -1745,6 +1804,8 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     if args.path_style != "auto":
         parts.extend(["--path-style", args.path_style])
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
+    if not args.drop_ascii_parens:
+        parts.append("--no-drop-ascii-parens")
     if args.source_audio:
         parts.extend(["--source-audio", args.source_audio])
     if args.samplerate:
@@ -1803,6 +1864,8 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
     parts.extend(["--fallback-policy", args.fallback_policy])
+    if args.match_preset:
+        parts.extend(["--match-preset", args.match_preset])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -1819,12 +1882,14 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         "path_style": args.path_style,
         "alias_map": str(args.alias_map),
         "no_collapse_align": args.no_collapse_align,
+        "drop_ascii_parens": args.drop_ascii_parens,
         "fast_match": args.fast_match,
         "workers": args.workers,
         "max_windows": args.max_windows,
         "match_timeout": args.match_timeout,
         "compute_timeout_sec": args.compute_timeout_sec,
         "fallback_policy": args.fallback_policy,
+        "match_preset": args.match_preset,
     }
     LOGGER.info(_safe_text(f"参数快照: {json.dumps(snapshot, ensure_ascii=False)}"))
 
@@ -2122,7 +2187,19 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "batch_report.json"
     no_collapse_align = bool(getattr(args, "no_collapse_align", True))
-    report: dict[str, dict] = {"params": {"no_collapse_align": no_collapse_align}}
+    include_canonical = bool(getattr(args, "include_canonical_kits", False))
+    drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
+    squash_mixed_english = bool(getattr(args, "squash_mixed_english", True))
+    match_preset = getattr(args, "match_preset", "") or ""
+    report: dict[str, dict] = {
+        "params": {
+            "no_collapse_align": no_collapse_align,
+            "drop_ascii_parens": drop_ascii_parens,
+            "squash_mixed_english": squash_mixed_english,
+            "include_canonical_kits": include_canonical,
+            "match_preset": match_preset,
+        }
+    }
     stage_summary: dict[str, dict] = {}
     pipeline_records: list[dict] = []
     start = time.perf_counter()
@@ -2168,6 +2245,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         align_keep_quotes=align_keep,
         prosody_gap_ms=int(getattr(args, "prosody_gap_ms", 350)),
         max_clause_chars=int(getattr(args, "max_clause_chars", 22)),
+        drop_ascii_parens=drop_ascii_parens,
+        squash_mixed_english=squash_mixed_english,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -2184,6 +2263,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         retake_text_patterns,
         args.glob_words,
         args.glob_audio,
+        include_canonical_kits=include_canonical,
     )
     kit_count = len(kits)
     audio_kits = sum(1 for kit in kits if kit.audio)
@@ -2218,6 +2298,16 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
     fallback_policy = getattr(args, "fallback_policy", "greedy")
     compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
+    match_preset = getattr(args, "match_preset", None)
+    max_distance_ratio, min_anchor_ngram, fallback_policy = _resolve_match_parameters(
+        match_preset,
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+    )
+    args.max_distance_ratio = max_distance_ratio
+    args.min_anchor_ngram = min_anchor_ngram
+    args.fallback_policy = fallback_policy
 
     retake_items: list[dict] = []
     failed = 0
@@ -2289,6 +2379,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             path_style,
             alias_map,
             no_collapse_align,
+            drop_ascii_parens,
             pause_align=True,
             pause_gap_sec=PAUSE_GAP_SEC,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
@@ -2564,6 +2655,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-audio",
         args.glob_audio,
     ]
+    if args.include_canonical_kits:
+        parts.append("--include-canonical-kits")
     if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE:
         parts.extend(["--split-mode", args.split_mode])
     if args.min_len != DEFAULT_ALIGN_MIN_LEN:
@@ -2583,6 +2676,10 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     if args.path_style != "auto":
         parts.extend(["--path-style", args.path_style])
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
+    if not args.drop_ascii_parens:
+        parts.append("--no-drop-ascii-parens")
+    if not args.squash_mixed_english:
+        parts.append("--no-squash-mixed-english")
     if not args.emit_align:
         parts.append("--no-emit-align")
     if args.workers:
@@ -2612,6 +2709,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
     parts.extend(["--fallback-policy", args.fallback_policy])
+    if args.match_preset:
+        parts.extend(["--match-preset", args.match_preset])
 
     LOGGER.info(
         _safe_text(
@@ -2631,6 +2730,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
         "no_collapse_align": args.no_collapse_align,
+        "include_canonical_kits": args.include_canonical_kits,
         "split_mode": args.split_mode,
         "render": canonical_render,
         "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
@@ -2645,6 +2745,9 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "max_distance_ratio": args.max_distance_ratio,
         "min_anchor_ngram": args.min_anchor_ngram,
         "fallback_policy": args.fallback_policy,
+        "drop_ascii_parens": args.drop_ascii_parens,
+        "squash_mixed_english": args.squash_mixed_english,
+        "match_preset": args.match_preset,
         "serve": args.serve,
         "open_browser": args.open_browser,
         "open_ui": args.open_ui,
@@ -2755,6 +2858,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="括号/引号内默认不在弱标点处断句（默认开启）",
     )
     prep.add_argument(
+        "--drop-ascii-parens",
+        dest="drop_ascii_parens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="删除括注中 ASCII 占比高的内容（默认开启）",
+    )
+    prep.add_argument(
+        "--squash-mixed-english",
+        dest="squash_mixed_english",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="去掉中文行尾紧跟的英文词串（默认开启）",
+    )
+    prep.add_argument(
         "--prosody-gap-ms",
         type=int,
         default=350,
@@ -2807,6 +2924,13 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="规范化文本是否已折叠换行（默认开启，用于诊断时可关闭）",
+    )
+    retake.add_argument(
+        "--drop-ascii-parens",
+        dest="drop_ascii_parens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="对齐前放宽含英文括注行的匹配阈值（默认开启）",
     )
     align_group = retake.add_mutually_exclusive_group()
     align_group.add_argument(
@@ -2947,9 +3071,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retake.add_argument(
         "--fallback-policy",
-        choices=["safe", "keep-all", "align-greedy", "greedy"],
+        choices=["safe", "keep-all", "align-greedy", "greedy", "greedy+expand"],
         default="greedy",
         help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
+    )
+    retake.add_argument(
+        "--match-preset",
+        choices=["tolerant"],
+        help="匹配参数预设（tolerant=放宽距离/锚点限制）",
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
@@ -3077,6 +3206,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="*.txt",
         help="规范化阶段的文本匹配模式",
     )
+    pipeline.add_argument(
+        "--include-canonical-kits",
+        dest="include_canonical_kits",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="同时处理 *.canonical 派生文本（默认关闭）",
+    )
     pipeline_align_group = pipeline.add_mutually_exclusive_group()
     pipeline_align_group.add_argument(
         "--no-collapse-align",
@@ -3129,6 +3265,20 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="括号/引号内默认不在弱标点处断句（默认开启）",
+    )
+    pipeline.add_argument(
+        "--drop-ascii-parens",
+        dest="drop_ascii_parens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="删除括注中 ASCII 占比高的内容（默认开启）",
+    )
+    pipeline.add_argument(
+        "--squash-mixed-english",
+        dest="squash_mixed_english",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="去掉中文行尾紧跟的英文词串（默认开启）",
     )
     pipeline.add_argument(
         "--prosody-gap-ms",
@@ -3224,9 +3374,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pipeline.add_argument(
         "--fallback-policy",
-        choices=["safe", "keep-all", "align-greedy", "greedy"],
+        choices=["safe", "keep-all", "align-greedy", "greedy", "greedy+expand"],
         default="greedy",
         help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
+    )
+    pipeline.add_argument(
+        "--match-preset",
+        choices=["tolerant"],
+        help="匹配参数预设（tolerant=放宽距离/锚点限制）",
     )
     pipeline.set_defaults(func=handle_all_in_one)
 

@@ -771,6 +771,22 @@ python onepass_main.py
 # 选择 “预处理：原文规范化（NFKC + 兼容字清洗）”，观察逐步反馈与最终统计
 ```
 
+#### R4 自测命令
+
+```bash
+# 严格参数：仅统计主套件
+python scripts/onepass_cli.py all-in-one --in materials --out out \
+  --render auto --no-interaction --alias-map config/default_alias_map.json
+
+# 宽容参数：启用 tolerant 预设
+python scripts/onepass_cli.py all-in-one --in materials --out out \
+  --render auto --no-interaction --match-preset tolerant \
+  --alias-map config/default_alias_map.json
+```
+
+- 预期：两次命令均应 `success 2/2`，每篇 `unaligned ≤ 2`。
+- 批次剪切的 `cut_seconds` 波动应控制在 ±10% 内，以验证匹配放宽但稳定。
+
 ## 小程序使用说明
 
 - 首页显示「关卡、目标、得分、总分、最佳分」
