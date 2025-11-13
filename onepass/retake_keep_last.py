@@ -58,6 +58,7 @@ __all__ = [
 MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
 MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
 MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
+FALLBACK_MAX_KEEP_SEC = 20.0  # 兜底段最长保留时长
 
 PAUSE_GAP_SEC = 0.45  # 词间间隔超过该值视为自然停顿
 PAUSE_SNAP_LIMIT = 0.20  # 段首尾可吸附到停顿边界的最大距离
@@ -106,6 +107,7 @@ class RetakeResult:
     audio_duration: float = 0.0
     edl_fallback: bool = False
     edl_fallback_reason: str | None = None
+    edl_segment_metadata: list[dict[str, object]] | None = None
     unmatched_samples: list[dict[str, object]] | None = None
 
 
@@ -1178,6 +1180,7 @@ def compute_retake_keep_last(
 
     keeps: list[KeepSpan] = []
     edl_keep_segments: list[tuple[float, float]] = []
+    segment_metadata: list[dict[str, object]] = []
     drops: list[tuple[float, float]] = []
     debug_rows: list[dict] = []
     stats: dict[str, object] | None = None
@@ -1501,6 +1504,14 @@ def compute_retake_keep_last(
         keeps = [fallback_keeps[idx] for idx in range(len(fallback_keeps)) if idx in active_indices]
         keeps.sort(key=lambda item: item.start)
         edl_keep_segments = final_segments or [(0.0, 0.0)]
+        edl_keep_segments = _split_segments_by_limit(
+            edl_keep_segments,
+            max_duration=FALLBACK_MAX_KEEP_SEC,
+            keep_spans=keeps,
+            silence_intervals=pause_intervals,
+        )
+        if "timeout" in fallback_reasons:
+            segment_metadata = [{"fallback_reason": "timeout"} for _ in edl_keep_segments]
         drops = _invert_segments(edl_keep_segments, 0.0, audio_duration)
         drops, window_splits = _split_long_segments(drops, max_window_sec)
         stats.update(refine_stats)
@@ -1601,6 +1612,7 @@ def compute_retake_keep_last(
     stats["cut_seconds"] = max(0.0, audio_duration - stats.get("keep_duration", 0.0))
     stats["max_window_splits"] = window_splits
     stats["edl_segments_count"] = edl_segments_count
+    stats["segment_count"] = edl_segments_count
     edl_fallback_flag = bool(
         edl_segments_count == 0
         or stats.get("fallback_reason") == "no_keep_segments"
@@ -1623,6 +1635,7 @@ def compute_retake_keep_last(
         audio_duration=audio_duration,
         edl_fallback=edl_fallback_flag,
         edl_fallback_reason=stats.get("fallback_reason") or None,
+        edl_segment_metadata=segment_metadata or None,
         unmatched_samples=unmatched_samples,
     )
 
@@ -1820,6 +1833,65 @@ def _split_long_segments(
     return result, splits
 
 
+def _collect_boundary_points(
+    keep_spans: Sequence[KeepSpan],
+    silence_intervals: Sequence[tuple[float, float]],
+) -> list[float]:
+    """Collect candidate cut points from text spans and silence windows."""
+
+    points: set[float] = set()
+    for span in keep_spans:
+        points.add(max(0.0, span.start))
+        points.add(max(0.0, span.end))
+    for start, end in silence_intervals:
+        points.add(max(0.0, start))
+        points.add(max(0.0, end))
+    return sorted(points)
+
+
+def _split_segments_by_limit(
+    segments: Sequence[tuple[float, float]],
+    *,
+    max_duration: float,
+    keep_spans: Sequence[KeepSpan],
+    silence_intervals: Sequence[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Ensure fallback keep segments respect the configured duration limit."""
+
+    if max_duration <= 0:
+        return [segment for segment in segments if segment[1] > segment[0]]
+    candidates = _collect_boundary_points(keep_spans, silence_intervals)
+    min_gap = max(0.4, min(max_duration / 4, 1.5))
+    epsilon = 1e-3
+    constrained: list[tuple[float, float]] = []
+    for start, end in segments:
+        if end - start <= max_duration + epsilon:
+            constrained.append((start, end))
+            continue
+        stack = [(start, end)]
+        while stack:
+            current_start, current_end = stack.pop()
+            if current_end - current_start <= max_duration + epsilon:
+                constrained.append((current_start, current_end))
+                continue
+            target = current_start + max_duration
+            valid_candidates = [
+                point
+                for point in candidates
+                if (current_start + min_gap) <= point <= min(current_end - min_gap, target)
+            ]
+            if valid_candidates:
+                cut = min(valid_candidates, key=lambda value: abs(target - value))
+            else:
+                cut = min(current_end, current_start + max_duration)
+            if cut <= current_start + epsilon or cut >= current_end - epsilon:
+                cut = min(current_end, current_start + max_duration)
+            stack.append((cut, current_end))
+            stack.append((current_start, cut))
+    constrained.sort(key=lambda item: (item[0], item[1]))
+    return constrained
+
+
 def export_srt(keeps: list[KeepSpan], out_path: Path) -> Path:
     """将保留行导出为 SRT 字幕文件。"""
 
@@ -1894,6 +1966,7 @@ def export_audition_markers(
 
 def export_edl_json(
     edl_keep_segments: list[tuple[float, float]],
+    segment_metadata: Sequence[Mapping[str, object]] | None,
     source_audio_abs: str | None,
     out_path: Path,
     *,
@@ -1910,12 +1983,18 @@ def export_edl_json(
     """导出仅包含 keep 动作的 EDL JSON。"""
 
     segments: list[dict[str, object]] = []
-    for start, end in edl_keep_segments:
+    for idx, (start, end) in enumerate(edl_keep_segments):
         payload: dict[str, object] = {
             "start": max(0.0, start),
             "end": max(0.0, end),
             "action": "keep",
         }
+        if segment_metadata and idx < len(segment_metadata):
+            extra = dict(segment_metadata[idx])
+            if extra:
+                payload.setdefault("metadata", {})
+                if isinstance(payload["metadata"], dict):
+                    payload["metadata"].update(extra)
         if fallback_reason:
             payload.setdefault("metadata", {})
             if isinstance(payload["metadata"], dict):

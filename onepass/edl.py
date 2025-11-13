@@ -1,9 +1,12 @@
-"""根据对齐结果生成“保留最后一遍”的剪辑决策列表（EDL）。"""
-from __future__ import annotations  # 启用未来注解语法，支持前置引用
+"""EDL helpers for both legacy action lists and unified segment schema."""
+from __future__ import annotations
 
-from dataclasses import dataclass  # 引入数据类装饰器
-from datetime import datetime, timezone  # 用于生成 UTC 时间戳
-from typing import Dict, List, Tuple  # 引入常用类型注解
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Literal
 
 from .align import AlignResult  # 引入对齐结果数据结构
 from .asr_loader import Word  # 引入词级时间戳数据结构
@@ -28,6 +31,32 @@ class EDL:
     actions: List[EDLAction]  # 剪切动作列表
     stats: Dict[str, float | int | None]  # 附带统计数据
     created_at: str  # 创建时间戳（ISO 格式）
+
+
+@dataclass(slots=True)
+class Segment:
+    """Unified segment representation used by renderer and CLI."""
+
+    start: float
+    end: float
+    action: Literal["keep", "cut"] = "keep"
+    metadata: Dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class SegmentEDL:
+    """Structured document returned by :func:`load`."""
+
+    source_audio: str | None
+    segments: List[Segment]
+    samplerate: int | None = None
+    channels: int | None = None
+    stem: str | None = None
+    version: int | None = None
+    source_samplerate: int | None = None
+    source_audio_basename: str | None = None
+    path_style: str = "posix"
+    stats: Dict[str, Any] | None = None
 
 
 def merge_intervals(
@@ -82,4 +111,122 @@ def build_keep_last_edl(words: List[Word], align: AlignResult) -> EDL:
     return edl  # 返回完整的 EDL 结构
 
 
-__all__ = ["EDL", "EDLAction", "build_keep_last_edl", "merge_intervals"]  # 对外导出符号
+def _derive_stem_from_path(path: Path) -> str:
+    name = path.name
+    if name.endswith(".edl.json"):
+        name = name[: -len(".edl.json")]
+    elif name.endswith(".json"):
+        name = name[: -len(".json")]
+    for suffix in (".edl", ".keepLast", ".keep", ".sentence"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
+def _to_float(value: object, field: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"字段 `{field}` 无法解析为浮点数: {value!r}") from exc
+
+
+def _to_optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalise_action(raw: object, keep_flag: object, legacy_type: object) -> Literal["keep", "cut"]:
+    candidates: list[object] = [raw, legacy_type]
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            lowered = candidate.strip().lower()
+            if lowered in {"keep", "cut"}:
+                return "keep" if lowered == "keep" else "cut"
+            if lowered == "drop":
+                return "cut"
+    if isinstance(keep_flag, bool):
+        return "keep" if keep_flag else "cut"
+    return "keep"
+
+
+def load(path: Path | str) -> SegmentEDL:
+    """Load an EDL file and normalise it into unified segments."""
+
+    edl_path = Path(path).expanduser()
+    if not edl_path.exists():
+        raise FileNotFoundError(f"未找到 EDL 文件: {edl_path}")
+    data = json.loads(edl_path.read_text(encoding="utf-8", errors="replace"))
+    raw_segments = data.get("segments")
+    items: list[dict[str, Any]] = [item for item in raw_segments or [] if isinstance(item, dict)]
+    segments: list[Segment] = []
+    for item in items:
+        start = _to_float(item.get("start"), "start")
+        end = _to_float(item.get("end"), "end")
+        if end <= start:
+            continue
+        action = _normalise_action(item.get("action"), item.get("keep"), item.get("type"))
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else None
+        segments.append(Segment(start=start, end=end, action=action, metadata=metadata))
+    if not segments:
+        actions = data.get("actions")
+        if isinstance(actions, list):
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                if action.get("type") not in {None, "cut"}:
+                    continue
+                start = _to_float(action.get("start"), "start")
+                end = _to_float(action.get("end"), "end")
+                if end <= start:
+                    continue
+                reason = action.get("reason")
+                metadata = {"reason": reason.strip()} if isinstance(reason, str) and reason.strip() else None
+                segments.append(Segment(start=start, end=end, action="cut", metadata=metadata))
+    if not segments:
+        raise ValueError(f"EDL 缺少有效的 segments/actions 描述: {edl_path}")
+    segments.sort(key=lambda seg: (seg.start, seg.end))
+    source_raw = data.get("source_audio") or data.get("audio") or ""
+    source_audio = source_raw.strip() if isinstance(source_raw, str) else None
+    samplerate = _to_optional_int(data.get("samplerate") or data.get("sample_rate"))
+    channels = _to_optional_int(data.get("channels"))
+    source_samplerate = _to_optional_int(data.get("source_samplerate"))
+    stem_field = data.get("stem")
+    stem = stem_field.strip() if isinstance(stem_field, str) and stem_field.strip() else _derive_stem_from_path(edl_path)
+    stats = data.get("stats") if isinstance(data.get("stats"), dict) else None
+    path_style_field = data.get("path_style")
+    path_style = path_style_field.strip().lower() if isinstance(path_style_field, str) else "posix"
+    if path_style not in {"posix", "windows"}:
+        path_style = "posix"
+    basename_field = data.get("source_audio_basename")
+    basename = basename_field.strip() if isinstance(basename_field, str) and basename_field.strip() else None
+    if not basename and source_audio:
+        basename = Path(source_audio).name
+    version_value = data.get("version") or data.get("schema_version")
+    version = _to_optional_int(version_value)
+    return SegmentEDL(
+        source_audio=source_audio,
+        segments=segments,
+        samplerate=samplerate,
+        channels=channels,
+        stem=stem,
+        version=version,
+        source_samplerate=source_samplerate,
+        source_audio_basename=basename,
+        path_style=path_style,
+        stats=stats,
+    )
+
+
+__all__ = [
+    "EDL",
+    "EDLAction",
+    "Segment",
+    "SegmentEDL",
+    "build_keep_last_edl",
+    "merge_intervals",
+    "load",
+]

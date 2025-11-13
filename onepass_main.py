@@ -45,7 +45,7 @@ from onepass.ux import (  # 引入命令行交互的工具函数
     prompt_text,  # 自由输入文本
     prompt_yes_no,  # 询问用户是否继续的布尔函数
 )
-from onepass.ui_server import open_browser_later, start_static_server
+from scripts.ui_server import start_ui
 
 
 ROOT_DIR = Path(__file__).resolve().parent  # 计算项目根目录，方便拼接相对路径
@@ -1166,17 +1166,25 @@ def _launch_web_panel() -> None:
     manifest_path = out_dir / "manifest.json"
     if manifest_path.exists():
         query["manifest"] = str(manifest_path)
+    host = "127.0.0.1"
+    port = 5173
+    base_url = f"http://{host}:{port}/"
+    url = f"{base_url}?{urlencode(query)}" if query else base_url
     try:
-        _, base_url = start_static_server(str(web_dir), host="127.0.0.1", port=8765)
-    except OSError as exc:
+        proc = start_ui(out_dir=out_dir, host=host, port=port, open_browser=True, query=query)
+    except Exception as exc:
         print_error(f"启动 Web UI 失败: {exc}")
         return
-    url = base_url
-    if query:
-        url = f"{base_url}?{urlencode(query)}"
     print_success(f"UI 服务已启动: {url}")
-    print_info("浏览器页面将自动打开，可直接使用 app.html。")
-    open_browser_later(url)
+    print_info("浏览器页面已尝试打开，可随时按 Ctrl+C 结束。")
+    print_info("按 Ctrl+C 退出 Web UI，或关闭终端后自动结束。")
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        print_info("收到中断信号，正在关闭 Web UI 服务…")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
 
 def main() -> None:  # CLI 主入口
     _print_banner()  # 展示欢迎信息
@@ -1428,12 +1436,15 @@ def _run_retake_keep_last_menu() -> None:  # 单文件“保留最后一遍”�
     )  # 导出 Audition 标记
     export_edl_json(
         result.edl_keep_segments,
+        result.edl_segment_metadata,
         None,
         edl_path,
         stem=stem,
         samplerate=None,
         channels=None,
         source_samplerate=None,
+        fallback_reason=result.fallback_reason,
+        fallback_used=result.fallback_used,
     )  # 导出 EDL，源音频留空待后续指定
 
     stats = result.stats  # 读取统计信息

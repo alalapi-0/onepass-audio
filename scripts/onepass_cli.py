@@ -23,6 +23,7 @@ if str(ROOT_DIR) not in sys.path:  # 若根目录未在 sys.path 中则插入
     sys.path.insert(0, str(ROOT_DIR))
 
 from match_materials import match_materials, parse_glob_list
+from scripts.ui_server import start_ui
 
 from onepass.asr_loader import load_words  # 载入词级 JSON
 from onepass.batch_utils import (  # 批处理通用工具
@@ -39,7 +40,8 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     render_audio,
     resolve_source_audio,
 )
-from onepass.normalize import collapse_soft_linebreaks, to_align_text
+from onepass.normalize import collapse_soft_linebreaks
+from onepass.segmentation import split_text
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -88,7 +90,7 @@ DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符
 DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
-_UI_THREADS: list[threading.Thread] = []
+_UI_PROCESSES: list[object] = []
 
 
 @dataclass(slots=True)
@@ -187,7 +189,7 @@ def _launch_static_ui(
     """启动静态 Web UI，并在需要时打开浏览器。"""
 
     try:
-        web_dir = _ensure_web_assets()
+        _ensure_web_assets()
     except FileNotFoundError as exc:
         LOGGER.error(str(exc))
         return None, None
@@ -196,19 +198,22 @@ def _launch_static_ui(
         query["stem"] = ",".join(stems)
     if manifest_path and manifest_path.exists():
         query["manifest"] = str(manifest_path)
+    base_url = f"http://{serve_host}:{serve_port}/"
+    url = f"{base_url}?{urlencode(query)}" if query else base_url
     try:
-        thread, base_url = start_static_server(str(web_dir), host=serve_host, port=serve_port)
-    except OSError:
+        proc = start_ui(
+            out_dir=out_dir,
+            host=serve_host,
+            port=serve_port,
+            open_browser=open_browser,
+            query=query,
+        )
+    except Exception:
         LOGGER.exception("自动启动 Web UI 失败")
         return None, None
-    _UI_THREADS.append(thread)
-    url = base_url
-    if query:
-        url = f"{base_url}?{urlencode(query)}"
+    _UI_PROCESSES.append(proc)
     LOGGER.info("UI 服务已启动: %s", url)
-    if open_browser:
-        open_browser_later(url)
-    return thread, url
+    return proc, url
 
 
 def _summarize_context(text: str, width: int = 20) -> str:
@@ -324,6 +329,7 @@ def _process_single_text(
     dry_run: bool,
     collapse_lines: bool,
     emit_align: bool,
+    split_mode: str,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -449,7 +455,8 @@ def _process_single_text(
                 char_map=cmap,
                 preserve_newlines=True,
             )
-            align_payload = to_align_text(align_source)
+            align_lines = split_text(align_source, mode=split_mode)
+            align_payload = "\n".join(align_lines)
             if align_payload:
                 if "\t" in align_payload:
                     raise ValueError("对齐文本包含制表符，请检查规范化结果。")
@@ -494,6 +501,7 @@ def run_prep_norm(
     emit_align: bool,
     *,
     allow_missing_char_map: bool = False,
+    split_mode: str = "all-punct",
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -547,6 +555,7 @@ def run_prep_norm(
             dry_run,
             collapse_lines,
             emit_align,
+            split_mode,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -590,6 +599,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         ]
         + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
         + (["--emit-align"] if args.emit_align else [])
+        + (["--split-mode", args.split_mode] if args.split_mode != "all-punct" else [])
         + (["--dry-run"] if args.dry_run else []),
     )
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
@@ -604,6 +614,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.dry_run,
             args.collapse_lines,
             args.emit_align,
+            split_mode=args.split_mode,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -678,6 +689,7 @@ def _export_retake_outputs(
         )
         edl_result = export_edl_json(
             result.edl_keep_segments,
+            result.edl_segment_metadata,
             source_audio_abs,
             edl_path,
             stem=stem,
@@ -1467,15 +1479,18 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         "kept_count",
         "deleted_count",
         "cut_seconds",
+        "keep_duration",
         "coarse_total",
         "coarse_passed",
         "fine_evaluated",
         "pruned_candidates",
         "search_elapsed_sec",
+        "segment_count",
+        "fallback_used",
         "timeout_fallback",
         "elapsed_sec",
     ]  # 汇总字段
-    float_keys = {"cut_seconds", "search_elapsed_sec", "elapsed_sec"}
+    float_keys = {"cut_seconds", "search_elapsed_sec", "elapsed_sec", "keep_duration"}
     aggregated = {}
     for key in stat_keys:
         if key in float_keys:
@@ -1873,7 +1888,7 @@ def handle_serve_web(args: argparse.Namespace) -> int:
     out_dir = Path(args.out).expanduser().resolve()
     manifest_path = out_dir / "manifest.json"
     stems = []
-    thread, url = _launch_static_ui(
+    proc, url = _launch_static_ui(
         out_dir,
         stems=stems,
         serve_host=args.host,
@@ -1881,13 +1896,16 @@ def handle_serve_web(args: argparse.Namespace) -> int:
         open_browser=args.open_browser,
         manifest_path=manifest_path if manifest_path.exists() else None,
     )
-    if thread is None or url is None:
+    if proc is None or url is None:
         return 1
-    LOGGER.info("按 Ctrl+C 停止服务。")
+    LOGGER.info("按 Ctrl+C 停止服务。日志将打印在子进程中。")
     try:
-        thread.join()
+        proc.wait()
     except KeyboardInterrupt:
-        LOGGER.info("收到中断信号，服务线程将自动结束。")
+        LOGGER.info("收到中断信号，正在停止 Web UI。")
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
     return 0
 
 
@@ -1932,6 +1950,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         collapse_lines=args.collapse_lines,
         emit_align=args.emit_align,
         allow_missing_char_map=True,
+        split_mode=args.split_mode,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -2327,6 +2346,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "--glob-audio",
         args.glob_audio,
     ]
+    if args.split_mode != "all-punct":
+        parts.extend(["--split-mode", args.split_mode])
     if args.audio_root:
         parts.extend(["--audio-root", str(Path(args.audio_root))])
     if not args.prefer_relative_audio:
@@ -2380,6 +2401,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "glob_audio": args.glob_audio,
         "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
+        "split_mode": args.split_mode,
         "render": canonical_render,
         "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
         "prefer_relative_audio": args.prefer_relative_audio,
@@ -2427,7 +2449,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     out_dir = Path(args.output_dir).expanduser().resolve()
     stems_for_ui = success_stems or list(summary.get("stems", []))
     if args.serve or args.open_ui:
-        thread, url = _launch_static_ui(
+        proc, url = _launch_static_ui(
             out_dir,
             stems=stems_for_ui,
             serve_host=serve_host,
@@ -2435,7 +2457,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
             open_browser=bool(args.open_ui or args.open_browser),
             manifest_path=manifest_path if manifest_path and manifest_path.exists() else None,
         )
-        if thread is None or url is None:
+        if proc is None or url is None:
             LOGGER.error("静态 UI 服务启动失败，可稍后通过 serve-web 子命令重试。")
         else:
             LOGGER.info("流水线结束后 UI 服务已在后台运行。")
@@ -2465,6 +2487,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--emit-align",
         action="store_true",
         help="额外生成去标点的 .align.txt 供词级对齐与可视化使用",
+    )
+    prep.add_argument(
+        "--split-mode",
+        choices=["all-punct", "period-only"],
+        default="all-punct",
+        help="对齐文本切句策略 (默认 all-punct)",
     )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
@@ -2774,6 +2802,13 @@ def build_parser() -> argparse.ArgumentParser:
         dest="norm_glob",
         default="*.txt",
         help="规范化阶段的文本匹配模式",
+    )
+    pipeline.add_argument(
+        "--split-mode",
+        dest="split_mode",
+        choices=["all-punct", "period-only"],
+        default="all-punct",
+        help="规范化阶段输出 .align.txt 时的切句策略",
     )
     pipeline.add_argument(
         "--glob-words",

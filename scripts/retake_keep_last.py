@@ -110,12 +110,15 @@ def main(argv: list[str] | None = None) -> int:
     source_audio_name = Path(args.source_audio).name if args.source_audio else None
     export_edl_json(
         result.edl_keep_segments,
+        result.edl_segment_metadata,
         source_audio_name,
         edl_path,
         stem=stem,
         samplerate=args.samplerate,
         channels=args.channels,
         source_samplerate=args.samplerate,
+        fallback_reason=result.fallback_reason,
+        fallback_used=result.fallback_used,
     )
 
     stats = result.stats
