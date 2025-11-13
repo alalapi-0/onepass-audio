@@ -60,12 +60,25 @@ def _scan_with_logging(root: Path, patterns: Iterable[str], category: str) -> li
     return matches
 
 
+def is_canonical_stem(stem: str) -> bool:
+    """Return True when the stem represents a canonical/derivative text."""
+
+    lowered = stem.lower().strip()
+    if not lowered:
+        return False
+    if lowered.endswith(".canonical"):
+        return True
+    return ".canonical." in lowered
+
+
 def match_materials(
     materials_root: Path,
     norm_root: Path,
     text_patterns: Iterable[str],
     glob_words: str,
     glob_audio: str,
+    *,
+    include_canonical_kits: bool = False,
 ) -> list[MaterialKit]:
     """Collect all available resources and group them by stem."""
 
@@ -77,6 +90,9 @@ def match_materials(
     word_patterns = parse_glob_list(glob_words)
     for path in _scan_with_logging(materials_root, word_patterns, "words"):
         stem = stem_from_words_json(path)
+        if not include_canonical_kits and is_canonical_stem(stem):
+            LOGGER.info("[skip][words] canonical stem=%s path=%s", stem, path)
+            continue
         key = stem.lower()
         kit = kits.setdefault(key, MaterialKit(stem=stem))
         kit.words = path.resolve()
@@ -104,6 +120,9 @@ def match_materials(
                 stem = name[: -len(".txt")]
             else:
                 continue
+            if not include_canonical_kits and is_canonical_stem(stem):
+                LOGGER.info("[skip][%s] canonical stem=%s path=%s", variant, stem, resolved)
+                continue
             key = stem.lower()
             kit = kits.setdefault(key, MaterialKit(stem=stem))
             if variant == "align" and kit.align is None:
@@ -117,6 +136,9 @@ def match_materials(
     audio_patterns = parse_glob_list(glob_audio)
     for path in _scan_with_logging(materials_root, audio_patterns, "audio"):
         stem = path.stem
+        if not include_canonical_kits and is_canonical_stem(stem):
+            LOGGER.info("[skip][audio] canonical stem=%s path=%s", stem, path)
+            continue
         key = stem.lower()
         kit = kits.setdefault(key, MaterialKit(stem=stem))
         kit.audio = kit.audio or path.resolve()
@@ -124,4 +146,4 @@ def match_materials(
     return [kits[key] for key in sorted(kits)]
 
 
-__all__ = ["MaterialKit", "match_materials", "parse_glob_list"]
+__all__ = ["MaterialKit", "is_canonical_stem", "match_materials", "parse_glob_list"]

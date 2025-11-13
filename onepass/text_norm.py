@@ -191,6 +191,7 @@ _ASCII_TO_CJK_PUNCT = {
 }
 
 
+
 def load_alias_map(path: Path | str | None) -> dict[str, list[str]]:
     """加载词别名映射 JSON，失败时返回空映射。"""
 
@@ -372,7 +373,106 @@ def merge_hard_wraps(raw: str) -> str:
     return result
 
 
-def normalize_chinese_text(text: str, *, collapse_lines: bool = True) -> str:
+def _is_cjk_char(ch: str) -> bool:
+    if not ch:
+        return False
+    code = ord(ch)
+    return (
+        0x3400 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+        or 0x20000 <= code <= 0x2FFFF
+    )
+
+
+def _drop_ascii_parentheticals(value: str, threshold: float = 0.7) -> str:
+    if not value:
+        return value
+    openers = {"(": ")", "（": "）"}
+    closers = {
+        ")": "(",
+        "）": "（",
+    }
+    stack: list[tuple[str, int]] = []
+    spans: list[tuple[int, int]] = []
+    for idx, ch in enumerate(value):
+        if ch in openers:
+            stack.append((ch, idx))
+            continue
+        match_open = closers.get(ch)
+        if not match_open:
+            continue
+        for pos in range(len(stack) - 1, -1, -1):
+            open_ch, start = stack[pos]
+            if open_ch != match_open:
+                continue
+            content = value[start + 1 : idx]
+            stack = stack[:pos]
+            payload = "".join(ch for ch in content if not ch.isspace())
+            if not payload:
+                break
+            ascii_count = sum(1 for char in payload if ord(char) < 128)
+            ratio = ascii_count / len(payload) if payload else 0.0
+            if ratio >= threshold:
+                spans.append((start, idx + 1))
+            break
+    if not spans:
+        return value
+    spans.sort()
+    cleaned: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start < cursor:
+            continue
+        cleaned.append(value[cursor:start])
+        cursor = end
+    cleaned.append(value[cursor:])
+    return "".join(cleaned)
+
+
+def _strip_mixed_english_tail(line: str) -> str:
+    if not line:
+        return line
+    stripped = line.rstrip()
+    if not stripped:
+        return stripped
+    idx = len(stripped)
+    while idx > 0 and ord(stripped[idx - 1]) < 128:
+        if stripped[idx - 1] == "\n":
+            break
+        idx -= 1
+    if idx == len(stripped):
+        return stripped
+    tail = stripped[idx:]
+    if not tail or not any(char.isalnum() and ord(char) < 128 for char in tail):
+        return stripped
+    if any(_is_cjk_char(ch) for ch in tail):
+        return stripped
+    prev_char: str | None = None
+    for ch in reversed(stripped[:idx]):
+        if ch.isspace():
+            continue
+        prev_char = ch
+        break
+    if not prev_char or not _is_cjk_char(prev_char):
+        return stripped
+    return stripped[:idx].rstrip()
+
+
+def _squash_mixed_english_tails(text: str) -> str:
+    if not text:
+        return text
+    lines = text.split("\n")
+    adjusted = [_strip_mixed_english_tail(line) for line in lines]
+    return "\n".join(adjusted)
+
+
+def normalize_chinese_text(
+    text: str,
+    *,
+    collapse_lines: bool = True,
+    drop_ascii_parens: bool = False,
+    squash_mixed_english: bool = False,
+) -> str:
     """针对中文文本执行空白与标点修正，支持可选折叠换行。"""
 
     if not text:
@@ -403,6 +503,10 @@ def normalize_chinese_text(text: str, *, collapse_lines: bool = True) -> str:
     normalized = _RE_ELLIPSIS_SPACES.sub("……", normalized)
     normalized = _RE_LATIN_GAPS_LEFT.sub(r"\1 \2", normalized)
     normalized = _RE_LATIN_GAPS_RIGHT.sub(r"\1 \2", normalized)
+    if drop_ascii_parens:
+        normalized = _drop_ascii_parentheticals(normalized)
+    if squash_mixed_english:
+        normalized = _squash_mixed_english_tails(normalized)
     normalized = _RE_MULTISPACE.sub(" ", normalized)
 
     if collapse_lines:
