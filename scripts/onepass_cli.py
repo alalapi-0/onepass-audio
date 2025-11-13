@@ -48,7 +48,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
 from onepass.normalize import collapse_soft_linebreaks
 from onepass.zh_segmenter import Segment as ZhSegment
 from onepass.zh_segmenter import segment as segment_text
-from onepass.text_split import smart_split
+from onepass.text_split import DEFAULT_HARD_PUNCT, DEFAULT_SOFT_PUNCT, smart_split
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -400,10 +400,21 @@ def _process_single_text(
     debug_align: bool = False,
     drop_ascii_parens: bool,
     squash_mixed_english: bool,
+    hard_punct: str | Sequence[str] | None,
+    soft_punct: str | Sequence[str] | None,
+    punct_attach: str,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
     LOGGER.debug("Normalize %s", path)  # 调试输出当前文件
+
+    def _fmt_punct(value: str | Sequence[str] | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return "".join(str(item) for item in value if item)
+
     raw_text = ""
     try:
         raw_text = path.read_text(encoding="utf-8-sig")  # 按 UTF-8-sig 读取原文
@@ -549,6 +560,9 @@ def _process_single_text(
                         min_len=align_min_len,
                         max_len=align_max_len,
                         hard_max=align_hard_max,
+                        hard_punct=hard_punct,
+                        soft_punct=soft_punct,
+                        punct_attach=punct_attach,
                         return_debug=True,
                     )
                 else:
@@ -557,6 +571,9 @@ def _process_single_text(
                         min_len=align_min_len,
                         max_len=align_max_len,
                         hard_max=align_hard_max,
+                        hard_punct=hard_punct,
+                        soft_punct=soft_punct,
+                        punct_attach=punct_attach,
                     )
             else:
                 align_segments: list[ZhSegment] = segment_text(
@@ -578,6 +595,9 @@ def _process_single_text(
                             min_len=8,
                             max_len=20,
                             hard_max=28,
+                            hard_punct=hard_punct,
+                            soft_punct=soft_punct,
+                            punct_attach=punct_attach,
                             return_debug=True,
                         )
                     else:
@@ -586,6 +606,9 @@ def _process_single_text(
                             min_len=8,
                             max_len=20,
                             hard_max=28,
+                            hard_punct=hard_punct,
+                            soft_punct=soft_punct,
+                            punct_attach=punct_attach,
                         )
                         guard_debug = None
                     effective_split_mode = "punct+len"
@@ -605,6 +628,15 @@ def _process_single_text(
                             (segment.text, len(segment.text), "ZH_SEGMENTER")
                             for segment in align_segments
                         ]
+            if split_mode == "punct+len" and align_lines:
+                LOGGER.info(
+                    "[split] hard=%s soft=%s attach=%s max_len=%s -> lines=%s",
+                    _fmt_punct(hard_punct) or DEFAULT_HARD_PUNCT,
+                    _fmt_punct(soft_punct) or DEFAULT_SOFT_PUNCT,
+                    (punct_attach or "left"),
+                    align_max_len,
+                    len(align_lines),
+                )
             align_payload = "\n".join(align_lines)
             if align_payload:
                 if "\t" in align_payload:
@@ -727,7 +759,7 @@ def _write_timeline_debug(path: Path, rows: Sequence[dict[str, object]]) -> None
 
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write(
-            "idx\tmatch_t0\tmatch_t1\tsnap_t0\tsnap_t1\tsnapped\tdur\tkept\tdrop_reason\tmono_mode\n"
+            "idx\tmatch_t0\tmatch_t1\tsnap_t0\tsnap_t1\tsnapped\tdur\tkept\tdrop_reason\tmono_mode\tdp_in_best\tdp_drop_reason\n"
         )
         for row in rows:
             match_t0 = float(row.get("match_t0", 0.0) or 0.0)
@@ -737,10 +769,36 @@ def _write_timeline_debug(path: Path, rows: Sequence[dict[str, object]]) -> None
             duration = max(0.0, snap_t1 - snap_t0)
             kept = int(1 if row.get("kept") else 0)
             drop_reason = str(row.get("drop_reason", "-") or "-")
+            dp_best = int(1 if row.get("dp_in_best") else 0)
+            dp_reason = str(row.get("dp_drop_reason", "-") or "-")
             handle.write(
                 f"{int(row.get('idx', 0))}\t{match_t0:.3f}\t{match_t1:.3f}\t{snap_t0:.3f}\t{snap_t1:.3f}\t"
                 f"{row.get('snapped', 'no-snap')}\t{duration:.3f}\t{kept}\t{drop_reason}\t"
-                f"{row.get('mono_mode', '')}\n"
+                f"{row.get('mono_mode', '')}\t{dp_best}\t{dp_reason}\n"
+            )
+
+
+def _write_repeat_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            "line_idx\tline_key\tcand_rank\tt0\tt1\tscore\tis_last\tin_best\tdrop_reason\n"
+        )
+        for row in rows:
+            handle.write(
+                f"{int(row.get('line_idx', 0))}\t{row.get('line_key', '')}\t{int(row.get('cand_rank', 0))}\t"
+                f"{float(row.get('t0', 0.0)):.3f}\t{float(row.get('t1', 0.0)):.3f}\t{float(row.get('score', 0.0)):.3f}\t"
+                f"{int(1 if row.get('is_last') else 0)}\t{int(1 if row.get('in_best') else 0)}\t{row.get('drop_reason', '-') or '-'}\n"
+            )
+
+
+def _write_dp_path_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("order\tline_idx\tt0\tt1\tvalue\tlate_bonus\tpenalties\n")
+        for row in rows:
+            handle.write(
+                f"{int(row.get('order', 0))}\t{int(row.get('line_idx', 0))}\t{float(row.get('t0', 0.0)):.3f}\t"
+                f"{float(row.get('t1', 0.0)):.3f}\t{float(row.get('value', 0.0)):.3f}\t"
+                f"{float(row.get('late_bonus', 0.0)):.3f}\t{row.get('penalties', '-') or '-'}\n"
             )
 
 
@@ -766,6 +824,9 @@ def run_prep_norm(
     debug_align: bool = False,
     drop_ascii_parens: bool = True,
     squash_mixed_english: bool = True,
+    hard_punct: str | Sequence[str] | None = DEFAULT_HARD_PUNCT,
+    soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
+    punct_attach: str = "left",
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -834,6 +895,9 @@ def run_prep_norm(
             debug_align=debug_align,
             drop_ascii_parens=drop_ascii_parens,
             squash_mixed_english=squash_mixed_english,
+            hard_punct=hard_punct,
+            soft_punct=soft_punct,
+            punct_attach=punct_attach,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -882,6 +946,9 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         + (["--min-len", str(args.min_len)] if args.min_len != DEFAULT_ALIGN_MIN_LEN else [])
         + (["--max-len", str(args.max_len)] if args.max_len != DEFAULT_ALIGN_MAX_LEN else [])
         + (["--hard-max", str(args.hard_max)] if args.hard_max != DEFAULT_ALIGN_HARD_MAX else [])
+        + (["--hard-punct", args.hard_punct] if args.hard_punct != DEFAULT_HARD_PUNCT else [])
+        + (["--soft-punct", args.soft_punct] if args.soft_punct != DEFAULT_SOFT_PUNCT else [])
+        + (["--punct-attach", args.punct_attach] if args.punct_attach != "left" else [])
         + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
         + (["--no-keep-quotes"] if not args.keep_quotes else [])
         + (["--no-drop-ascii-parens"] if not args.drop_ascii_parens else [])
@@ -911,6 +978,9 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             debug_align=args.debug_align,
             drop_ascii_parens=args.drop_ascii_parens,
             squash_mixed_english=args.squash_mixed_english,
+            hard_punct=args.hard_punct,
+            soft_punct=args.soft_punct,
+            punct_attach=args.punct_attach,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -1059,6 +1129,14 @@ def _process_retake_item(
     overcut_threshold: float,
     no_interaction: bool,
     debug_csv: Path | None,
+    dedupe_policy: str,
+    line_eq: str,
+    line_dist_max: float,
+    dedupe_window: float,
+    dp_bonus_late: float,
+    dp_penalty_pre: float,
+    dp_penalty_gap: float,
+    dp_epsilon: float,
 ) -> Tuple[str, dict]:
     """处理单个词级 JSON + 文本的组合。"""
 
@@ -1167,6 +1245,14 @@ def _process_retake_item(
                 snap_min_duration=min_seg_dur,
                 monotonic_mode=monotonic_mode,
                 monotonic_epsilon=0.02,
+                dedupe_policy=dedupe_policy,
+                line_eq=line_eq,
+                line_dist_max=line_dist_max,
+                dedupe_window=dedupe_window,
+                dp_bonus_late=dp_bonus_late,
+                dp_penalty_pre=dp_penalty_pre,
+                dp_penalty_gap=dp_penalty_gap,
+                dp_epsilon=dp_epsilon,
             )
 
         def _load_context_preview() -> str:
@@ -1217,6 +1303,20 @@ def _process_retake_item(
                 stats["timeline_debug_path"] = str(timeline_path)
             except OSError as exc:
                 LOGGER.warning("写入 timeline 调试文件失败: %s", exc)
+        if match_debug and isinstance(getattr(result, "repeat_debug_rows", None), list):
+            repeat_path = out_dir / f"{stem}.keepLast.repeat.tsv"
+            try:
+                _write_repeat_debug(repeat_path, result.repeat_debug_rows or [])
+                stats["repeat_debug_path"] = str(repeat_path)
+            except OSError as exc:
+                LOGGER.warning("写入 repeat 调试文件失败: %s", exc)
+        if match_debug and isinstance(getattr(result, "dp_path_rows", None), list):
+            path_path = out_dir / f"{stem}.keepLast.path.tsv"
+            try:
+                _write_dp_path_debug(path_path, result.dp_path_rows or [])
+                stats["dp_path_debug_path"] = str(path_path)
+            except OSError as exc:
+                LOGGER.warning("写入 DP 路径调试文件失败: %s", exc)
         if not sentence_strict:
             snap_total = int(stats.get("snap_total", 0))
             snap_hits = int(stats.get("snap_hits", 0))
@@ -1552,15 +1652,23 @@ def _run_retake_batch(
                         silence_noise_db=silence_noise_db,
                         silence_min_d=silence_min_d,
                         snap_silence=snap_silence,
-                        snap_radius=snap_radius,
-                        min_seg_dur=min_seg_dur,
-                        monotonic_mode=monotonic_mode,
-                        overcut_guard=overcut_guard,
-                        overcut_mode=overcut_mode,
-                        overcut_threshold=overcut_threshold,
-                        no_interaction=no_interaction,
-                        debug_csv=debug_csv,
-                    )
+            snap_radius=snap_radius,
+            min_seg_dur=min_seg_dur,
+            monotonic_mode=monotonic_mode,
+            overcut_guard=overcut_guard,
+            overcut_mode=overcut_mode,
+            overcut_threshold=overcut_threshold,
+            no_interaction=no_interaction,
+            debug_csv=debug_csv,
+            dedupe_policy=dedupe_policy,
+            line_eq=line_eq,
+            line_dist_max=line_dist_max,
+            dedupe_window=dedupe_window,
+            dp_bonus_late=dp_bonus_late,
+            dp_penalty_pre=dp_penalty_pre,
+            dp_penalty_gap=dp_penalty_gap,
+            dp_epsilon=dp_epsilon,
+        )
                 )  # 提交任务
             for future in as_completed(futures):  # 收集结果
                 _, item = future.result()
@@ -1699,6 +1807,14 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     min_anchor_ngram = int(args.min_anchor_ngram)
     fallback_policy = args.fallback_policy
     match_preset = getattr(args, "match_preset", None)
+    dedupe_policy = str(getattr(args, "dedupe_policy", "dp") or "dp")
+    line_eq = str(getattr(args, "line_eq", "char") or "char")
+    line_dist_max = float(getattr(args, "line_dist_max", 0.15))
+    dedupe_window = float(getattr(args, "dedupe_window", 12.0))
+    dp_bonus_late = float(getattr(args, "dp_bonus_late", 1.0))
+    dp_penalty_pre = float(getattr(args, "dp_penalty_pre", -0.8))
+    dp_penalty_gap = float(getattr(args, "dp_penalty_gap", -0.2))
+    dp_epsilon = float(getattr(args, "dp_epsilon", 0.02))
     (
         max_distance_ratio,
         min_anchor_ngram,
@@ -1789,6 +1905,14 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
             overcut_threshold=overcut_threshold,
             no_interaction=no_interaction,
             debug_csv=debug_csv,
+            dedupe_policy=dedupe_policy,
+            line_eq=line_eq,
+            line_dist_max=line_dist_max,
+            dedupe_window=dedupe_window,
+            dp_bonus_late=dp_bonus_late,
+            dp_penalty_pre=dp_penalty_pre,
+            dp_penalty_gap=dp_penalty_gap,
+            dp_epsilon=dp_epsilon,
         )
         items = [item]
         failed = 0 if item["status"] == "ok" else 1
@@ -1985,6 +2109,22 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--channels", str(args.channels)])
     if args.min_sent_chars != MIN_SENT_CHARS:
         parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
+    if args.dedupe_policy != "dp":
+        parts.extend(["--dedupe-policy", args.dedupe_policy])
+    if args.line_eq != "char":
+        parts.extend(["--line-eq", args.line_eq])
+    if float(args.line_dist_max) != 0.15:
+        parts.extend(["--line-dist-max", str(args.line_dist_max)])
+    if float(args.dedupe_window) != 12.0:
+        parts.extend(["--dedupe-window", str(args.dedupe_window)])
+    if float(args.dp_bonus_late) != 1.0:
+        parts.extend(["--dp-bonus-late", str(args.dp_bonus_late)])
+    if float(args.dp_penalty_pre) != -0.8:
+        parts.extend(["--dp-penalty-pre", str(args.dp_penalty_pre)])
+    if float(args.dp_penalty_gap) != -0.2:
+        parts.extend(["--dp-penalty-gap", str(args.dp_penalty_gap)])
+    if float(args.dp_epsilon) != 0.02:
+        parts.extend(["--dp-epsilon", str(args.dp_epsilon)])
     if args.max_dup_gap_sec is not None:
         parts.extend(["--max-dup-gap-sec", str(args.max_dup_gap_sec)])
     if float(args.max_window_sec) != float(MAX_WINDOW_SEC):
@@ -2047,6 +2187,22 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.extend(["--fallback-policy", args.fallback_policy])
     if args.match_preset:
         parts.extend(["--match-preset", args.match_preset])
+    if args.dedupe_policy != "dp":
+        parts.extend(["--dedupe-policy", args.dedupe_policy])
+    if args.line_eq != "char":
+        parts.extend(["--line-eq", args.line_eq])
+    if float(args.line_dist_max) != 0.15:
+        parts.extend(["--line-dist-max", str(args.line_dist_max)])
+    if float(args.dedupe_window) != 12.0:
+        parts.extend(["--dedupe-window", str(args.dedupe_window)])
+    if float(args.dp_bonus_late) != 1.0:
+        parts.extend(["--dp-bonus-late", str(args.dp_bonus_late)])
+    if float(args.dp_penalty_pre) != -0.8:
+        parts.extend(["--dp-penalty-pre", str(args.dp_penalty_pre)])
+    if float(args.dp_penalty_gap) != -0.2:
+        parts.extend(["--dp-penalty-gap", str(args.dp_penalty_gap)])
+    if float(args.dp_epsilon) != 0.02:
+        parts.extend(["--dp-epsilon", str(args.dp_epsilon)])
     LOGGER.info("开始保留最后一遍任务: 输入=%s 文本=%s 输出=%s", args.words_json or args.materials, args.text, args.out)
     LOGGER.info("等价命令: %s", _build_cli_example("retake-keep-last", parts))
 
@@ -2407,6 +2563,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     align_hard_max = int(getattr(args, "hard_max", DEFAULT_ALIGN_HARD_MAX))
     align_weak = bool(getattr(args, "weak_punct_enable", True))
     align_keep = bool(getattr(args, "keep_quotes", True))
+    hard_punct = getattr(args, "hard_punct", DEFAULT_HARD_PUNCT)
+    soft_punct = getattr(args, "soft_punct", DEFAULT_SOFT_PUNCT)
+    punct_attach = getattr(args, "punct_attach", "left")
     LOGGER.info(_safe_text(f"开始规范化文本 → {norm_out_dir}"))
     norm_result = run_prep_norm(
         input_dir,
@@ -2429,6 +2588,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         debug_align=bool(getattr(args, "debug_align", False)),
         drop_ascii_parens=drop_ascii_parens,
         squash_mixed_english=squash_mixed_english,
+        hard_punct=hard_punct,
+        soft_punct=soft_punct,
+        punct_attach=punct_attach,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -2583,6 +2745,14 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             overcut_threshold=0.60,
             no_interaction=args.no_interaction,
             debug_csv=None,
+            dedupe_policy=dedupe_policy,
+            line_eq=line_eq,
+            line_dist_max=line_dist_max,
+            dedupe_window=dedupe_window,
+            dp_bonus_late=dp_bonus_late,
+            dp_penalty_pre=dp_penalty_pre,
+            dp_penalty_gap=dp_penalty_gap,
+            dp_epsilon=dp_epsilon,
         )
         retake_items.append(item)
         if item.get("status") != "ok":
@@ -2854,6 +3024,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--max-len", str(args.max_len)])
     if args.hard_max != DEFAULT_ALIGN_HARD_MAX:
         parts.extend(["--hard-max", str(args.hard_max)])
+    if args.hard_punct != DEFAULT_HARD_PUNCT:
+        parts.extend(["--hard-punct", args.hard_punct])
+    if args.soft_punct != DEFAULT_SOFT_PUNCT:
+        parts.extend(["--soft-punct", args.soft_punct])
+    if args.punct_attach != "left":
+        parts.extend(["--punct-attach", args.punct_attach])
     if not args.weak_punct_enable:
         parts.append("--no-weak-punct-enable")
     if not args.keep_quotes:
@@ -3037,6 +3213,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"punct+len 模式首轮长度上限（默认 {DEFAULT_ALIGN_MAX_LEN}）",
     )
     prep.add_argument(
+        "--max-chunk-len",
+        dest="max_len",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="punct+len 模式软切上限（同 --max-len，默认 24）",
+    )
+    prep.add_argument(
         "--hard-max",
         type=int,
         default=DEFAULT_ALIGN_HARD_MAX,
@@ -3081,6 +3264,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=22,
         help="单条子句的最大字符数，超出后会在弱标点或连接词处分裂（默认 22）",
+    )
+    prep.add_argument(
+        "--hard-punct",
+        default=DEFAULT_HARD_PUNCT,
+        help="punct+len 模式的硬切标点集合（默认包含 。！？!?．.;；）",
+    )
+    prep.add_argument(
+        "--soft-punct",
+        default=DEFAULT_SOFT_PUNCT,
+        help="punct+len 模式的软切标点集合（默认包含 ，、,:：；;……—）",
+    )
+    prep.add_argument(
+        "--punct-attach",
+        choices=["left", "right"],
+        default="left",
+        help="硬标点归属（left=句末，right=下一句开头，默认 left）",
     )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
@@ -3159,6 +3358,54 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=MIN_SENT_CHARS,
         help=f"重复去重的句长下限（默认 {MIN_SENT_CHARS}）",
+    )
+    retake.add_argument(
+        "--dedupe-policy",
+        choices=["off", "last", "dp"],
+        default="dp",
+        help="重复检测策略（off=关闭，last=仅取最后一次，dp=动态规划，默认 dp）",
+    )
+    retake.add_argument(
+        "--line-eq",
+        choices=["char", "pinyin"],
+        default="char",
+        help="判定同一句的文本等价策略（char=字符，pinyin=同音，默认 char）",
+    )
+    retake.add_argument(
+        "--line-dist-max",
+        type=float,
+        default=0.15,
+        help="视为同一句的最大归一化编辑距离（默认 0.15）",
+    )
+    retake.add_argument(
+        "--dedupe-window",
+        type=float,
+        default=12.0,
+        help="聚合重复候选的时间窗口，秒（默认 12.0）",
+    )
+    retake.add_argument(
+        "--dp-bonus-late",
+        type=float,
+        default=1.0,
+        help="DP 选择后一次命中的奖励权重（默认 1.0）",
+    )
+    retake.add_argument(
+        "--dp-penalty-pre",
+        type=float,
+        default=-0.8,
+        help="选中非最后一遍时的惩罚（默认 -0.8）",
+    )
+    retake.add_argument(
+        "--dp-penalty-gap",
+        type=float,
+        default=-0.2,
+        help="时间回跳或间隔异常时的惩罚（默认 -0.2）",
+    )
+    retake.add_argument(
+        "--dp-epsilon",
+        type=float,
+        default=0.02,
+        help="DP 时间单调容差，秒（默认 0.02）",
     )
     retake.add_argument(
         "--max-dup-gap-sec",
@@ -3489,6 +3736,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"punct+len 模式首轮长度上限（默认 {DEFAULT_ALIGN_MAX_LEN}）",
     )
     pipeline.add_argument(
+        "--max-chunk-len",
+        dest="max_len",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="punct+len 模式软切上限（同 --max-len，默认 24）",
+    )
+    pipeline.add_argument(
         "--hard-max",
         type=int,
         default=DEFAULT_ALIGN_HARD_MAX,
@@ -3533,6 +3787,70 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=22,
         help="单条子句最大字符数（默认 22）",
+    )
+    pipeline.add_argument(
+        "--dedupe-policy",
+        choices=["off", "last", "dp"],
+        default="dp",
+        help="重复检测策略（默认 dp）",
+    )
+    pipeline.add_argument(
+        "--line-eq",
+        choices=["char", "pinyin"],
+        default="char",
+        help="判定同一句的等价策略（默认 char）",
+    )
+    pipeline.add_argument(
+        "--line-dist-max",
+        type=float,
+        default=0.15,
+        help="视为同一句的最大归一化编辑距离（默认 0.15）",
+    )
+    pipeline.add_argument(
+        "--dedupe-window",
+        type=float,
+        default=12.0,
+        help="聚合重复候选的时间窗口，秒（默认 12.0）",
+    )
+    pipeline.add_argument(
+        "--dp-bonus-late",
+        type=float,
+        default=1.0,
+        help="DP 选择后一次命中的奖励权重（默认 1.0）",
+    )
+    pipeline.add_argument(
+        "--dp-penalty-pre",
+        type=float,
+        default=-0.8,
+        help="选中非最后一遍时的惩罚（默认 -0.8）",
+    )
+    pipeline.add_argument(
+        "--dp-penalty-gap",
+        type=float,
+        default=-0.2,
+        help="时间回跳或间隔异常的惩罚（默认 -0.2）",
+    )
+    pipeline.add_argument(
+        "--dp-epsilon",
+        type=float,
+        default=0.02,
+        help="DP 时间单调容差，秒（默认 0.02）",
+    )
+    pipeline.add_argument(
+        "--hard-punct",
+        default=DEFAULT_HARD_PUNCT,
+        help="punct+len 模式硬切标点集合（默认包含 。！？!?．.;；）",
+    )
+    pipeline.add_argument(
+        "--soft-punct",
+        default=DEFAULT_SOFT_PUNCT,
+        help="punct+len 模式软切标点集合（默认包含 ，、,:：；;……—）",
+    )
+    pipeline.add_argument(
+        "--punct-attach",
+        choices=["left", "right"],
+        default="left",
+        help="硬标点归属（left=句末，right=下一句开头，默认 left）",
     )
     pipeline.add_argument(
         "--glob-words",
