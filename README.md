@@ -164,6 +164,23 @@ pip install opencc
 4. **音频渲染 (`render-audio`)**：`_run_render_audio()` 读取 EDL、通过 `resolve_source_audio()` 定位素材、调用 `render_audio()` 执行 `ffmpeg concat`，生成 `.clean.wav`。 【F:scripts/onepass_cli.py†L520-L720】【F:onepass/edl_renderer.py†L1-L200】
 5. **批处理 (`all-in-one`)**：`_run_all_in_one()` 依次执行规范化、保留最后一遍与（可选）音频渲染，自动写入 `batch_report.json`。命令执行完毕后会输出统计摘要与对应 CLI 示例，便于复现。 【F:scripts/onepass_cli.py†L720-L960】
 
+#### 中文分句模式与验收
+
+- **三种模式**：`--split-mode punct` 仅依赖 `。！？；…` 等强标点；`--split-mode all-punct` 会在强标点之外追加 `，、：—` 等弱断点；`--split-mode punct+len`（默认）先按强标点分句，再根据 `--min-len/--max-len/--hard-max` 自动在弱标点、空白或逗号处分块，并将过短片段与邻句合并。
+- **调参与护栏**：`--min-len` 控制短句合并阈值，`--max-len` 决定二次切分的软上限，`--hard-max` 则在超长句子中强制寻找空白/逗号断开；`--weak-punct-enable/--no-weak-punct-enable` 用于全局开关弱断点，`--keep-quotes/--no-keep-quotes` 用于指定括号/引号内部是否跳过弱断点。若 `.align.txt` 仍只有 1 行，流水线会自动切回 `punct+len` 并应用 `min_len=8/max_len=20/hard_max=28` 再跑一遍，同时在 `batch_report.json` 中记录 `align_guard_triggered/align_guard_failed` 以及最终使用的分句参数。
+- **调试文件**：生成 `.align.txt` 时会同步写出 `.align.debug.tsv`，包含 `idx/start_char/end_char/text_preview` 四列，可快速定位句段与字符区间。
+- **统计与验收**：`batch_report.json` 的 `prep_norm.items[]` 现会附带 `align_total_lines/split_mode/min_len/max_len/hard_max/weak_punct_enable` 等字段。R2 需要至少 100 行且使用 `punct+len`，可运行 `python scripts/check_r2_alignment.py out/batch_report.json` 自动列出 PASS/FAIL 并附上 `.align.txt` 与 `.align.debug.tsv` 前 5 行。
+
+常用示例：
+
+```bash
+python scripts/onepass_cli.py prep-norm \
+  --in materials/example \
+  --out out/norm \
+  --emit-align --split-mode punct+len --min-len 8 --max-len 24 --hard-max 32 \
+  --weak-punct-enable --keep-quotes
+```
+
 ### Web 可视化面板
 
 1. **本地服务**：`scripts/web_panel_server.py` 提供 `/api/list`、`/api/file`、`/api/save_edl`、`/api/save_markers_csv` 等接口；内部通过 `_build_list_payload()` 列举 `out/` 目录成果，保存文件时校验路径防止越权。 【F:scripts/web_panel_server.py†L1-L200】【F:scripts/web_panel_server.py†L200-L360】
