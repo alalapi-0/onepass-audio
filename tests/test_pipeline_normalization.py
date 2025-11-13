@@ -14,10 +14,18 @@ import argparse
 import json
 import re
 
+from onepass.alignment.canonical import CanonicalRules, concat_and_index
 from onepass.asr_loader import Word
 from onepass.retake_keep_last import compute_retake_keep_last
 from onepass.text_norm import collapse_and_resplit
 from scripts.onepass_cli import DEFAULT_CHAR_MAP, run_all_in_one, run_prep_norm
+
+
+def _default_canonical_rules() -> CanonicalRules:
+    payload = json.loads(DEFAULT_CHAR_MAP.read_text(encoding="utf-8"))
+    mapping = payload.get("map", {}) if isinstance(payload, dict) else {}
+    mapping = {str(key): str(value) for key, value in mapping.items()}
+    return CanonicalRules(char_map=mapping)
 
 
 def _allowed_boundary_chars() -> set[str]:
@@ -54,8 +62,10 @@ def test_norm_outputs_are_sentence_lines(tmp_path: Path) -> None:
     )
     norm_path = out_dir / "001序言01.norm.txt"
     align_path = out_dir / "001序言01.align.txt"
+    canonical_path = out_dir / "001序言01.canonical.txt"
     norm_text = norm_path.read_text(encoding="utf-8")
     align_text = align_path.read_text(encoding="utf-8")
+    canonical_text = canonical_path.read_text(encoding="utf-8")
     assert norm_text.strip(), "normalized text should not be empty"
     assert "\r" not in norm_text
     assert "\t" not in norm_text
@@ -68,6 +78,15 @@ def test_norm_outputs_are_sentence_lines(tmp_path: Path) -> None:
         assert line == line.strip(), "align sentence should not have surrounding spaces"
         assert "\t" not in line
     _assert_sentence_lines(align_text, enforce_boundary=False)
+    rules = _default_canonical_rules()
+    expected_canonical, _, line_spans = concat_and_index(align_lines, rules)
+    assert canonical_text == expected_canonical, "canonical text should match normalized align lines"
+    assert len(line_spans) == len(align_lines)
+    prev_end = 0
+    for start, end in line_spans:
+        assert start <= end
+        assert start >= prev_end
+        prev_end = end
 
 
 def test_all_in_one_without_audio_reports_records(tmp_path: Path) -> None:

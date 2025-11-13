@@ -26,6 +26,10 @@ from match_materials import match_materials, parse_glob_list
 from scripts.ui_server import start_ui
 
 from onepass.asr_loader import load_words  # 载入词级 JSON
+from onepass.alignment.canonical import (
+    CanonicalRules,
+    concat_and_index,
+)
 from onepass.batch_utils import (  # 批处理通用工具
     find_text_for_stem,
     iter_files,
@@ -320,6 +324,35 @@ def _ensure_out_dir(out_dir: Path) -> Path:
     return resolved
 
 
+def _load_canonical_rules(char_map_path: Path) -> CanonicalRules:
+    """Load canonical normalization rules from ``char_map_path``."""
+
+    mapping: dict[str, str] = {}
+    try:
+        content = char_map_path.read_text(encoding="utf-8")
+        payload = json.loads(content)
+    except (OSError, json.JSONDecodeError) as exc:
+        LOGGER.warning("WARNING: char_map load failed: %s ; use empty map {}", exc)
+        return CanonicalRules(char_map=mapping)
+    if isinstance(payload, dict):
+        source = payload.get("map") if isinstance(payload.get("map"), dict) else payload
+        if isinstance(source, dict):
+            for key, value in source.items():
+                if not isinstance(key, str):
+                    key = str(key)
+                if isinstance(value, str):
+                    mapping[key] = value
+                else:
+                    mapping[key] = str(value)
+    else:
+        LOGGER.warning(
+            "WARNING: char_map load failed: unexpected payload type %s ; use empty map {}",
+            type(payload).__name__,
+        )
+        mapping = {}
+    return CanonicalRules(char_map=mapping)
+
+
 def _process_single_text(
     path: Path,
     base_dir: Path,
@@ -330,6 +363,7 @@ def _process_single_text(
     collapse_lines: bool,
     emit_align: bool,
     split_mode: str,
+    canonical_rules: CanonicalRules | None,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -418,6 +452,8 @@ def _process_single_text(
 
     align_written = False
     align_path: Path | None = None
+    align_lines: list[str] | None = None
+    canonical_path: Path | None = None
 
     if not dry_run:
         out_path.parent.mkdir(parents=True, exist_ok=True)  # 创建输出目录
@@ -471,6 +507,25 @@ def _process_single_text(
             except OSError as exc:
                 LOGGER.warning("写入对齐文本失败: %s", exc)
 
+            if align_written and canonical_rules and align_lines is not None:
+                canonical_path = out_dir / relative.parent / f"{relative.stem}.canonical.txt"
+                canonical_text, index_map, line_spans = concat_and_index(align_lines, canonical_rules)
+                canonical_len = len(canonical_text)
+                LOGGER.info(
+                    "[canonical] stem=%s canonical_len=%s first50=%s",
+                    relative.stem,
+                    canonical_len,
+                    canonical_text[:50],
+                )
+                if canonical_len == 0:
+                    LOGGER.warning("WARNING: empty canonical for %s", relative.stem)
+                try:
+                    with canonical_path.open("w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(canonical_text)
+                except OSError as exc:
+                    LOGGER.warning("写入 canonical 文本失败: %s", exc)
+                # line_spans and index_map are computed for future alignment steps.
+
     return {
         "file": str(path),
         "orig_len": len(raw_text),
@@ -485,6 +540,7 @@ def _process_single_text(
         "suspects_examples": suspects_examples,
         "align_written": str(align_written).lower(),
         "align_path": str(align_path) if align_written and align_path else "",
+        "canonical_path": str(canonical_path) if canonical_path else "",
         "status": "ok",
         "message": "；".join(message_parts),
     }
@@ -520,6 +576,7 @@ def run_prep_norm(
             "normalize_space": False,
             "preserve_cjk_punct": True,
         }
+    canonical_rules = _load_canonical_rules(char_map_path)
     out_dir = _ensure_out_dir(output_dir)  # 校验并创建输出目录
     input_path = input_path.expanduser().resolve()  # 解析输入路径
     if input_path.is_file():  # 单文件模式
@@ -556,6 +613,7 @@ def run_prep_norm(
             collapse_lines,
             emit_align,
             split_mode,
+            canonical_rules if emit_align else None,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -1939,6 +1997,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
 
     norm_pattern = _casefold_pattern(args.norm_glob)
     norm_out_dir = out_dir / "norm"
+    split_mode = getattr(args, "split_mode", "all-punct")
     LOGGER.info(_safe_text(f"开始规范化文本 → {norm_out_dir}"))
     norm_result = run_prep_norm(
         input_dir,
@@ -1950,7 +2009,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         collapse_lines=args.collapse_lines,
         emit_align=args.emit_align,
         allow_missing_char_map=True,
-        split_mode=args.split_mode,
+        split_mode=split_mode,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
