@@ -47,6 +47,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
 from onepass.normalize import collapse_soft_linebreaks
 from onepass.zh_segmenter import Segment as ZhSegment
 from onepass.zh_segmenter import segment as segment_text
+from onepass.text_split import smart_split
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -395,6 +396,7 @@ def _process_single_text(
     align_keep_quotes: bool,
     prosody_gap_ms: int,
     max_clause_chars: int,
+    debug_align: bool = False,
     drop_ascii_parens: bool,
     squash_mixed_english: bool,
 ) -> dict:
@@ -537,40 +539,71 @@ def _process_single_text(
                 char_map=cmap,
                 preserve_newlines=True,
             )
-            align_segments: list[ZhSegment] = segment_text(
-                align_source,
-                split_mode=split_mode,
-                min_len=align_min_len,
-                max_len=align_max_len,
-                hard_max=align_hard_max,
-                weak_punct_enable=align_weak_punct,
-                keep_quotes=align_keep_quotes,
-                prosody_gap_ms=prosody_gap_ms,
-                max_clause_chars=max_clause_chars,
-            )
-            if len(align_segments) <= 1:
-                align_guard_attempted = True
-                guard_segments = segment_text(
+            align_lines: list[str] | None = None
+            align_debug_rows: list[tuple[str, int, str]] | None = None
+            if split_mode == "punct+len":
+                if debug_align:
+                    align_lines, align_debug_rows = smart_split(
+                        align_source,
+                        min_len=align_min_len,
+                        max_len=align_max_len,
+                        hard_max=align_hard_max,
+                        return_debug=True,
+                    )
+                else:
+                    align_lines = smart_split(
+                        align_source,
+                        min_len=align_min_len,
+                        max_len=align_max_len,
+                        hard_max=align_hard_max,
+                    )
+            else:
+                align_segments: list[ZhSegment] = segment_text(
                     align_source,
-                    split_mode="punct+len",
-                    min_len=8,
-                    max_len=20,
-                    hard_max=28,
-                    weak_punct_enable=True,
+                    split_mode=split_mode,
+                    min_len=align_min_len,
+                    max_len=align_max_len,
+                    hard_max=align_hard_max,
+                    weak_punct_enable=align_weak_punct,
                     keep_quotes=align_keep_quotes,
                     prosody_gap_ms=prosody_gap_ms,
                     max_clause_chars=max_clause_chars,
                 )
-                effective_split_mode = "punct+len"
-                effective_min_len = 8
-                effective_max_len = 20
-                effective_hard_max = 28
-                effective_weak = True
-                if guard_segments:
-                    align_segments = guard_segments
                 if len(align_segments) <= 1:
-                    align_guard_failed = True
-            align_lines = [segment.text for segment in align_segments]
+                    align_guard_attempted = True
+                    if debug_align:
+                        guard_lines, guard_debug = smart_split(
+                            align_source,
+                            min_len=8,
+                            max_len=20,
+                            hard_max=28,
+                            return_debug=True,
+                        )
+                    else:
+                        guard_lines = smart_split(
+                            align_source,
+                            min_len=8,
+                            max_len=20,
+                            hard_max=28,
+                        )
+                        guard_debug = None
+                    effective_split_mode = "punct+len"
+                    effective_min_len = 8
+                    effective_max_len = 20
+                    effective_hard_max = 28
+                    effective_weak = True
+                    align_lines = guard_lines
+                    if debug_align:
+                        align_debug_rows = guard_debug
+                    if len(align_lines) <= 1:
+                        align_guard_failed = True
+                if align_lines is None:
+                    align_lines = [segment.text for segment in align_segments]
+                    if debug_align:
+                        align_debug_rows = [
+                            (segment.text, len(segment.text), "ZH_SEGMENTER")
+                            for segment in align_segments
+                        ]
             align_payload = "\n".join(align_lines)
             if align_payload:
                 if "\t" in align_payload:
@@ -579,16 +612,17 @@ def _process_single_text(
                     if part != part.strip():
                         raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
-            align_debug_path = align_path.with_name(f"{align_path.stem}.debug.tsv")
+            if debug_align:
+                align_debug_path = align_path.with_name(f"{align_path.stem}.debug.tsv")
             try:
                 with align_path.open("w", encoding="utf-8", newline="\n") as handle:
                     handle.write(align_payload)
                 align_written = True
             except OSError as exc:
                 LOGGER.warning("写入对齐文本失败: %s", exc)
-            if align_written:
+            if align_written and debug_align:
                 try:
-                    _write_align_debug(align_debug_path, align_segments)
+                    _write_align_debug(align_debug_path, align_debug_rows or [])
                 except OSError as exc:
                     LOGGER.warning("写入对齐调试文件失败: %s", exc)
             align_total_lines = len(align_lines)
@@ -657,17 +691,14 @@ def _process_single_text(
     }
 
 
-def _write_align_debug(path: Path, segments: Sequence[ZhSegment]) -> None:
-    """Write a TSV with segmentation spans for quick inspection."""
+def _write_align_debug(path: Path, rows: Sequence[tuple[str, int, str]]) -> None:
+    """Write TSV rows describing how smart_split produced each line."""
 
     with path.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("idx\tstart_char\tend_char\ttext_preview\n")
-        for idx, segment in enumerate(segments, 1):
-            preview = segment.text.strip()
-            if len(preview) > 30:
-                preview = preview[:30]
-            preview = preview.replace("\t", " ").replace("\n", " ")
-            handle.write(f"{idx}\t{segment.start}\t{segment.end}\t{preview}\n")
+        handle.write("idx\tlen\treason\ttext\n")
+        for idx, (text, length, reason) in enumerate(rows):
+            preview = text.replace("\t", " ").replace("\n", " ")
+            handle.write(f"{idx}\t{length}\t{reason}\t{preview}\n")
 
 
 def run_prep_norm(
@@ -689,6 +720,7 @@ def run_prep_norm(
     align_keep_quotes: bool = True,
     prosody_gap_ms: int = 350,
     max_clause_chars: int = 22,
+    debug_align: bool = False,
     drop_ascii_parens: bool = True,
     squash_mixed_english: bool = True,
 ) -> dict:
@@ -756,6 +788,7 @@ def run_prep_norm(
             align_keep_quotes=align_keep_quotes,
             prosody_gap_ms=prosody_gap_ms,
             max_clause_chars=max_clause_chars,
+            debug_align=debug_align,
             drop_ascii_parens=drop_ascii_parens,
             squash_mixed_english=squash_mixed_english,
         )  # 处理单个文件
@@ -801,6 +834,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         ]
         + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
         + (["--emit-align"] if args.emit_align else [])
+        + (["--debug-align"] if args.debug_align else [])
         + (["--split-mode", args.split_mode] if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE else [])
         + (["--min-len", str(args.min_len)] if args.min_len != DEFAULT_ALIGN_MIN_LEN else [])
         + (["--max-len", str(args.max_len)] if args.max_len != DEFAULT_ALIGN_MAX_LEN else [])
@@ -831,6 +865,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             align_keep_quotes=args.keep_quotes,
             prosody_gap_ms=args.prosody_gap_ms,
             max_clause_chars=args.max_clause_chars,
+            debug_align=args.debug_align,
             drop_ascii_parens=args.drop_ascii_parens,
             squash_mixed_english=args.squash_mixed_english,
         )
@@ -2245,6 +2280,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         align_keep_quotes=align_keep,
         prosody_gap_ms=int(getattr(args, "prosody_gap_ms", 350)),
         max_clause_chars=int(getattr(args, "max_clause_chars", 22)),
+        debug_align=bool(getattr(args, "debug_align", False)),
         drop_ascii_parens=drop_ascii_parens,
         squash_mixed_english=squash_mixed_english,
     )
@@ -2635,6 +2671,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         canonical_render = "never"
     args.render_mode = canonical_render
 
+    debug_align = bool(getattr(args, "debug_align", False))
     parts: list[str] = [
         "--in",
         str(Path(args.input_dir)),
@@ -2682,6 +2719,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--no-squash-mixed-english")
     if not args.emit_align:
         parts.append("--no-emit-align")
+    if debug_align:
+        parts.append("--debug-align")
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
     if args.no_interaction:
@@ -2720,6 +2759,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     LOGGER.info("等价命令: %s", _build_cli_example("all-in-one", parts))
     snapshot = {
         "emit_align": args.emit_align,
+        "debug_align": debug_align,
         "char_map": str(args.char_map),
         "alias_map": str(args.alias_map),
         "opencc": args.opencc,
@@ -2818,6 +2858,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--emit-align",
         action="store_true",
         help="额外生成去标点的 .align.txt 供词级对齐与可视化使用",
+    )
+    prep.add_argument(
+        "--debug-align",
+        action="store_true",
+        help="切句时额外产出 .align.debug.tsv（记录切分原因）",
     )
     prep.add_argument(
         "--split-mode",
@@ -3161,6 +3206,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="规范化阶段是否产出 .align.txt (默认开启)",
+    )
+    pipeline.add_argument(
+        "--debug-align",
+        action="store_true",
+        help="切句时额外写入 .align.debug.tsv（默认关闭）",
     )
     pipeline.add_argument(
         "--prefer-relative-audio",
