@@ -72,6 +72,7 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     export_sentence_txt,
 )
 from onepass.silence_probe import probe_silence_ffmpeg
+from onepass.seg_prosody import ProsodyConfig, ProsodySplitResult, split_text_with_prosody
 from onepass.text_norm import (  # 规范化工具
     load_alias_map,
     load_char_map,
@@ -99,9 +100,75 @@ DEFAULT_ALIGN_SPLIT_MODE = "punct+len"
 DEFAULT_ALIGN_MIN_LEN = 8
 DEFAULT_ALIGN_MAX_LEN = 24
 DEFAULT_ALIGN_HARD_MAX = 32
+DEFAULT_LEX_CUES = "但是,而且,因为,所以,比如,然而,如果,总之,同时,另外"
+DEFAULT_ENUM_CUES = "一是,二是,三是,首先,其次,再次,最后"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 _UI_PROCESSES: list[object] = []
+
+
+def _parse_cue_list(value: str | Sequence[str] | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        raw = value.replace("，", ",")
+        parts = [item.strip() for item in raw.split(",")]
+    else:
+        parts = [str(item or "").strip() for item in value]
+    return tuple(dict.fromkeys(part for part in parts if part))
+
+
+def _guess_words_json(text_path: Path) -> Path | None:
+    """Try to find a nearby *.words.json for the given normalized text path."""
+
+    base_dir = text_path.parent
+    stem_variants = {text_path.stem}
+    for suffix in (".norm", ".align"):
+        if text_path.stem.endswith(suffix):
+            stem_variants.add(text_path.stem[: -len(suffix)])
+    candidates: list[Path] = []
+    for stem in stem_variants:
+        if not stem:
+            continue
+        candidates.append(base_dir / f"{stem}.words.json")
+        candidates.append(base_dir / f"{stem}.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _build_prosody_config(
+    args: argparse.Namespace,
+    *,
+    hard_punct: str | Sequence[str] | None,
+    soft_punct: str | Sequence[str] | None,
+) -> ProsodyConfig:
+    enabled = getattr(args, "prosody_split", True)
+    return ProsodyConfig(
+        enabled=bool(enabled),
+        pause_gap_ms=float(getattr(args, "pause_gap_ms", 160.0)),
+        micro_silence_db=int(getattr(args, "micro_silence_db", -35)),
+        soft_join_max=int(getattr(args, "soft_join_max", 18)),
+        soft_split_min=int(getattr(args, "soft_split_min", 14)),
+        lex_cues=_parse_cue_list(getattr(args, "lex_cues", ())),
+        enum_cues=_parse_cue_list(getattr(args, "enum_cues", ())),
+        quote_protect=bool(getattr(args, "quote_protect", True)),
+        paren_protect=bool(getattr(args, "paren_protect", True)),
+        seg_len_min=int(getattr(args, "seg_len_min", 6)),
+        seg_len_max=int(getattr(args, "seg_len_max", 26)),
+        break_cost_soft=float(getattr(args, "break_cost_soft", -0.6)),
+        break_bonus_hard=float(getattr(args, "break_bonus_hard", 1.2)),
+        break_bonus_pause=float(getattr(args, "break_bonus_pause", 0.8)),
+        break_bonus_lex=float(getattr(args, "break_bonus_lex", 0.5)),
+        break_penalty_quote=float(getattr(args, "break_penalty_quote", -1.0)),
+        break_penalty_paren=float(getattr(args, "break_penalty_paren", -0.7)),
+        break_penalty_too_short=float(getattr(args, "break_penalty_too_short", -1.2)),
+        break_penalty_too_long=float(getattr(args, "break_penalty_too_long", -0.9)),
+        hard_punct=hard_punct or DEFAULT_HARD_PUNCT,
+        soft_punct=soft_punct or DEFAULT_SOFT_PUNCT,
+        punct_attach=getattr(args, "punct_attach", "left"),
+    )
 
 
 @dataclass(slots=True)
@@ -403,6 +470,7 @@ def _process_single_text(
     hard_punct: str | Sequence[str] | None,
     soft_punct: str | Sequence[str] | None,
     punct_attach: str,
+    prosody_config: ProsodyConfig | None,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -553,7 +621,51 @@ def _process_single_text(
             )
             align_lines: list[str] | None = None
             align_debug_rows: list[tuple[str, int, str]] | None = None
-            if split_mode == "punct+len":
+            prosody_result: ProsodySplitResult | None = None
+            if split_mode == "punct+len" and prosody_config and prosody_config.enabled:
+                guessed_words = _guess_words_json(path)
+                if guessed_words and guessed_words.exists():
+                    try:
+                        words_doc = load_words(guessed_words)
+                        prosody_result = split_text_with_prosody(
+                            align_source,
+                            list(words_doc),
+                            prosody_config,
+                        )
+                    except Exception as exc:  # pragma: no cover - 容错
+                        LOGGER.warning(
+                            "[prosody] 切句失败 %s: %s，已回退 punct+len", path.name, exc
+                        )
+                        prosody_result = None
+                elif prosody_config.enabled:
+                    LOGGER.debug("[prosody] 未找到词级 JSON，已使用 punct+len: %s", path.name)
+            if (
+                split_mode == "punct+len"
+                and prosody_result
+                and prosody_result.lines
+            ):
+                align_lines = prosody_result.lines
+                if debug_align:
+                    align_debug_rows = [
+                        (seg, len(seg), reason or "PROSODY")
+                        for seg, reason in zip(
+                            prosody_result.lines,
+                            prosody_result.break_reasons or ["PROSODY"] * len(prosody_result.lines),
+                        )
+                    ]
+                LOGGER.info(
+                    "[prosody] %s -> lines=%s candidates=%s",
+                    path.name,
+                    len(align_lines),
+                    len(prosody_result.candidates),
+                )
+            elif split_mode == "punct+len":
+                if prosody_result and not prosody_result.lines:
+                    LOGGER.warning(
+                        "[prosody] %s 无法生成切分，原因=%s，已回退 punct+len",
+                        path.name,
+                        prosody_result.fallback_reason or "unknown",
+                    )
                 if debug_align:
                     align_lines, align_debug_rows = smart_split(
                         align_source,
@@ -827,6 +939,7 @@ def run_prep_norm(
     hard_punct: str | Sequence[str] | None = DEFAULT_HARD_PUNCT,
     soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
     punct_attach: str = "left",
+    prosody_config: ProsodyConfig | None = None,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -898,6 +1011,7 @@ def run_prep_norm(
             hard_punct=hard_punct,
             soft_punct=soft_punct,
             punct_attach=punct_attach,
+            prosody_config=prosody_config,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -958,6 +1072,11 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
     LOGGER.info("等价命令: %s", cmd)
     try:
+        prosody_config = _build_prosody_config(
+            args,
+            hard_punct=args.hard_punct,
+            soft_punct=args.soft_punct,
+        )
         result = run_prep_norm(
             Path(args.input),
             Path(args.output),
@@ -981,6 +1100,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             hard_punct=args.hard_punct,
             soft_punct=args.soft_punct,
             punct_attach=args.punct_attach,
+            prosody_config=prosody_config,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -2566,6 +2686,11 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     hard_punct = getattr(args, "hard_punct", DEFAULT_HARD_PUNCT)
     soft_punct = getattr(args, "soft_punct", DEFAULT_SOFT_PUNCT)
     punct_attach = getattr(args, "punct_attach", "left")
+    prosody_config = _build_prosody_config(
+        args,
+        hard_punct=hard_punct,
+        soft_punct=soft_punct,
+    )
     LOGGER.info(_safe_text(f"开始规范化文本 → {norm_out_dir}"))
     norm_result = run_prep_norm(
         input_dir,
@@ -2591,6 +2716,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         hard_punct=hard_punct,
         soft_punct=soft_punct,
         punct_attach=punct_attach,
+        prosody_config=prosody_config,
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -3281,6 +3407,91 @@ def build_parser() -> argparse.ArgumentParser:
         default="left",
         help="硬标点归属（left=句末，right=下一句开头，默认 left）",
     )
+    prep.add_argument(
+        "--prosody-split",
+        dest="prosody_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="punct+len 模式下启用语气/呼吸位切句（默认开启）",
+    )
+    prep.add_argument("--pause-gap-ms", type=float, default=160.0, help="预测停顿阈值 (毫秒)")
+    prep.add_argument("--micro-silence-db", type=int, default=-35, help="微停顿噪声门限 (dBFS)")
+    prep.add_argument("--soft-join-max", type=int, default=18, help="优先并句的字符上限")
+    prep.add_argument("--soft-split-min", type=int, default=14, help="优先细分的字符下限")
+    prep.add_argument(
+        "--lex-cues",
+        default=DEFAULT_LEX_CUES,
+        help="词法断句提示词，逗号分隔",
+    )
+    prep.add_argument(
+        "--enum-cues",
+        default=DEFAULT_ENUM_CUES,
+        help="枚举提示词，逗号分隔",
+    )
+    prep.add_argument(
+        "--quote-protect",
+        dest="quote_protect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="引号内优先不断 (默认 on)",
+    )
+    prep.add_argument(
+        "--paren-protect",
+        dest="paren_protect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="括号内优先不断 (默认 on)",
+    )
+    prep.add_argument("--seg-len-min", type=int, default=6, help="DP 段长下限")
+    prep.add_argument("--seg-len-max", type=int, default=26, help="DP 段长上限")
+    prep.add_argument(
+        "--break-cost-soft",
+        type=float,
+        default=-0.6,
+        help="软切分惩罚",
+    )
+    prep.add_argument(
+        "--break-bonus-hard",
+        type=float,
+        default=1.2,
+        help="断在硬标点的奖励",
+    )
+    prep.add_argument(
+        "--break-bonus-pause",
+        type=float,
+        default=0.8,
+        help="断在显著微停顿的奖励",
+    )
+    prep.add_argument(
+        "--break-bonus-lex",
+        type=float,
+        default=0.5,
+        help="断在词法线索的奖励",
+    )
+    prep.add_argument(
+        "--break-penalty-quote",
+        type=float,
+        default=-1.0,
+        help="引号内断开的惩罚",
+    )
+    prep.add_argument(
+        "--break-penalty-paren",
+        type=float,
+        default=-0.7,
+        help="括号内断开的惩罚",
+    )
+    prep.add_argument(
+        "--break-penalty-too-short",
+        type=float,
+        default=-1.2,
+        help="段过短惩罚",
+    )
+    prep.add_argument(
+        "--break-penalty-too-long",
+        type=float,
+        default=-0.9,
+        help="段过长惩罚",
+    )
     prep.add_argument("--dry-run", action="store_true", help="仅生成报表，不写规范化文本")
     prep.set_defaults(func=handle_prep_norm)
 
@@ -3851,6 +4062,91 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["left", "right"],
         default="left",
         help="硬标点归属（left=句末，right=下一句开头，默认 left）",
+    )
+    pipeline.add_argument(
+        "--prosody-split",
+        dest="prosody_split",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="punct+len 模式下启用语气/呼吸位切句（默认开启）",
+    )
+    pipeline.add_argument("--pause-gap-ms", type=float, default=160.0, help="预测停顿阈值 (毫秒)")
+    pipeline.add_argument("--micro-silence-db", type=int, default=-35, help="微停顿噪声门限 (dBFS)")
+    pipeline.add_argument("--soft-join-max", type=int, default=18, help="优先并句的字符上限")
+    pipeline.add_argument("--soft-split-min", type=int, default=14, help="优先细分的字符下限")
+    pipeline.add_argument(
+        "--lex-cues",
+        default=DEFAULT_LEX_CUES,
+        help="词法断句提示词，逗号分隔",
+    )
+    pipeline.add_argument(
+        "--enum-cues",
+        default=DEFAULT_ENUM_CUES,
+        help="枚举提示词，逗号分隔",
+    )
+    pipeline.add_argument(
+        "--quote-protect",
+        dest="quote_protect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="引号内优先不断 (默认 on)",
+    )
+    pipeline.add_argument(
+        "--paren-protect",
+        dest="paren_protect",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="括号内优先不断 (默认 on)",
+    )
+    pipeline.add_argument("--seg-len-min", type=int, default=6, help="DP 段长下限")
+    pipeline.add_argument("--seg-len-max", type=int, default=26, help="DP 段长上限")
+    pipeline.add_argument(
+        "--break-cost-soft",
+        type=float,
+        default=-0.6,
+        help="软切分惩罚",
+    )
+    pipeline.add_argument(
+        "--break-bonus-hard",
+        type=float,
+        default=1.2,
+        help="断在硬标点的奖励",
+    )
+    pipeline.add_argument(
+        "--break-bonus-pause",
+        type=float,
+        default=0.8,
+        help="断在显著微停顿的奖励",
+    )
+    pipeline.add_argument(
+        "--break-bonus-lex",
+        type=float,
+        default=0.5,
+        help="断在词法线索的奖励",
+    )
+    pipeline.add_argument(
+        "--break-penalty-quote",
+        type=float,
+        default=-1.0,
+        help="引号内断开的惩罚",
+    )
+    pipeline.add_argument(
+        "--break-penalty-paren",
+        type=float,
+        default=-0.7,
+        help="括号内断开的惩罚",
+    )
+    pipeline.add_argument(
+        "--break-penalty-too-short",
+        type=float,
+        default=-1.2,
+        help="段过短惩罚",
+    )
+    pipeline.add_argument(
+        "--break-penalty-too-long",
+        type=float,
+        default=-0.9,
+        help="段过长惩罚",
     )
     pipeline.add_argument(
         "--glob-words",
