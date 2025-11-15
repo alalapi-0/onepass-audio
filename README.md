@@ -796,14 +796,16 @@ python onepass_main.py
 #### R4 自测命令
 
 ```bash
-# 严格参数：仅统计主套件
+# 推荐：严格中文朗读预设 + 纯标点分句
 python scripts/onepass_cli.py all-in-one --in materials --out out \
-  --render auto --no-interaction --alias-map config/default_alias_map.json
-
-# 宽容参数：启用 speech_zh_reading 预设
-python scripts/onepass_cli.py all-in-one --in materials --out out \
-  --render auto --no-interaction --match-preset speech_zh_reading \
+  --render auto --no-interaction \
+  --match-preset strict_zh_punct \
+  --split-mode punct \
   --alias-map config/default_alias_map.json
+
+# 若需要更宽松匹配，可切换 tolerant 预设（会增加跨句合并概率）
+# python scripts/onepass_cli.py all-in-one --in materials --out out \
+#   --render auto --no-interaction --match-preset tolerant --split-mode punct
 ```
 
 - 预期：两次命令均应 `success 2/2`，每篇 `unaligned ≤ 2`。

@@ -11,7 +11,6 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 from onepass.retake.matcher import MatchRequest, StableMatcher
-from onepass.retake_keep_last import PAUSE_GAP_SEC
 from scripts.onepass_cli import (
     DEFAULT_MATCH_FALLBACK_POLICY,
     DEFAULT_MATCH_MAX_DISTANCE_RATIO,
@@ -41,9 +40,9 @@ def test_tolerant_preset_matches_ascii_mixture():
     assert matcher.match(tolerant_request).success
 
 
-def test_speech_preset_maps_to_new_defaults():
+def test_strict_preset_maps_to_defaults():
     ratio, anchor, fallback, pause_gap = _resolve_match_parameters(
-        "speech_zh_reading",
+        "strict_zh_punct",
         0.1,
         2,
         "keep-all",
@@ -56,12 +55,12 @@ def test_speech_preset_maps_to_new_defaults():
     assert ratio == pytest.approx(DEFAULT_MATCH_MAX_DISTANCE_RATIO)
     assert anchor == DEFAULT_MATCH_MIN_ANCHOR_NGRAM
     assert fallback == DEFAULT_MATCH_FALLBACK_POLICY
-    assert pause_gap == pytest.approx(PAUSE_GAP_SEC)
+    assert pause_gap == pytest.approx(0.45)
 
 
 def test_match_preset_respects_explicit_overrides():
     ratio, anchor, fallback, pause_gap = _resolve_match_parameters(
-        "speech_zh_reading",
+        "strict_zh_punct",
         0.3,
         DEFAULT_MATCH_MIN_ANCHOR_NGRAM,
         "keep-all",
