@@ -1921,6 +1921,8 @@ def compute_retake_keep_last(
         guard_threshold = 0.6
         ratio_snapshot = float(stats.get("cut_ratio", 0.0) or 0.0)
         guard_triggered = False
+        prev_min_sent = current_min_sent
+        prev_dup_gap = current_dup_gap
         if (
             ratio_snapshot > guard_threshold
             and raw_keeps

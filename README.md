@@ -314,6 +314,22 @@ python scripts/onepass_cli.py all-in-one \
 
 使用 `strict_zh_punct` 预设时，日志会额外出现 `"[normalize] collapse-lines=on"` 与 `"[split] ... split_mode=punct weak=false prosody=false attach=right"`，并在参数快照中列出 `config/char_map_no_breaks.json` 以方便复现。
 
+### 空白清理与分句参数
+
+- `--hard-collapse-lines` 发生在字符映射之后、软折行之前：先删除零宽字符/BOM，再把所有 `\r/\n/\t/\u3000` 折成单空格并压缩连续空白，最后再交给 `--collapse-lines` 去处理 ASCII ↔ ASCII 插空。默认关闭，可在需要“硬清换行”时显式加上 `--hard-collapse-lines`。
+- 新的默认切句流程为 `split_mode=punct`、`--no-weak-punct-enable`、`--no-prosody-split`、`--split-attach right`，保证“句号类标点必分句”，若需按弱标点或气口进一步细分再显式开启。
+- 推荐的全量命令示例：
+
+```bash
+python scripts/onepass_cli.py prep-norm \
+  --in materials/example --out out/norm \
+  --char-map config/default_char_map.json \
+  --split-mode punct --split-attach right \
+  --hard-collapse-lines --no-weak-punct-enable --no-prosody-split
+```
+
+- 目前的切句实现仅支持“右挂标点”。当 CLI 收到 `--split-attach left` 时会给出 warning 并自动改为 `right`，同时在“等价命令/参数快照”中回显实际生效的 `right`，避免误判输出。
+
 ## 过裁剪保护
 
 为了避免阈值过激导致大量有效语句被剪掉，CLI 在吸附/合并完成后会根据 `keep` 总时长计算剪切比例 `cut_ratio`：

@@ -15,6 +15,9 @@ from . import _legacy_normalize as _legacy_normalize
 
 DEFAULT_HARD_PUNCT = "。！？!?．.;；……—"
 DEFAULT_SOFT_PUNCT = "，、,:：；;"
+ZWS_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
+FULLWIDTH_SPACE = "\u3000"
+WHITES_RE = re.compile(r"[ \t\r\n\u3000]+")
 
 __all__ = [
     "TextNormConfig",
@@ -25,6 +28,7 @@ __all__ = [
     "normalize_text_for_export",
     "split_sentences_with_rules",
     "collapse_soft_linebreaks",
+    "hard_collapse_whitespace",
 ]
 
 
@@ -37,6 +41,7 @@ class TextNormConfig:
     ascii_paren_mapping: bool = False
     squash_mixed_english: bool = False
     collapse_lines: bool = True
+    hard_collapse_lines: bool = False
     max_len: int = 24
     min_len: int = 8
     hard_max: int = 32
@@ -84,6 +89,7 @@ _RE_SPACE_RUN = re.compile(r" {2,}")
 _RE_LINE_BREAK = re.compile(r"\s*\n\s*")
 _RE_DASH_VARIANTS = re.compile(r"[‒–—―﹘﹣]+")
 _RE_ELLIPSIS = re.compile(r"\.{4,}")
+HARD_PUNCT = set(DEFAULT_HARD_PUNCT)
 
 
 def _preview_line_for_debug(text: str, limit: int = 80) -> str:
@@ -183,6 +189,17 @@ def _final_punct_normalize(text: str) -> str:
     return compacted
 
 
+def hard_collapse_whitespace(text: str) -> str:
+    """Forcibly collapse all whitespace into single spaces and trim."""
+
+    if not text:
+        return text
+    normalized = ZWS_RE.sub("", text)
+    normalized = normalized.replace(FULLWIDTH_SPACE, " ")
+    normalized = WHITES_RE.sub(" ", normalized)
+    return normalized.strip()
+
+
 def normalize_text_for_export(
     text: str,
     char_map: Mapping[str, object],
@@ -202,6 +219,8 @@ def normalize_text_for_export(
 
     sample_before: str | None = None
     normalized = _apply_char_map(text, char_map, cfg)
+    if cfg.hard_collapse_lines:
+        normalized = hard_collapse_whitespace(normalized)
     if is_debug_logging_enabled():
         sample_before = _preview_line_for_debug(text)
         log_debug(
@@ -216,9 +235,9 @@ def normalize_text_for_export(
             len(char_map.get("delete", [])),
             len(char_map.get("map", {})),
         )
-    normalized = _normalize_whitespace(normalized, collapse_lines)
     if collapse_lines:
         normalized = _collapse_soft_linebreaks(normalized)
+    normalized = _normalize_whitespace(normalized, collapse_lines)
     if cfg.drop_ascii_parens:
         table = {ord(ch): None for ch in _ASCII_PARENS}
         normalized = normalized.translate(table)
@@ -248,7 +267,7 @@ def _log_split_event(
     reason: str = "",
     attach: str,
     max_len: int,
-) -> None:
+    ) -> None:
     if not state:
         return
     log_debug(
@@ -316,6 +335,13 @@ def _split_hard_layers(text: str, cfg: TextNormConfig, state: dict | None = None
         )
         layers.append(tail)
     return layers
+
+
+def _hard_punct_set(cfg: TextNormConfig | None) -> set[str]:
+    custom = None
+    if cfg is not None:
+        custom = {ch for ch in cfg.hard_puncts if ch and not ch.isspace()}
+    return custom or set(HARD_PUNCT)
 
 
 def _find_split_index(segment: str, cfg: TextNormConfig, state: dict | None = None) -> int | None:
@@ -393,14 +419,25 @@ def _split_soft_layer(segment: str, cfg: TextNormConfig, state: dict | None = No
     return sentences
 
 
-def _merge_short_neighbors(sentences: List[str], cfg: TextNormConfig) -> List[str]:
+def _ends_with_hard_punct(text: str, hard_puncts: set[str]) -> bool:
+    stripped = text.rstrip()
+    return bool(stripped) and stripped[-1] in hard_puncts
+
+
+def _merge_short_neighbors(
+    sentences: List[str], cfg: TextNormConfig, hard_puncts: set[str] | None = None
+) -> List[str]:
     merged: List[str] = []
+    puncts = set(hard_puncts) if hard_puncts else _hard_punct_set(cfg)
     for sentence in sentences:
         stripped = sentence.strip()
         if not stripped:
             continue
         if merged and len(stripped) < cfg.min_len and len(merged[-1]) < cfg.min_len:
-            merged[-1] = (merged[-1] + stripped).strip()
+            if _ends_with_hard_punct(merged[-1], puncts):
+                merged.append(stripped)
+            else:
+                merged[-1] = (merged[-1] + stripped).strip()
         else:
             merged.append(stripped)
     return merged
@@ -436,6 +473,32 @@ def _would_cross_block_merge(
     return 0
 
 
+def _enforce_hard_punct_split(
+    lines: List[str], hard_puncts: set[str] | None = None
+) -> List[str]:
+    puncts = set(hard_puncts) if hard_puncts else set(HARD_PUNCT)
+    output: List[str] = []
+    for line in lines:
+        if not line:
+            continue
+        start = 0
+        local: List[str] = []
+        for idx, ch in enumerate(line):
+            if ch in puncts:
+                segment = line[start : idx + 1]
+                if segment:
+                    local.append(segment)
+                start = idx + 1
+        if start < len(line):
+            tail = line[start:]
+            if tail:
+                local.append(tail)
+        if not local:
+            local = [line]
+        output.extend(part.strip() for part in local if part.strip())
+    return output
+
+
 def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     """Split text into sentences following hard/soft punctuation rules."""
 
@@ -455,12 +518,13 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     state: dict | None = None
     if is_debug_logging_enabled():
         state = make_log_limit(400)
+    hard_puncts = _hard_punct_set(cfg)
     hard_layers = _split_hard_layers(normalized, cfg, state)
     sentences: List[str] = []
     blocked_cross_hard_merges = 0
     for layer in hard_layers:
         soft_sentences = _split_soft_layer(layer, cfg, state)
-        soft_sentences = _merge_short_neighbors(soft_sentences, cfg)
+        soft_sentences = _merge_short_neighbors(soft_sentences, cfg, hard_puncts)
         blocked_cross_hard_merges += _would_cross_block_merge(soft_sentences, sentences, cfg)
         guarded = _merge_quote_guards(soft_sentences)
         sentences.extend(guarded)
@@ -469,7 +533,8 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
             "[split] blocked_cross_hard_merges=%s",
             blocked_cross_hard_merges,
         )
-    return [sent for sent in sentences if sent]
+    cleaned = [sent for sent in sentences if sent]
+    return _enforce_hard_punct_split(cleaned, hard_puncts)
 
 
 def collapse_soft_linebreaks(text: str) -> str:
