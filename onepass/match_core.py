@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import bisect
+import logging
 import math
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -10,6 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .canonicalize import CanonicalAliasMap, canonicalize
 from .words_loader import Token
 
+LOGGER = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class TokenStream:
@@ -202,9 +204,57 @@ def match_line_to_tokens(
     return best
 
 
+def align_text(
+    lines: Sequence[str],
+    tokens: Sequence[Token],
+    *,
+    alias_map: Dict[str, str] | CanonicalAliasMap | None = None,
+    min_anchor_ngram: int = 6,
+    max_distance_ratio: float = 0.35,
+    fallback_policy: str = "greedy",
+    max_windows: int = 200,
+    match_timeout: float | None = 60.0,
+    prefer_latest: bool = True,
+    dedupe_policy: str | None = None,
+) -> tuple[list[MatchResult | None], dict[str, object]]:
+    """Align *lines* against *tokens*, returning matches and config metadata."""
+
+    LOGGER.info(
+        "[align_text] alias_map_size=%s dedupe_policy=%s min_anchor_ngram=%s max_distance_ratio=%.2f fallback_policy=%s",
+        len(alias_map or {}),
+        dedupe_policy or "none",
+        min_anchor_ngram,
+        max_distance_ratio,
+        fallback_policy,
+    )
+    stream = build_token_stream(tokens, alias_map)
+    matches: list[MatchResult | None] = []
+    for line in lines:
+        match = match_line_to_tokens(
+            line,
+            stream,
+            alias_map,
+            min_anchor_ngram=min_anchor_ngram,
+            max_windows=max_windows,
+            max_distance_ratio=max_distance_ratio,
+            match_timeout=match_timeout,
+            prefer_latest=prefer_latest,
+        )
+        matches.append(match)
+    metadata = {
+        "alias_map_size": len(alias_map or {}),
+        "dedupe_policy": dedupe_policy or "none",
+        "min_anchor_ngram": int(min_anchor_ngram),
+        "max_distance_ratio": float(max_distance_ratio),
+        "fallback_policy": fallback_policy,
+    }
+    return matches, metadata
+
+
 __all__ = [
     "MatchResult",
     "TokenStream",
+    "align_text",
     "build_token_stream",
     "match_line_to_tokens",
 ]

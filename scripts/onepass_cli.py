@@ -26,7 +26,6 @@ from match_materials import is_canonical_stem, match_materials, parse_glob_list
 from scripts.ui_server import start_ui
 
 from onepass.asr_loader import load_words  # 载入词级 JSON
-from onepass.canonicalize import load_alias_map as load_match_alias_map
 from onepass.alignment.canonical import (
     CanonicalRules,
     concat_and_index,
@@ -76,7 +75,6 @@ from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.seg_prosody import ProsodyConfig, ProsodySplitResult, split_text_with_prosody
 from onepass.text_norm import (  # 规范化工具
     load_alias_map,
-    load_char_map,
     normalize_chinese_text,
     normalize_pipeline,
     run_opencc_if_available,
@@ -84,7 +82,11 @@ from onepass.text_norm import (  # 规范化工具
     sentence_lines_from_text,
     validate_sentence_lines,
 )
-from onepass.text_normalizer import normalize_text_for_export
+from onepass.text_normalizer import (
+    load_match_alias_map,
+    load_normalize_char_map,
+    normalize_text_for_export,
+)
 from onepass.sent_align import (
     LOW_CONF as SENT_LOW_CONF,
     MAX_DUP_GAP_SEC as SENT_MAX_DUP_GAP_SEC,
@@ -106,6 +108,31 @@ DEFAULT_ENUM_CUES = "一是,二是,三是,首先,其次,再次,最后"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 _UI_PROCESSES: list[object] = []
+
+
+_DEDUPE_LABELS = {"none", "safe", "aggressive"}
+_DEDUPE_ALIASES = {"off": "none", "last": "safe", "dp": "aggressive"}
+
+
+def _normalize_dedupe_policy(value: str | None) -> str:
+    """Normalize dedupe policy strings to one of none/safe/aggressive."""
+
+    if value is None:
+        return "none"
+    normalized = str(value or "").strip().lower()
+    normalized = _DEDUPE_ALIASES.get(normalized, normalized)
+    if normalized not in _DEDUPE_LABELS:
+        LOGGER.warning("未知 dedupe_policy=%s，已回退 none", value)
+        return "none"
+    return normalized
+
+
+def _ensure_dedupe_policy(args: argparse.Namespace) -> str:
+    """Ensure args carries a normalized dedupe_policy attribute."""
+
+    normalized = _normalize_dedupe_policy(getattr(args, "dedupe_policy", None))
+    setattr(args, "dedupe_policy", normalized)
+    return normalized
 
 
 def _parse_cue_list(value: str | Sequence[str] | None) -> tuple[str, ...]:
@@ -933,7 +960,7 @@ def run_prep_norm(
     if opencc_mode not in {"none", "t2s", "s2t"}:  # 校验 opencc 取值
         raise ValueError("--opencc 仅支持 none/t2s/s2t。")
     try:
-        cmap = load_char_map(char_map_path)  # 加载字符映射
+        cmap = load_normalize_char_map(char_map_path)  # 加载字符映射
     except FileNotFoundError:
         if not allow_missing_char_map:
             raise
@@ -1914,7 +1941,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     min_anchor_ngram = int(args.min_anchor_ngram)
     fallback_policy = args.fallback_policy
     match_preset = getattr(args, "match_preset", None)
-    dedupe_policy = str(getattr(args, "dedupe_policy", "dp") or "dp")
+    dedupe_policy = _ensure_dedupe_policy(args)
     line_eq = str(getattr(args, "line_eq", "char") or "char")
     line_dist_max = float(getattr(args, "line_dist_max", 0.15))
     dedupe_window = float(getattr(args, "dedupe_window", 12.0))
@@ -1947,6 +1974,14 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     alias_map_path = Path(getattr(args, "alias_map", DEFAULT_ALIAS_MAP)).expanduser()
     alias_map = load_alias_map(alias_map_path)
     match_alias_map = load_match_alias_map(alias_map_path)
+    LOGGER.info(
+        "[retake-config] alias_map_size=%s dedupe_policy=%s min_anchor_ngram=%s max_distance_ratio=%.2f fallback_policy=%s",
+        len(alias_map or {}),
+        dedupe_policy,
+        min_anchor_ngram,
+        max_distance_ratio,
+        fallback_policy,
+    )
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
     no_collapse_align = bool(getattr(args, "no_collapse_align", True))
     if args.audio_root:
@@ -2177,6 +2212,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
 
     if args.review_only and not args.sentence_strict:
         raise ValueError("--review-only 仅在启用 --sentence-strict 时可用。")
+    _ensure_dedupe_policy(args)
     parts: list[str] = []
     if args.words_json:
         parts.extend([
@@ -2216,7 +2252,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
         parts.extend(["--channels", str(args.channels)])
     if args.min_sent_chars != MIN_SENT_CHARS:
         parts.extend(["--min-sent-chars", str(args.min_sent_chars)])
-    if args.dedupe_policy != "dp":
+    if args.dedupe_policy != "none":
         parts.extend(["--dedupe-policy", args.dedupe_policy])
     if args.line_eq != "char":
         parts.extend(["--line-eq", args.line_eq])
@@ -2294,7 +2330,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     parts.extend(["--fallback-policy", args.fallback_policy])
     if args.match_preset:
         parts.extend(["--match-preset", args.match_preset])
-    if args.dedupe_policy != "dp":
+    if args.dedupe_policy != "none":
         parts.extend(["--dedupe-policy", args.dedupe_policy])
     if args.line_eq != "char":
         parts.extend(["--line-eq", args.line_eq])
@@ -2648,6 +2684,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     pipeline_records: list[dict] = []
     start = time.perf_counter()
 
+    dedupe_policy = _ensure_dedupe_policy(args)
+
     audio_root_arg = getattr(args, "audio_root", None)
     if audio_root_arg:
         audio_root_path = Path(audio_root_arg).expanduser().resolve()
@@ -2766,6 +2804,14 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     args.max_distance_ratio = max_distance_ratio
     args.min_anchor_ngram = min_anchor_ngram
     args.fallback_policy = fallback_policy
+    LOGGER.info(
+        "[retake-config] alias_map_size=%s dedupe_policy=%s min_anchor_ngram=%s max_distance_ratio=%.2f fallback_policy=%s",
+        len(alias_map or {}),
+        dedupe_policy,
+        min_anchor_ngram,
+        max_distance_ratio,
+        fallback_policy,
+    )
 
     retake_items: list[dict] = []
     failed = 0
@@ -3106,6 +3152,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     elif canonical_render == "no":
         canonical_render = "never"
     args.render_mode = canonical_render
+    _ensure_dedupe_policy(args)
 
     debug_align = bool(getattr(args, "debug_align", False))
     parts: list[str] = [
@@ -3562,9 +3609,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     retake.add_argument(
         "--dedupe-policy",
-        choices=["off", "last", "dp"],
-        default="dp",
-        help="重复检测策略（off=关闭，last=仅取最后一次，dp=动态规划，默认 dp）",
+        default="none",
+        help="重复检测策略（none=关闭，safe=仅取最后一遍，aggressive=动态规划，可兼容 off/last/dp，默认 none）",
     )
     retake.add_argument(
         "--line-eq",
@@ -3991,9 +4037,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pipeline.add_argument(
         "--dedupe-policy",
-        choices=["off", "last", "dp"],
-        default="dp",
-        help="重复检测策略（默认 dp）",
+        default="none",
+        help="重复检测策略（none/safe/aggressive，兼容 off/last/dp，默认 none）",
     )
     pipeline.add_argument(
         "--line-eq",

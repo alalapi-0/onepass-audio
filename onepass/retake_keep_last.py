@@ -47,6 +47,7 @@ __all__ = [
     "KeepSpan",
     "RetakeResult",
     "SentenceReviewResult",
+    "keep_last_segments",
     "compute_retake_keep_last",
     "compute_sentence_review",
     "export_srt",
@@ -81,6 +82,22 @@ PAD_BEFORE = 0.08  # EDL 段首补偿
 PAD_AFTER = 0.12  # EDL 段尾补偿
 MIN_SEGMENT_SEC = 0.18  # 过短的片段需要合并或丢弃
 MERGE_GAP_SEC = 0.06  # 吸附+补偿后相邻片段小于该间隔自动合并
+
+_DEDUPE_POLICY_MAP = {
+    "none": ("none", "off"),
+    "safe": ("safe", "last"),
+    "aggressive": ("aggressive", "dp"),
+    "off": ("none", "off"),
+    "last": ("safe", "last"),
+    "dp": ("aggressive", "dp"),
+}
+
+
+def _resolve_dedupe_policy(policy: str | None) -> tuple[str, str]:
+    """Return (label, effective_mode) for dedupe policy strings."""
+
+    key = (policy or "dp").strip().lower()
+    return _DEDUPE_POLICY_MAP.get(key, _DEDUPE_POLICY_MAP["dp"])
 
 
 @dataclass(slots=True)
@@ -826,6 +843,25 @@ def _build_match_stages(initial_anchor: int, initial_ratio: float) -> list[dict[
     return stages
 
 
+def keep_last_segments(
+    words: list[Word],
+    original_txt: Path,
+    *,
+    alias_map: Mapping[str, Sequence[str]] | None = None,
+    dedupe_policy: str = "none",
+    **kwargs,
+) -> RetakeResult:
+    """Compatibility wrapper for compute_retake_keep_last with explicit knobs."""
+
+    return compute_retake_keep_last(
+        words,
+        original_txt,
+        alias_map=alias_map,
+        dedupe_policy=dedupe_policy,
+        **kwargs,
+    )
+
+
 def compute_retake_keep_last(
     words: list[Word],
     original_txt: Path,
@@ -872,6 +908,8 @@ def compute_retake_keep_last(
     """根据原文 TXT 匹配词序列，仅保留最后一次出现的行。"""
 
     drop_ascii_parens = bool(drop_ascii_parens)
+    alias_map_size = len(alias_map or {})
+    dedupe_label, dedupe_effective_policy = _resolve_dedupe_policy(dedupe_policy)
     if not words:  # 无词序列时无法继续
         raise ValueError("词序列为空，无法执行保留最后一遍逻辑。请先导入有效的 ASR JSON。")
     try:
@@ -1343,12 +1381,13 @@ def compute_retake_keep_last(
         except Exception:
             LOGGER.exception("[repeat] 聚类失败，已回退到 off 策略")
             clusters = []
-            dedupe_policy = "off"
+            dedupe_label = "none"
+            dedupe_effective_policy = "off"
 
         dp_candidates = [candidate for cluster in clusters for candidate in cluster.candidates]
         candidate_lookup = {candidate.candidate_id: candidate for candidate in dp_candidates}
         total_candidates = len(dp_candidates)
-        effective_policy = (dedupe_policy or "dp").lower()
+        effective_policy = dedupe_effective_policy
         if effective_policy not in {"off", "last", "dp"}:
             effective_policy = "dp"
         best_ids: list[int] = []
@@ -1572,6 +1611,9 @@ def compute_retake_keep_last(
             "pruned_candidates": pruned_candidates_total,
             "search_elapsed_sec": search_elapsed_total,
             "ascii_relaxed_lines": ascii_relaxed,
+            "alias_map_used": bool(alias_map),
+            "alias_map_size": alias_map_size,
+            "dedupe_policy": dedupe_label,
         }
         stats.update(refine_stats)
         stats.update(snap_stats)
