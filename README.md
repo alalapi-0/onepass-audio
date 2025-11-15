@@ -302,9 +302,17 @@ python scripts/onepass_cli.py retake-keep-last --materials materials --out out \
 # 句子级（更稳）+ 停顿吸附 + 单段审阅（不剪）
 python scripts/onepass_cli.py retake-keep-last --words-json ... --text ... --out out \
   --sentence-strict --review-only
+
+# 仅硬标点切句 + 先统一空白 + 匹配宽容但稳定
+python scripts/onepass_cli.py all-in-one \
+  --in materials --out out \
+  --render auto --no-interaction \
+  --match-preset strict_zh_punct
 ```
 
 运行结束后可在日志中看到 `pause_used`、`pause_snaps`、`auto_merged`、`too_short_dropped` 等统计字段，便于快速评估参数效果。
+
+使用 `strict_zh_punct` 预设时，日志会额外出现 `"[normalize] collapse-lines=on"` 与 `"[split] ... split_mode=punct weak=false prosody=false attach=right"`，并在参数快照中列出 `config/char_map_no_breaks.json` 以方便复现。
 
 ## 过裁剪保护
 

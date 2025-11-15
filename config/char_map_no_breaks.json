@@ -1,0 +1,10 @@
+{
+  "normalize_width": true,
+  "normalize_space": true,
+  "map": {
+    "\u0009": " ",
+    "\u000a": " ",
+    "\u000d": " ",
+    "\u3000": " "
+  }
+}

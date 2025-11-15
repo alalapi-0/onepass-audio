@@ -1,7 +1,9 @@
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
+import sys
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = ROOT_DIR / "scripts"
@@ -12,9 +14,13 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from onepass.retake.matcher import MatchRequest, StableMatcher
 from scripts.onepass_cli import (
+    DEFAULT_CHAR_MAP,
     DEFAULT_MATCH_FALLBACK_POLICY,
     DEFAULT_MATCH_MAX_DISTANCE_RATIO,
     DEFAULT_MATCH_MIN_ANCHOR_NGRAM,
+    PAUSE_GAP_SEC,
+    STRICT_PRESET_CHAR_MAP,
+    _apply_text_preset,
     _resolve_match_parameters,
 )
 
@@ -52,10 +58,10 @@ def test_strict_preset_maps_to_defaults():
         fallback_explicit=False,
         pause_gap_explicit=False,
     )
-    assert ratio == pytest.approx(DEFAULT_MATCH_MAX_DISTANCE_RATIO)
-    assert anchor == DEFAULT_MATCH_MIN_ANCHOR_NGRAM
-    assert fallback == DEFAULT_MATCH_FALLBACK_POLICY
-    assert pause_gap == pytest.approx(0.45)
+    assert ratio == pytest.approx(0.45)
+    assert anchor == 4
+    assert fallback == "greedy+expand"
+    assert pause_gap == pytest.approx(PAUSE_GAP_SEC)
 
 
 def test_match_preset_respects_explicit_overrides():
@@ -71,6 +77,37 @@ def test_match_preset_respects_explicit_overrides():
         pause_gap_explicit=True,
     )
     assert ratio == pytest.approx(0.3)
-    assert anchor == DEFAULT_MATCH_MIN_ANCHOR_NGRAM
+    assert anchor == 4
     assert fallback == "keep-all"
     assert pause_gap == pytest.approx(0.42)
+
+
+def test_apply_text_preset_sets_sentence_strategy():
+    args = Namespace(
+        match_preset="strict_zh_punct",
+        collapse_lines=False,
+        char_map=str(DEFAULT_CHAR_MAP),
+        split_mode="punct+len",
+        weak_punct_enable=True,
+        prosody_split=True,
+        split_attach="left",
+        min_len=32,
+        max_len=120,
+        hard_max=140,
+        max_distance_ratio=None,
+        min_anchor_ngram=None,
+        fallback_policy="",
+    )
+    _apply_text_preset(args)
+    assert args.collapse_lines
+    assert args.split_mode == "punct"
+    assert args.weak_punct_enable is False
+    assert args.prosody_split is False
+    assert args.split_attach == "right"
+    assert args.min_len <= 8
+    assert args.max_len >= 2000
+    assert args.hard_max >= 4000
+    assert args.max_distance_ratio == pytest.approx(0.45)
+    assert args.min_anchor_ngram == 4
+    assert args.fallback_policy == "greedy+expand"
+    assert Path(args.char_map).name == STRICT_PRESET_CHAR_MAP.name
