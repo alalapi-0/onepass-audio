@@ -95,6 +95,7 @@ from onepass.debug_utils import set_debug_logging
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
+STRICT_PRESET_CHAR_MAP = ROOT_DIR / "config" / "char_map_no_breaks.json"
 DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
 DEFAULT_ALIGN_SPLIT_MODE = "punct+len"
 DEFAULT_ALIGN_MIN_LEN = 8
@@ -110,10 +111,10 @@ LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 _UI_PROCESSES: list[object] = []
 
 _STRICT_BASE = {
-    "max_distance_ratio": DEFAULT_MATCH_MAX_DISTANCE_RATIO,
-    "min_anchor_ngram": DEFAULT_MATCH_MIN_ANCHOR_NGRAM,
-    "fallback_policy": DEFAULT_MATCH_FALLBACK_POLICY,
-    "pause_gap_sec": 0.45,
+    "max_distance_ratio": 0.45,
+    "min_anchor_ngram": 4,
+    "fallback_policy": "greedy+expand",
+    "pause_gap_sec": PAUSE_GAP_SEC,
 }
 MATCH_PRESETS: dict[str, dict[str, float | int | str]] = {
     "strict_zh_punct": dict(_STRICT_BASE),
@@ -526,6 +527,39 @@ def _resolve_match_parameters(
         resolved_pause,
     )
     return resolved_ratio, resolved_anchor, resolved_fallback, resolved_pause
+
+
+def _apply_text_preset(args: argparse.Namespace) -> None:
+    """Apply text/segmentation overrides for specific match presets."""
+
+    name = (getattr(args, "match_preset", "") or "").strip().lower()
+    if name != "strict_zh_punct":
+        return
+    args.collapse_lines = True
+    current_char_map = getattr(args, "char_map", "")
+    if not current_char_map:
+        args.char_map = str(STRICT_PRESET_CHAR_MAP)
+    else:
+        try:
+            if Path(current_char_map).resolve() == DEFAULT_CHAR_MAP.resolve():
+                args.char_map = str(STRICT_PRESET_CHAR_MAP)
+        except OSError:
+            pass
+    args.split_mode = "punct"
+    args.weak_punct_enable = False
+    args.prosody_split = False
+    args.split_attach = "right"
+    args.min_len = min(int(getattr(args, "min_len", 8) or 8), 8)
+    max_len_value = int(getattr(args, "max_len", 2000) or 2000)
+    hard_max_value = int(getattr(args, "hard_max", 4000) or 4000)
+    args.max_len = max(max_len_value, 2000)
+    args.hard_max = max(hard_max_value, 4000)
+    if getattr(args, "max_distance_ratio", None) is None:
+        args.max_distance_ratio = _STRICT_BASE["max_distance_ratio"]
+    if getattr(args, "min_anchor_ngram", None) is None:
+        args.min_anchor_ngram = _STRICT_BASE["min_anchor_ngram"]
+    if not getattr(args, "fallback_policy", None):
+        args.fallback_policy = str(_STRICT_BASE["fallback_policy"])
 
 
 def _rule_split_text(
@@ -2867,6 +2901,48 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     pipeline_records: list[dict] = []
     start = time.perf_counter()
 
+    fast_match = bool(getattr(args, "fast_match", True))
+    max_windows = int(getattr(args, "max_windows", 50))
+    match_timeout = float(getattr(args, "match_timeout", 20.0))
+    ratio_input = getattr(args, "max_distance_ratio", None)
+    ratio_explicit = ratio_input is not None
+    max_distance_ratio = (
+        float(ratio_input) if ratio_input is not None else DEFAULT_MATCH_MAX_DISTANCE_RATIO
+    )
+    anchor_input = getattr(args, "min_anchor_ngram", None)
+    anchor_explicit = anchor_input is not None
+    min_anchor_ngram = (
+        int(anchor_input) if anchor_input is not None else DEFAULT_MATCH_MIN_ANCHOR_NGRAM
+    )
+    fallback_input = getattr(args, "fallback_policy", None)
+    fallback_explicit = bool(fallback_input)
+    fallback_policy = fallback_input or DEFAULT_MATCH_FALLBACK_POLICY
+    pause_gap_input = getattr(args, "pause_gap_sec", None)
+    pause_gap_explicit = pause_gap_input is not None
+    pause_gap_sec = float(pause_gap_input) if pause_gap_input is not None else PAUSE_GAP_SEC
+    compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
+    (
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+        pause_gap_sec,
+    ) = _resolve_match_parameters(
+        match_preset,
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+        pause_gap_sec,
+        ratio_explicit=ratio_explicit,
+        anchor_explicit=anchor_explicit,
+        fallback_explicit=fallback_explicit,
+        pause_gap_explicit=pause_gap_explicit,
+    )
+    args.max_distance_ratio = max_distance_ratio
+    args.min_anchor_ngram = min_anchor_ngram
+    args.fallback_policy = fallback_policy
+    args.pause_gap_sec = pause_gap_sec
+    _apply_text_preset(args)
+
     dedupe_policy = _ensure_dedupe_policy(args)
     line_eq = str(getattr(args, "line_eq", "char") or "char")
     line_dist_max = float(getattr(args, "line_dist_max", 0.15))
@@ -2979,47 +3055,6 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             len(missing_words),
         )
 
-    fast_match = bool(getattr(args, "fast_match", True))
-    max_windows = int(getattr(args, "max_windows", 50))
-    match_timeout = float(getattr(args, "match_timeout", 20.0))
-    ratio_input = getattr(args, "max_distance_ratio", None)
-    ratio_explicit = ratio_input is not None
-    max_distance_ratio = (
-        float(ratio_input) if ratio_input is not None else DEFAULT_MATCH_MAX_DISTANCE_RATIO
-    )
-    anchor_input = getattr(args, "min_anchor_ngram", None)
-    anchor_explicit = anchor_input is not None
-    min_anchor_ngram = (
-        int(anchor_input) if anchor_input is not None else DEFAULT_MATCH_MIN_ANCHOR_NGRAM
-    )
-    fallback_input = getattr(args, "fallback_policy", None)
-    fallback_explicit = bool(fallback_input)
-    fallback_policy = fallback_input or DEFAULT_MATCH_FALLBACK_POLICY
-    pause_gap_input = getattr(args, "pause_gap_sec", None)
-    pause_gap_explicit = pause_gap_input is not None
-    pause_gap_sec = float(pause_gap_input) if pause_gap_input is not None else PAUSE_GAP_SEC
-    compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
-    match_preset = getattr(args, "match_preset", None)
-    (
-        max_distance_ratio,
-        min_anchor_ngram,
-        fallback_policy,
-        pause_gap_sec,
-    ) = _resolve_match_parameters(
-        match_preset,
-        max_distance_ratio,
-        min_anchor_ngram,
-        fallback_policy,
-        pause_gap_sec,
-        ratio_explicit=ratio_explicit,
-        anchor_explicit=anchor_explicit,
-        fallback_explicit=fallback_explicit,
-        pause_gap_explicit=pause_gap_explicit,
-    )
-    args.max_distance_ratio = max_distance_ratio
-    args.min_anchor_ngram = min_anchor_ngram
-    args.fallback_policy = fallback_policy
-    args.pause_gap_sec = pause_gap_sec
     LOGGER.info(
         "[retake-config] alias_map_size=%s dedupe_policy=%s min_anchor_ngram=%s max_distance_ratio=%.2f fallback_policy=%s",
         len(alias_map or {}),
@@ -3369,6 +3404,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         canonical_render = "never"
     args.render_mode = canonical_render
     _ensure_dedupe_policy(args)
+    _apply_text_preset(args)
 
     debug_align = bool(getattr(args, "debug_align", False))
     parts: list[str] = [
@@ -3403,10 +3439,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--hard-punct", args.hard_punct])
     if args.soft_punct != DEFAULT_SOFT_PUNCT:
         parts.extend(["--soft-punct", args.soft_punct])
-    if args.split_attach != "left":
-        parts.extend(["--split-attach", args.split_attach])
-    if not args.weak_punct_enable:
-        parts.append("--no-weak-punct-enable")
+    parts.extend(["--split-attach", args.split_attach])
+    parts.append("--weak-punct-enable" if args.weak_punct_enable else "--no-weak-punct-enable")
     if not args.keep_quotes:
         parts.append("--no-keep-quotes")
     if args.audio_root:
@@ -3428,6 +3462,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.append("--no-emit-align")
     if debug_align:
         parts.append("--debug-align")
+    parts.append("--prosody-split" if args.prosody_split else "--no-prosody-split")
     if args.workers:
         parts.extend(["--workers", str(args.workers)])
     if args.no_interaction:
@@ -3483,6 +3518,9 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "no_collapse_align": args.no_collapse_align,
         "include_canonical_kits": args.include_canonical_kits,
         "split_mode": args.split_mode,
+        "weak_punct_enable": args.weak_punct_enable,
+        "prosody_split": args.prosody_split,
+        "split_attach": args.split_attach,
         "render": canonical_render,
         "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
         "prefer_relative_audio": args.prefer_relative_audio,
@@ -4017,7 +4055,10 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--match-preset",
         choices=MATCH_PRESET_CHOICES,
-        help="匹配参数预设（strict_zh_punct=严格中文朗读默认；tolerant=旧版宽松）",
+        help=(
+            "匹配参数预设（strict_zh_punct=只按中文句末标点切句+统一空白+右挂标点+放宽长度限制；"
+            "tolerant=旧版宽松）"
+        ),
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
@@ -4544,7 +4585,10 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--match-preset",
         choices=MATCH_PRESET_CHOICES,
-        help="匹配参数预设（strict_zh_punct=严格中文朗读默认；tolerant=旧版宽松）",
+        help=(
+            "匹配参数预设（strict_zh_punct=只按中文句末标点切句+统一空白+右挂标点+放宽长度限制；"
+            "tolerant=旧版宽松）"
+        ),
     )
     pipeline.set_defaults(func=handle_all_in_one)
 
