@@ -68,6 +68,11 @@ _SPECIAL_WHITESPACE = {
     "\u2029": " ",
 }
 
+_NBSP_RE = re.compile(r"[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000]")
+_SOFT_BREAK_RE = re.compile(r"[ \t\f\v]*\r?\n[ \t\f\v]*")
+_ASCII_SPACE_RUN = re.compile(r"([ -~])\s{2,}([ -~])")
+_SOFT_STRIP = " \t\f\v\r\n"
+
 _ASCII_PARENS = {"(", ")", "[", "]", "{", "}"}
 _FULLWIDTH_PARENS = {"（", "）"}
 _FULLWIDTH_PAREN_TO_ASCII = str.maketrans({"（": "(", "）": ")"})
@@ -128,6 +133,44 @@ def _normalize_whitespace(text: str, collapse_lines: bool) -> str:
     return compacted.strip()
 
 
+def _should_join_with_space(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    left_char = left[-1]
+    right_char = right[0]
+    return (
+        left_char.isascii()
+        and right_char.isascii()
+        and left_char.isalnum()
+        and right_char.isalnum()
+    )
+
+
+def _collapse_soft_linebreaks(text: str) -> str:
+    """Collapse soft line breaks, tabs, and narrow spaces into single spaces."""
+
+    if not text:
+        return ""
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\t", " ")
+    normalized = normalized.replace("\f", " ")
+    normalized = normalized.replace("\v", " ")
+    normalized = _NBSP_RE.sub(" ", normalized)
+
+    def _join(match: re.Match[str]) -> str:
+        left = match.string[: match.start()]
+        right = match.string[match.end() :]
+        left_char = left.rstrip(_SOFT_STRIP)[-1:]
+        right_char = right.lstrip(_SOFT_STRIP)[:1]
+        return " " if _should_join_with_space(left_char, right_char) else ""
+
+    normalized = _SOFT_BREAK_RE.sub(_join, normalized)
+    normalized = _ASCII_SPACE_RUN.sub(lambda m: f"{m.group(1)} {m.group(2)}", normalized)
+    normalized = re.sub(r"[ ]{2,}", " ", normalized)
+    return normalized.strip()
+
+
 def _squash_mixed_spacing(text: str) -> str:
     result = _RE_ASCII_BLOCK.sub(lambda m: m.group(1) + " ", text)
     result = _RE_ASCII_BLOCK_LEFT.sub(lambda m: " " + m.group(1), result)
@@ -174,6 +217,8 @@ def normalize_text_for_export(
             len(char_map.get("map", {})),
         )
     normalized = _normalize_whitespace(normalized, collapse_lines)
+    if collapse_lines:
+        normalized = _collapse_soft_linebreaks(normalized)
     if cfg.drop_ascii_parens:
         table = {ord(ch): None for ch in _ASCII_PARENS}
         normalized = normalized.translate(table)
@@ -396,9 +441,15 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
 
     if not text:
         return []
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = _RE_LINE_BREAK.sub(" ", normalized)
-    normalized = _RE_SPACE_RUN.sub(" ", normalized).strip()
+    collapse_enabled = bool(getattr(cfg, "collapse_lines", False))
+    normalized = (
+        _collapse_soft_linebreaks(text)
+        if collapse_enabled
+        else text.replace("\r\n", "\n").replace("\r", "\n")
+    )
+    normalized = normalized.strip()
+    if not collapse_enabled:
+        normalized = _RE_SPACE_RUN.sub(" ", normalized)
     if not normalized:
         return []
     state: dict | None = None
@@ -422,9 +473,9 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
 
 
 def collapse_soft_linebreaks(text: str) -> str:
-    """Compatibility wrapper exposing the legacy helper under the new module."""
+    """Public helper collapsing soft line breaks/tabs/nbsp into spaces."""
 
-    return _legacy_normalize.collapse_soft_linebreaks(text)
+    return _collapse_soft_linebreaks(text)
 
 
 # Re-export legacy helpers for compatibility.
