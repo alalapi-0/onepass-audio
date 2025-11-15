@@ -7,6 +7,7 @@ import math
 import re
 import time
 import itertools
+import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,8 @@ _DEDUPE_POLICY_MAP = {
     "dp": ("aggressive", "dp"),
 }
 
+_SIM_TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
+
 
 def _resolve_dedupe_policy(policy: str | None) -> tuple[str, str]:
     """Return (label, effective_mode) for dedupe policy strings."""
@@ -124,6 +127,149 @@ class KeepSpan:
     end: float
     score: float = 1.0
     candidate_id: int = -1
+
+
+def _normalize_similarity_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "").lower()
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _token_jaccard_similarity(left: str, right: str) -> float:
+    left_norm = _normalize_similarity_text(left)
+    right_norm = _normalize_similarity_text(right)
+    left_tokens = set(_SIM_TOKEN_RE.findall(left_norm))
+    right_tokens = set(_SIM_TOKEN_RE.findall(right_norm))
+    if left_tokens or right_tokens:
+        union = left_tokens | right_tokens
+        if not union:
+            return 1.0
+        return len(left_tokens & right_tokens) / len(union)
+    if not left_norm and not right_norm:
+        return 1.0
+    if not left_norm or not right_norm:
+        return 0.0
+    matches = sum(1 for a, b in zip(left_norm, right_norm) if a == b)
+    return matches / max(len(left_norm), len(right_norm), 1)
+
+
+def _total_duration(spans: Sequence[KeepSpan]) -> float:
+    return sum(max(0.0, span.end - span.start) for span in spans)
+
+
+def _cut_ratio(spans: Sequence[KeepSpan]) -> float:
+    if not spans:
+        return 0.0
+    start = min(span.start for span in spans)
+    end = max(span.end for span in spans)
+    window = max(0.0, end - start)
+    if window <= 0.0:
+        return 0.0
+    return max(0.0, min(1.0, _total_duration(spans) / window))
+
+
+def _apply_keep_last_dedupe(
+    keeps: Sequence[KeepSpan],
+    policy: str,
+) -> tuple[list[KeepSpan], dict[str, object], list[int]]:
+    normalized_policy = (policy or "none").strip().lower()
+    if normalized_policy not in {"none", "safe", "aggressive"}:
+        normalized_policy = "none"
+    before_count = len(keeps)
+    before_duration = _total_duration(keeps)
+    before_ratio = _cut_ratio(keeps)
+    stats: dict[str, object] = {
+        "policy": normalized_policy,
+        "before_count": before_count,
+        "after_count": before_count,
+        "duration_before": before_duration,
+        "duration_after": before_duration,
+        "cut_ratio_before": before_ratio,
+        "cut_ratio_after": before_ratio,
+        "merged_count": 0,
+        "removed_count": 0,
+    }
+    removed_ids: list[int] = []
+    if normalized_policy == "none" or before_count < 2:
+        return list(keeps), stats, removed_ids
+    threshold = 0.85 if normalized_policy == "safe" else 0.75
+    allow_bridge = normalized_policy == "aggressive"
+    result: list[KeepSpan] = []
+    pending_blank: KeepSpan | None = None
+    merged_count = 0
+    removed_segments = 0
+
+    def _consume_blank() -> KeepSpan | None:
+        nonlocal pending_blank
+        blank = pending_blank
+        pending_blank = None
+        return blank
+
+    for keep in keeps:
+        is_blank = not (keep.text or "").strip()
+        if allow_bridge and is_blank:
+            if pending_blank is None:
+                pending_blank = keep
+            else:
+                result.append(pending_blank)
+                pending_blank = keep
+            continue
+        blank_bridge = _consume_blank() if allow_bridge else None
+        if not result:
+            if blank_bridge is not None:
+                result.append(blank_bridge)
+            result.append(keep)
+            continue
+        prev_keep = result[-1]
+        similarity = _token_jaccard_similarity(prev_keep.text, keep.text)
+        overlap = min(prev_keep.end, keep.end) - max(prev_keep.start, keep.start)
+        has_overlap = overlap > 0
+        if blank_bridge is not None and not has_overlap:
+            gap = keep.start - prev_keep.end
+            allowed_gap = max(0.0, blank_bridge.end - blank_bridge.start)
+            has_overlap = gap <= allowed_gap + 0.05
+        if similarity >= threshold and has_overlap and keep.start >= prev_keep.start:
+            merged_count += 1
+            removed_segments += 1
+            if prev_keep.candidate_id >= 0:
+                removed_ids.append(prev_keep.candidate_id)
+            if blank_bridge is not None:
+                removed_segments += 1
+                if blank_bridge.candidate_id >= 0:
+                    removed_ids.append(blank_bridge.candidate_id)
+            new_start = min(prev_keep.start, keep.start)
+            new_end = max(prev_keep.end, keep.end)
+            if blank_bridge is not None:
+                new_start = min(new_start, blank_bridge.start)
+                new_end = max(new_end, blank_bridge.end)
+            result[-1] = KeepSpan(
+                line_no=keep.line_no,
+                text=keep.text,
+                start=new_start,
+                end=new_end,
+                score=max(prev_keep.score, keep.score),
+                candidate_id=keep.candidate_id,
+            )
+            continue
+        if blank_bridge is not None:
+            result.append(blank_bridge)
+        result.append(keep)
+
+    if pending_blank is not None:
+        result.append(pending_blank)
+
+    after_duration = _total_duration(result)
+    after_ratio = _cut_ratio(result)
+    stats.update(
+        {
+            "after_count": len(result),
+            "duration_after": after_duration,
+            "cut_ratio_after": after_ratio,
+            "merged_count": merged_count,
+            "removed_count": removed_segments,
+        }
+    )
+    return result, stats, removed_ids
 
 
 @dataclass(slots=True)
@@ -1013,6 +1159,18 @@ def compute_retake_keep_last(
     active_deadline = compute_deadline
 
     candidate_counter = itertools.count(1)
+    simple_dedupe_stats: dict[str, object] = {
+        "policy": dedupe_label,
+        "before_count": 0,
+        "after_count": 0,
+        "duration_before": 0.0,
+        "duration_after": 0.0,
+        "cut_ratio_before": 0.0,
+        "cut_ratio_after": 0.0,
+        "merged_count": 0,
+        "removed_count": 0,
+    }
+    simple_removed_ids: list[int] = []
 
     def _align_once(min_sent_cutoff: int, dup_gap: float) -> dict[str, object]:
         local_keeps: list[KeepSpan] = []
@@ -1333,6 +1491,27 @@ def compute_retake_keep_last(
             monotonic_mode=monotonic_mode,
             monotonic_epsilon=float(monotonic_epsilon),
         )
+        snapped_keeps, simple_dedupe_stats, simple_removed_ids = _apply_keep_last_dedupe(
+            snapped_keeps,
+            dedupe_label,
+        )
+        LOGGER.info(
+            "[dedupe-simple] policy=%s before=%s after=%s merged=%s removed=%s",
+            simple_dedupe_stats.get("policy"),
+            simple_dedupe_stats.get("before_count"),
+            simple_dedupe_stats.get("after_count"),
+            simple_dedupe_stats.get("merged_count"),
+            simple_dedupe_stats.get("removed_count"),
+        )
+        if simple_removed_ids:
+            removed_set = {cid for cid in simple_removed_ids if cid >= 0}
+            if removed_set:
+                filtered_rows: list[dict[str, object]] = []
+                for row in timeline_rows:
+                    cid = int(row.get("candidate_id", -1) or -1)
+                    if cid < 0 or cid not in removed_set:
+                        filtered_rows.append(row)
+                timeline_rows = filtered_rows
         timeline_rows_final = timeline_rows
 
         timeline_map: dict[int, dict[str, object]] = {}
@@ -1619,6 +1798,7 @@ def compute_retake_keep_last(
         stats.update(snap_stats)
         stats.update(dp_stats)
         stats.update(monotonic_stats)
+        stats["simple_dedupe"] = simple_dedupe_stats
         stats["aligned_lines"] = stats["matched_lines"]
         stats["unaligned_lines"] = max(0, stats["total_lines"] - stats["matched_lines"])
         if align_line_count_read is not None:
@@ -1717,6 +1897,7 @@ def compute_retake_keep_last(
         }
         stats.update(dp_stats)
         stats.update(monotonic_stats)
+        stats["simple_dedupe"] = simple_dedupe_stats
         keeps = []
         edl_keep_segments = []
         drops = []

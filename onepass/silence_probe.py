@@ -39,6 +39,9 @@ def probe_silence_ffmpeg(audio: Path, noise_db: float = -35.0, min_d: float = 0.
     cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "warning",
         "-nostdin",
         "-i",
         str(audio),
@@ -53,9 +56,7 @@ def probe_silence_ffmpeg(audio: Path, noise_db: float = -35.0, min_d: float = 0.
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             check=False,
         )
     except FileNotFoundError:
@@ -65,7 +66,8 @@ def probe_silence_ffmpeg(audio: Path, noise_db: float = -35.0, min_d: float = 0.
         LOGGER.warning("调用 ffmpeg 失败，跳过静音探测: %s", exc)
         return []
 
-    stderr = result.stderr or ""
+    stderr_bytes = result.stderr or b""
+    stderr = stderr_bytes.decode("utf-8", "ignore")
     ranges: List[Tuple[float, float]] = []
     pending: float | None = None
     for raw_line in stderr.splitlines():
