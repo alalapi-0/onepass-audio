@@ -97,7 +97,7 @@ DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范�
 DEFAULT_CHAR_MAP = ROOT_DIR / "config" / "default_char_map.json"  # 默认字符映射
 STRICT_PRESET_CHAR_MAP = ROOT_DIR / "config" / "char_map_no_breaks.json"
 DEFAULT_ALIAS_MAP = ROOT_DIR / "config" / "default_alias_map.json"
-DEFAULT_ALIGN_SPLIT_MODE = "punct+len"
+DEFAULT_ALIGN_SPLIT_MODE = "punct"
 DEFAULT_ALIGN_MIN_LEN = 8
 DEFAULT_ALIGN_MAX_LEN = 24
 DEFAULT_ALIGN_HARD_MAX = 32
@@ -177,13 +177,24 @@ def _coerce_punct_string(value: str | Sequence[str] | None, fallback: str) -> st
     return "".join(parts) if parts else fallback
 
 
-def _get_split_attach(args: argparse.Namespace, default: str = "left") -> str:
+def _get_split_attach(args: argparse.Namespace, default: str = "right") -> str:
     for attr in ("split_attach", "attach", "punct_attach"):
         if hasattr(args, attr):
             value = getattr(args, attr)
             if value:
                 return value
     return default
+
+
+def _resolve_split_attach(value: str | None, *, warn: bool = False) -> str:
+    normalized = (value or "").strip().lower()
+    if not normalized:
+        return "right"
+    if normalized == "left":
+        if warn:
+            LOGGER.warning("当前分句实现仅支持右挂标点，已强制改为 right")
+        return "right"
+    return normalized
 
 
 def _guess_words_json(text_path: Path) -> Path | None:
@@ -212,7 +223,7 @@ def _build_prosody_config(
     hard_punct: str | Sequence[str] | None,
     soft_punct: str | Sequence[str] | None,
 ) -> ProsodyConfig:
-    enabled = getattr(args, "prosody_split", True)
+    enabled = getattr(args, "prosody_split", False)
     return ProsodyConfig(
         enabled=bool(enabled),
         pause_gap_ms=float(getattr(args, "pause_gap_ms", 160.0)),
@@ -582,7 +593,7 @@ def _rule_split_text(
         hard_max=hard_max,
         hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
         soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT) if soft_enabled else "",
-        attach_side=attach or "left",
+        attach_side=attach or "right",
     )
     return split_sentences_with_rules(text, cfg)
 
@@ -595,6 +606,7 @@ def _process_single_text(
     opencc_mode: str,
     dry_run: bool,
     collapse_lines: bool,
+    hard_collapse_lines: bool,
     emit_align: bool,
     split_mode: str,
     canonical_rules: CanonicalRules | None,
@@ -669,12 +681,13 @@ def _process_single_text(
         ascii_paren_mapping=ascii_paren_mapping,
         squash_mixed_english=squash_mixed_english,
         collapse_lines=collapse_lines,
+        hard_collapse_lines=hard_collapse_lines,
         max_len=align_max_len,
         min_len=align_min_len,
         hard_max=align_hard_max,
         hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
         soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
-        attach_side=split_attach or "left",
+        attach_side=split_attach or "right",
     )
     try:
         normalized_text = normalize_text_for_export(
@@ -846,7 +859,7 @@ def _process_single_text(
                     min_len=align_min_len,
                     max_len=align_max_len,
                     hard_max=align_hard_max,
-                    attach=split_attach or "left",
+                    attach=split_attach or "right",
                     hard_punct=hard_punct,
                     soft_punct=soft_punct,
                     soft_enabled=(split_mode == "punct+len"),
@@ -873,7 +886,7 @@ def _process_single_text(
                             min_len=8,
                             max_len=20,
                             hard_max=28,
-                            attach=split_attach or "left",
+                            attach=split_attach or "right",
                             hard_punct=hard_punct,
                             soft_punct=soft_punct,
                             soft_enabled=True,
@@ -885,7 +898,7 @@ def _process_single_text(
                             min_len=8,
                             max_len=20,
                             hard_max=28,
-                            attach=split_attach or "left",
+                            attach=split_attach or "right",
                             hard_punct=hard_punct,
                             soft_punct=soft_punct,
                             soft_enabled=True,
@@ -913,7 +926,7 @@ def _process_single_text(
                     "[split] hard=%s soft=%s attach=%s max_len=%s -> lines=%s",
                     _coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
                     _coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
-                    (split_attach or "left"),
+                    (split_attach or "right"),
                     align_max_len,
                     len(align_lines),
                 )
@@ -1110,6 +1123,7 @@ def run_prep_norm(
     glob_pattern: str,
     dry_run: bool,
     collapse_lines: bool,
+    hard_collapse_lines: bool,
     emit_align: bool,
     *,
     allow_missing_char_map: bool = False,
@@ -1128,7 +1142,7 @@ def run_prep_norm(
     squash_mixed_english: bool = False,
     hard_punct: str | Sequence[str] | None = DEFAULT_HARD_PUNCT,
     soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
-    split_attach: str = "left",
+    split_attach: str = "right",
     prosody_config: ProsodyConfig | None = None,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
@@ -1150,6 +1164,7 @@ def run_prep_norm(
             "preserve_cjk_punct": True,
         }
     canonical_rules = _load_canonical_rules(char_map_path)
+    split_attach = _resolve_split_attach(split_attach)
     out_dir = _ensure_out_dir(output_dir)  # 校验并创建输出目录
     input_path = input_path.expanduser().resolve()  # 解析输入路径
     if input_path.is_file():  # 单文件模式
@@ -1168,6 +1183,10 @@ def run_prep_norm(
     failed = 0  # 统计失败数量
     total = len(files)
     LOGGER.info("[stage] norm start total=%s", total)
+    if hard_collapse_lines:
+        LOGGER.info("[normalize] hard-collapse-lines=on (tabs/newlines/fullwidth → single space)")
+    else:
+        LOGGER.info("[normalize] hard-collapse-lines=off (skip forced whitespace collapse)")
     if collapse_lines:
         LOGGER.info("[normalize] collapse-lines=on (ascii-ascii -> space, others -> join)")
     else:
@@ -1193,10 +1212,11 @@ def run_prep_norm(
             cmap,
             opencc_mode,
             dry_run,
-            collapse_lines,
-            emit_align,
-            split_mode,
-            canonical_rules if emit_align else None,
+            collapse_lines=collapse_lines,
+            hard_collapse_lines=hard_collapse_lines,
+            emit_align=emit_align,
+            split_mode=split_mode,
+            canonical_rules=canonical_rules if emit_align else None,
             align_min_len=align_min_len,
             align_max_len=align_max_len,
             align_hard_max=align_hard_max,
@@ -1240,6 +1260,7 @@ def run_prep_norm(
 def handle_prep_norm(args: argparse.Namespace) -> int:
     """处理 prep-norm 子命令。"""
 
+    args.split_attach = _resolve_split_attach(args.split_attach, warn=True)
     cmd = _build_cli_example(
         "prep-norm",
         [
@@ -1255,6 +1276,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.glob,
         ]
         + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
+        + (["--hard-collapse-lines"] if args.hard_collapse_lines else [])
         + (["--emit-align"] if args.emit_align else [])
         + (["--debug-align"] if args.debug_align else [])
         + (["--split-mode", args.split_mode] if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE else [])
@@ -1263,8 +1285,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         + (["--hard-max", str(args.hard_max)] if args.hard_max != DEFAULT_ALIGN_HARD_MAX else [])
         + (["--hard-punct", args.hard_punct] if args.hard_punct != DEFAULT_HARD_PUNCT else [])
         + (["--soft-punct", args.soft_punct] if args.soft_punct != DEFAULT_SOFT_PUNCT else [])
-        + (["--split-attach", args.split_attach] if args.split_attach != "left" else [])
-        + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
+        + (["--split-attach", args.split_attach] if args.split_attach != "right" else [])
+        + (["--weak-punct-enable"] if args.weak_punct_enable else [])
         + (["--no-keep-quotes"] if not args.keep_quotes else [])
         + (["--no-drop-ascii-parens"] if not args.drop_ascii_parens else [])
         + (["--no-preserve-fullwidth-parens"] if not args.preserve_fullwidth_parens else [])
@@ -1288,6 +1310,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.glob,
             args.dry_run,
             args.collapse_lines,
+            args.hard_collapse_lines,
             args.emit_align,
             split_mode=args.split_mode,
             align_min_len=args.min_len,
@@ -2452,6 +2475,7 @@ def handle_retake_keep_last(args: argparse.Namespace) -> int:
     if args.path_style != "auto":
         parts.extend(["--path-style", args.path_style])
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
+    parts.append("--hard-collapse-lines" if args.hard_collapse_lines else "--no-hard-collapse-lines")
     if not args.drop_ascii_parens:
         parts.append("--no-drop-ascii-parens")
     if args.source_audio:
@@ -2973,7 +2997,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     align_min_len = int(getattr(args, "min_len", DEFAULT_ALIGN_MIN_LEN))
     align_max_len = int(getattr(args, "max_len", DEFAULT_ALIGN_MAX_LEN))
     align_hard_max = int(getattr(args, "hard_max", DEFAULT_ALIGN_HARD_MAX))
-    align_weak = bool(getattr(args, "weak_punct_enable", True))
+    align_weak = bool(getattr(args, "weak_punct_enable", False))
     align_keep = bool(getattr(args, "keep_quotes", True))
     hard_punct = getattr(args, "hard_punct", DEFAULT_HARD_PUNCT)
     soft_punct = getattr(args, "soft_punct", DEFAULT_SOFT_PUNCT)
@@ -2992,6 +3016,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         norm_pattern,
         dry_run=False,
         collapse_lines=args.collapse_lines,
+        hard_collapse_lines=args.hard_collapse_lines,
         emit_align=args.emit_align,
         allow_missing_char_map=True,
         split_mode=split_mode,
@@ -3405,6 +3430,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     args.render_mode = canonical_render
     _ensure_dedupe_policy(args)
     _apply_text_preset(args)
+    args.split_attach = _resolve_split_attach(args.split_attach, warn=True)
 
     debug_align = bool(getattr(args, "debug_align", False))
     parts: list[str] = [
@@ -3515,6 +3541,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "glob_audio": args.glob_audio,
         "glob_audio_list": parse_glob_list(args.glob_audio),
         "collapse_lines": args.collapse_lines,
+        "hard_collapse_lines": args.hard_collapse_lines,
         "no_collapse_align": args.no_collapse_align,
         "include_canonical_kits": args.include_canonical_kits,
         "split_mode": args.split_mode,
@@ -3607,6 +3634,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="规范化时折叠换行并按句分行 (默认开启)",
     )
     prep.add_argument(
+        "--hard-collapse-lines",
+        dest="hard_collapse_lines",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="先将换行/制表符/全角空格统一为单空格并压缩空白（默认关闭）",
+    )
+    prep.add_argument(
         "--emit-align",
         action="store_true",
         help="额外生成去标点的 .align.txt 供词级对齐与可视化使用",
@@ -3620,7 +3654,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-mode",
         choices=["punct", "all-punct", "punct+len"],
         default=DEFAULT_ALIGN_SPLIT_MODE,
-        help="对齐文本切句策略 (默认 punct+len)",
+        help="对齐文本切句策略 (默认 punct)",
     )
     prep.add_argument(
         "--min-len",
@@ -3651,8 +3685,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--weak-punct-enable",
         dest="weak_punct_enable",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="弱标点可作为断句点（默认开启）",
+        default=False,
+        help="弱标点可作为断句点（默认关闭）",
     )
     prep.add_argument(
         "--keep-quotes",
@@ -3717,15 +3751,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--punct-attach",
         dest="split_attach",
         choices=["left", "right"],
-        default="left",
-        help="硬标点归属（默认 left，兼容旧版 --attach/--punct-attach）",
+        default="right",
+        help="硬标点归属（当前仅支持 right，传 left 会自动回退）",
     )
     prep.add_argument(
         "--prosody-split",
         dest="prosody_split",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="punct+len 模式下启用语气/呼吸位切句（默认开启）",
+        default=False,
+        help="punct+len 模式下启用语气/呼吸位切句（默认关闭）",
     )
     prep.add_argument("--pause-gap-ms", type=float, default=160.0, help="预测停顿阈值 (毫秒)")
     prep.add_argument("--micro-silence-db", type=int, default=-35, help="微停顿噪声门限 (dBFS)")
@@ -4201,6 +4235,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="规范化阶段是否折叠换行并按句输出 (默认开启)",
     )
     pipeline.add_argument(
+        "--hard-collapse-lines",
+        dest="hard_collapse_lines",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否额外启用硬清空白（默认关闭，兼容旧流程）",
+    )
+    pipeline.add_argument(
         "--char-map",
         dest="char_map",
         default=str(DEFAULT_CHAR_MAP),
@@ -4250,7 +4291,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="split_mode",
         choices=["punct", "all-punct", "punct+len"],
         default=DEFAULT_ALIGN_SPLIT_MODE,
-        help="规范化阶段输出 .align.txt 时的切句策略 (默认 punct+len)",
+        help="规范化阶段输出 .align.txt 时的切句策略 (默认 punct)",
     )
     pipeline.add_argument(
         "--min-len",
@@ -4281,8 +4322,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--weak-punct-enable",
         dest="weak_punct_enable",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="规范化阶段弱标点是否可断句（默认开启）",
+        default=False,
+        help="规范化阶段弱标点是否可断句（默认关闭）",
     )
     pipeline.add_argument(
         "--keep-quotes",
@@ -4394,15 +4435,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--punct-attach",
         dest="split_attach",
         choices=["left", "right"],
-        default="left",
-        help="硬标点归属（默认 left，兼容旧版 --attach/--punct-attach）",
+        default="right",
+        help="硬标点归属（当前仅支持 right，传 left 会提示并改写）",
     )
     pipeline.add_argument(
         "--prosody-split",
         dest="prosody_split",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="punct+len 模式下启用语气/呼吸位切句（默认开启）",
+        default=False,
+        help="punct+len 模式下启用语气/呼吸位切句（默认关闭）",
     )
     pipeline.add_argument("--pause-gap-ms", type=float, default=160.0, help="预测停顿阈值 (毫秒)")
     pipeline.add_argument("--micro-silence-db", type=int, default=-35, help="微停顿噪声门限 (dBFS)")
