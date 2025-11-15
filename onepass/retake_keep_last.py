@@ -77,8 +77,9 @@ MIN_SENT_CHARS = 12  # 句子长度低于该阈值不参与去重
 MAX_DUP_GAP_SEC = 30.0  # 相邻命中间隔超过该值则认为不是重录
 MAX_WINDOW_SEC = 90.0  # 单段 drop 上限
 FALLBACK_MAX_KEEP_SEC = 20.0  # 兜底段最长保留时长
+DEFAULT_FALLBACK_POLICY = "greedy+expand"
 
-PAUSE_GAP_SEC = 0.45  # 词间间隔超过该值视为自然停顿
+PAUSE_GAP_SEC = 0.55  # 词间间隔超过该值视为自然停顿
 PAUSE_SNAP_LIMIT = 0.20  # 段首尾可吸附到停顿边界的最大距离
 PAD_BEFORE = 0.08  # EDL 段首补偿
 PAD_AFTER = 0.12  # EDL 段尾补偿
@@ -1068,9 +1069,9 @@ def compute_retake_keep_last(
     fast_match: bool = True,
     max_windows: int = 200,
     match_timeout: float = 60.0,
-    max_distance_ratio: float = 0.35,
-    min_anchor_ngram: int = 6,
-    fallback_policy: str = "greedy",
+    max_distance_ratio: float = 0.45,
+    min_anchor_ngram: int = 4,
+    fallback_policy: str = DEFAULT_FALLBACK_POLICY,
     compute_timeout_sec: float = 300.0,
     no_collapse_align: bool = True,
     drop_ascii_parens: bool = False,
@@ -1116,7 +1117,7 @@ def compute_retake_keep_last(
             alias_map=alias_map,
         )
         lines = normalized_text.splitlines()  # 按行拆分原文
-    fallback_policy_input = str(fallback_policy or "greedy")
+    fallback_policy_input = str(fallback_policy or DEFAULT_FALLBACK_POLICY)
     fallback_policy = fallback_policy_input.strip().lower()
     if fallback_policy == "greedy":
         fallback_policy = "align-greedy"
@@ -1431,6 +1432,7 @@ def compute_retake_keep_last(
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
     recomputed = False
+    guard_log_pending = False
     coarse_total = 0
     coarse_passed = 0
     fine_evaluated_total = 0
@@ -1923,36 +1925,46 @@ def compute_retake_keep_last(
         guard_triggered = False
         if not recomputed and ratio_snapshot > guard_threshold and raw_keeps:
             guard_triggered = True
-            new_min_sent = max(current_min_sent + 4, int(math.ceil(current_min_sent * 1.2)))
-            new_dup_gap = max(0.5, current_dup_gap * 0.6) if current_dup_gap > 0 else current_dup_gap
-            if new_min_sent != current_min_sent or not math.isclose(new_dup_gap, current_dup_gap, rel_tol=1e-2):
-                LOGGER.warning(
-                    "降级: stem=%s reason=cut_ratio_guard -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
-                    debug_label or "-",
-                    current_min_sent,
-                    new_min_sent,
-                    current_dup_gap,
-                    new_dup_gap,
-                )
-                previous_params = {
-                    "min_sent": current_min_sent,
-                    "max_dup_gap": current_dup_gap,
+            new_min_sent = current_min_sent + 4
+            new_dup_gap = current_dup_gap
+            if current_dup_gap > 0:
+                new_dup_gap = min(current_dup_gap, 15.0)
+            LOGGER.warning(
+                "降级: stem=%s reason=cut_ratio_guard -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
+                debug_label or "-",
+                current_min_sent,
+                new_min_sent,
+                current_dup_gap,
+                new_dup_gap,
+            )
+            previous_params = {
+                "min_sent": current_min_sent,
+                "max_dup_gap": current_dup_gap,
+            }
+            degrade_reason = degrade_reason or "cut_ratio_guard"
+            current_min_sent = new_min_sent
+            current_dup_gap = new_dup_gap
+            degrade_history.append(
+                {
+                    "reason": "cut_ratio_guard",
+                    "previous": previous_params,
+                    "adjusted": {
+                        "min_sent": current_min_sent,
+                        "max_dup_gap": current_dup_gap,
+                    },
                 }
-                degrade_reason = degrade_reason or "cut_ratio_guard"
-                current_min_sent = new_min_sent
-                current_dup_gap = new_dup_gap
-                degrade_history.append(
-                    {
-                        "reason": "cut_ratio_guard",
-                        "previous": previous_params,
-                        "adjusted": {
-                            "min_sent": current_min_sent,
-                            "max_dup_gap": current_dup_gap,
-                        },
-                    }
-                )
-                recomputed = True
-                continue
+            )
+            guard_log_pending = True
+            recomputed = True
+            continue
+        if guard_log_pending and not guard_triggered:
+            LOGGER.info(
+                "[cut-ratio-guard] final params min_sent=%s max_dup_gap=%.2f cut_ratio=%.3f",
+                current_min_sent,
+                current_dup_gap,
+                ratio_snapshot,
+            )
+            guard_log_pending = False
         log_debug(
             "[cut-ratio] threshold=%.2f ratio=%.3f triggered=%s min_sent=%s->%s max_dup_gap=%.2f->%.2f",
             guard_threshold,

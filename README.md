@@ -800,9 +800,9 @@ python onepass_main.py
 python scripts/onepass_cli.py all-in-one --in materials --out out \
   --render auto --no-interaction --alias-map config/default_alias_map.json
 
-# 宽容参数：启用 tolerant 预设
+# 宽容参数：启用 speech_zh_reading 预设
 python scripts/onepass_cli.py all-in-one --in materials --out out \
-  --render auto --no-interaction --match-preset tolerant \
+  --render auto --no-interaction --match-preset speech_zh_reading \
   --alias-map config/default_alias_map.json
 ```
 

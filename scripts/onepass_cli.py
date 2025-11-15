@@ -102,9 +102,24 @@ DEFAULT_ALIGN_MAX_LEN = 24
 DEFAULT_ALIGN_HARD_MAX = 32
 DEFAULT_LEX_CUES = "但是,而且,因为,所以,比如,然而,如果,总之,同时,另外"
 DEFAULT_ENUM_CUES = "一是,二是,三是,首先,其次,再次,最后"
+DEFAULT_MATCH_MAX_DISTANCE_RATIO = 0.45
+DEFAULT_MATCH_MIN_ANCHOR_NGRAM = 4
+DEFAULT_MATCH_FALLBACK_POLICY = "greedy+expand"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 _UI_PROCESSES: list[object] = []
+
+_MATCH_PRESET_BASE = {
+    "max_distance_ratio": DEFAULT_MATCH_MAX_DISTANCE_RATIO,
+    "min_anchor_ngram": DEFAULT_MATCH_MIN_ANCHOR_NGRAM,
+    "fallback_policy": DEFAULT_MATCH_FALLBACK_POLICY,
+    "pause_gap_sec": PAUSE_GAP_SEC,
+}
+MATCH_PRESETS: dict[str, dict[str, float | int | str]] = {
+    "speech_zh_reading": dict(_MATCH_PRESET_BASE),
+    "tolerant": dict(_MATCH_PRESET_BASE),
+}
+MATCH_PRESET_CHOICES = tuple(MATCH_PRESETS.keys())
 
 
 _DEDUPE_LABELS = {"none", "safe", "aggressive"}
@@ -479,17 +494,33 @@ def _resolve_match_parameters(
     ratio: float,
     anchor: int,
     fallback: str,
-) -> tuple[float, int, str]:
+    pause_gap: float,
+    *,
+    ratio_explicit: bool = False,
+    anchor_explicit: bool = False,
+    fallback_explicit: bool = False,
+    pause_gap_explicit: bool = False,
+) -> tuple[float, int, str, float]:
     preset_name = (preset or "").strip().lower()
     if not preset_name:
-        return ratio, anchor, fallback
-    if preset_name == "tolerant":
-        LOGGER.info(
-            "match preset tolerant -> max_distance_ratio=0.45 min_anchor_ngram=4 fallback=greedy+expand"
-        )
-        return 0.45, 4, "greedy+expand"
-    LOGGER.warning("未知 match preset=%s，使用显式参数。", preset_name)
-    return ratio, anchor, fallback
+        return ratio, anchor, fallback, pause_gap
+    config = MATCH_PRESETS.get(preset_name)
+    if not config:
+        LOGGER.warning("未知 match preset=%s，使用显式参数。", preset_name)
+        return ratio, anchor, fallback, pause_gap
+    resolved_ratio = ratio if ratio_explicit else float(config["max_distance_ratio"])
+    resolved_anchor = anchor if anchor_explicit else int(config["min_anchor_ngram"])
+    resolved_fallback = fallback if fallback_explicit else str(config["fallback_policy"])
+    resolved_pause = pause_gap if pause_gap_explicit else float(config.get("pause_gap_sec", pause_gap))
+    LOGGER.info(
+        "match preset %s -> max_distance_ratio=%.2f min_anchor_ngram=%s fallback=%s pause_gap_sec=%.2f",
+        preset_name,
+        resolved_ratio,
+        resolved_anchor,
+        resolved_fallback,
+        resolved_pause,
+    )
+    return resolved_ratio, resolved_anchor, resolved_fallback, resolved_pause
 
 
 def _rule_split_text(
@@ -826,6 +857,8 @@ def _process_single_text(
                 for part in align_payload.splitlines():
                     if part != part.strip():
                         raise ValueError("对齐文本存在首尾空格，请检查规范化结果。")
+            if debug_align and align_debug_rows is None and align_lines is not None:
+                align_debug_rows = _build_split_debug_rows(align_lines)
             align_path = out_dir / relative.parent / f"{relative.stem}.align.txt"
             if debug_align:
                 align_debug_path = align_path.with_name(f"{align_path.stem}.debug.tsv")
@@ -838,6 +871,12 @@ def _process_single_text(
             if align_written and debug_align:
                 try:
                     _write_align_debug(align_debug_path, align_debug_rows or [])
+                    LOGGER.info(
+                        "[align-debug] stem=%s path=%s rows=%s",
+                        relative.stem,
+                        align_debug_path,
+                        len(align_debug_rows or []),
+                    )
                 except OSError as exc:
                     LOGGER.warning("写入对齐调试文件失败: %s", exc)
             align_total_lines = len(align_lines)
@@ -2002,7 +2041,9 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     )
     low_conf = float(args.low_conf) if args.low_conf is not None else SENT_LOW_CONF
     pause_align = not args.no_pause_align
-    pause_gap_sec = float(args.pause_gap_sec)
+    pause_gap_input = getattr(args, "pause_gap_sec", None)
+    pause_gap_explicit = pause_gap_input is not None
+    pause_gap_sec = float(pause_gap_input) if pause_gap_input is not None else PAUSE_GAP_SEC
     pause_snap_limit = float(args.pause_snap_limit)
     pad_before = float(args.pad_before)
     pad_after = float(args.pad_after)
@@ -2022,9 +2063,19 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
     max_windows = int(args.max_windows)
     match_timeout = float(args.match_timeout)
     compute_timeout_sec = float(args.compute_timeout_sec)
-    max_distance_ratio = float(args.max_distance_ratio)
-    min_anchor_ngram = int(args.min_anchor_ngram)
-    fallback_policy = args.fallback_policy
+    ratio_input = getattr(args, "max_distance_ratio", None)
+    ratio_explicit = ratio_input is not None
+    max_distance_ratio = (
+        float(ratio_input) if ratio_input is not None else DEFAULT_MATCH_MAX_DISTANCE_RATIO
+    )
+    anchor_input = getattr(args, "min_anchor_ngram", None)
+    anchor_explicit = anchor_input is not None
+    min_anchor_ngram = (
+        int(anchor_input) if anchor_input is not None else DEFAULT_MATCH_MIN_ANCHOR_NGRAM
+    )
+    fallback_input = getattr(args, "fallback_policy", None)
+    fallback_explicit = bool(fallback_input)
+    fallback_policy = fallback_input or DEFAULT_MATCH_FALLBACK_POLICY
     match_preset = getattr(args, "match_preset", None)
     dedupe_policy = _ensure_dedupe_policy(args)
     line_eq = str(getattr(args, "line_eq", "char") or "char")
@@ -2038,15 +2089,22 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         max_distance_ratio,
         min_anchor_ngram,
         fallback_policy,
+        pause_gap_sec,
     ) = _resolve_match_parameters(
         match_preset,
         max_distance_ratio,
         min_anchor_ngram,
         fallback_policy,
+        pause_gap_sec,
+        ratio_explicit=ratio_explicit,
+        anchor_explicit=anchor_explicit,
+        fallback_explicit=fallback_explicit,
+        pause_gap_explicit=pause_gap_explicit,
     )
     args.max_distance_ratio = max_distance_ratio
     args.min_anchor_ngram = min_anchor_ngram
     args.fallback_policy = fallback_policy
+    args.pause_gap_sec = pause_gap_sec
     debug_csv = Path(args.debug_csv).expanduser() if args.debug_csv else None
     if debug_csv and args.workers and args.workers > 1:
         LOGGER.warning("检测到并发执行，已禁用 debug CSV 以避免文件竞争。")
@@ -2891,20 +2949,44 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     fast_match = bool(getattr(args, "fast_match", True))
     max_windows = int(getattr(args, "max_windows", 50))
     match_timeout = float(getattr(args, "match_timeout", 20.0))
-    max_distance_ratio = float(getattr(args, "max_distance_ratio", 0.25))
-    min_anchor_ngram = int(getattr(args, "min_anchor_ngram", 8))
-    fallback_policy = getattr(args, "fallback_policy", "greedy")
+    ratio_input = getattr(args, "max_distance_ratio", None)
+    ratio_explicit = ratio_input is not None
+    max_distance_ratio = (
+        float(ratio_input) if ratio_input is not None else DEFAULT_MATCH_MAX_DISTANCE_RATIO
+    )
+    anchor_input = getattr(args, "min_anchor_ngram", None)
+    anchor_explicit = anchor_input is not None
+    min_anchor_ngram = (
+        int(anchor_input) if anchor_input is not None else DEFAULT_MATCH_MIN_ANCHOR_NGRAM
+    )
+    fallback_input = getattr(args, "fallback_policy", None)
+    fallback_explicit = bool(fallback_input)
+    fallback_policy = fallback_input or DEFAULT_MATCH_FALLBACK_POLICY
+    pause_gap_input = getattr(args, "pause_gap_sec", None)
+    pause_gap_explicit = pause_gap_input is not None
+    pause_gap_sec = float(pause_gap_input) if pause_gap_input is not None else PAUSE_GAP_SEC
     compute_timeout_sec = float(getattr(args, "compute_timeout_sec", 300.0))
     match_preset = getattr(args, "match_preset", None)
-    max_distance_ratio, min_anchor_ngram, fallback_policy = _resolve_match_parameters(
+    (
+        max_distance_ratio,
+        min_anchor_ngram,
+        fallback_policy,
+        pause_gap_sec,
+    ) = _resolve_match_parameters(
         match_preset,
         max_distance_ratio,
         min_anchor_ngram,
         fallback_policy,
+        pause_gap_sec,
+        ratio_explicit=ratio_explicit,
+        anchor_explicit=anchor_explicit,
+        fallback_explicit=fallback_explicit,
+        pause_gap_explicit=pause_gap_explicit,
     )
     args.max_distance_ratio = max_distance_ratio
     args.min_anchor_ngram = min_anchor_ngram
     args.fallback_policy = fallback_policy
+    args.pause_gap_sec = pause_gap_sec
     LOGGER.info(
         "[retake-config] alias_map_size=%s dedupe_policy=%s min_anchor_ngram=%s max_distance_ratio=%.2f fallback_policy=%s",
         len(alias_map or {}),
@@ -2988,7 +3070,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
             drop_ascii_parens,
             args.match_debug,
             pause_align=True,
-            pause_gap_sec=PAUSE_GAP_SEC,
+            pause_gap_sec=pause_gap_sec,
             pause_snap_limit=PAUSE_SNAP_LIMIT,
             pad_before=PAD_BEFORE,
             pad_after=PAD_AFTER,
@@ -3339,6 +3421,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     parts.append("--fast-match" if args.fast_match else "--no-fast-match")
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
+    parts.extend(["--pause-gap-sec", str(args.pause_gap_sec)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
     if args.match_debug:
@@ -3377,6 +3460,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "fast_match": args.fast_match,
         "max_windows": args.max_windows,
         "match_timeout": args.match_timeout,
+        "pause_gap_sec": args.pause_gap_sec,
         "compute_timeout_sec": getattr(args, "compute_timeout_sec", 120.0),
         "max_distance_ratio": args.max_distance_ratio,
         "min_anchor_ngram": args.min_anchor_ngram,
@@ -3814,7 +3898,7 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--pause-gap-sec",
         type=float,
-        default=PAUSE_GAP_SEC,
+        default=None,
         help=f"判定停顿的词间间隔阈值，秒（默认 {PAUSE_GAP_SEC:.2f}）",
     )
     retake.add_argument(
@@ -3875,14 +3959,14 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--max-distance-ratio",
         type=float,
-        default=0.38,
-        help="允许的编辑距离占比上限（默认 0.38）",
+        default=None,
+        help=f"允许的编辑距离占比上限（默认 {DEFAULT_MATCH_MAX_DISTANCE_RATIO:.2f}）",
     )
     retake.add_argument(
         "--min-anchor-ngram",
         type=int,
-        default=5,
-        help="候选预筛锚点 n-gram 长度（默认 5）",
+        default=None,
+        help=f"候选预筛锚点 n-gram 长度（默认 {DEFAULT_MATCH_MIN_ANCHOR_NGRAM}）",
     )
     retake.add_argument(
         "--match-debug",
@@ -3892,13 +3976,16 @@ def build_parser() -> argparse.ArgumentParser:
     retake.add_argument(
         "--fallback-policy",
         choices=["safe", "keep-all", "align-greedy", "greedy", "greedy+expand"],
-        default="greedy",
-        help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
+        default=None,
+        help=(
+            "对齐失败时的回退策略（默认 "
+            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy-expand）"
+        ),
     )
     retake.add_argument(
         "--match-preset",
-        choices=["tolerant"],
-        help="匹配参数预设（tolerant=放宽距离/锚点限制）",
+        choices=MATCH_PRESET_CHOICES,
+        help="匹配参数预设（speech_zh_reading=中文朗读默认，tolerant=旧版宽松）",
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
@@ -4391,16 +4478,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="每个条目的匹配时间预算（秒，默认 60.0）",
     )
     pipeline.add_argument(
+        "--pause-gap-sec",
+        type=float,
+        default=None,
+        help=f"判定停顿的词间间隔阈值，秒（默认 {PAUSE_GAP_SEC:.2f}）",
+    )
+    pipeline.add_argument(
         "--max-distance-ratio",
         type=float,
-        default=0.35,
-        help="允许的编辑距离占比上限（默认 0.35）",
+        default=None,
+        help=f"允许的编辑距离占比上限（默认 {DEFAULT_MATCH_MAX_DISTANCE_RATIO:.2f}）",
     )
     pipeline.add_argument(
         "--min-anchor-ngram",
         type=int,
-        default=6,
-        help="候选预筛锚点 n-gram 长度（默认 6）",
+        default=None,
+        help=f"候选预筛锚点 n-gram 长度（默认 {DEFAULT_MATCH_MIN_ANCHOR_NGRAM}）",
     )
     pipeline.add_argument(
         "--match-debug",
@@ -4410,13 +4503,16 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline.add_argument(
         "--fallback-policy",
         choices=["safe", "keep-all", "align-greedy", "greedy", "greedy+expand"],
-        default="greedy",
-        help="对齐失败时的回退策略（默认 greedy，对应 align-greedy）",
+        default=None,
+        help=(
+            "对齐失败时的回退策略（默认 "
+            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy-expand）"
+        ),
     )
     pipeline.add_argument(
         "--match-preset",
-        choices=["tolerant"],
-        help="匹配参数预设（tolerant=放宽距离/锚点限制）",
+        choices=MATCH_PRESET_CHOICES,
+        help="匹配参数预设（speech_zh_reading=中文朗读默认，tolerant=旧版宽松）",
     )
     pipeline.set_defaults(func=handle_all_in_one)
 
