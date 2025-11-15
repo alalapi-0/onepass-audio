@@ -2674,6 +2674,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
     squash_mixed_english = bool(getattr(args, "squash_mixed_english", True))
     match_preset = getattr(args, "match_preset", "") or ""
+    if not hasattr(args, "match_debug"):
+        args.match_debug = False
     report: dict[str, dict] = {
         "params": {
             "no_collapse_align": no_collapse_align,
@@ -2688,6 +2690,13 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     start = time.perf_counter()
 
     dedupe_policy = _ensure_dedupe_policy(args)
+    line_eq = str(getattr(args, "line_eq", "char") or "char")
+    line_dist_max = float(getattr(args, "line_dist_max", 0.15))
+    dedupe_window = float(getattr(args, "dedupe_window", 12.0))
+    dp_bonus_late = float(getattr(args, "dp_bonus_late", 1.0))
+    dp_penalty_pre = float(getattr(args, "dp_penalty_pre", -0.8))
+    dp_penalty_gap = float(getattr(args, "dp_penalty_gap", -0.2))
+    dp_epsilon = float(getattr(args, "dp_epsilon", 0.02))
 
     audio_root_arg = getattr(args, "audio_root", None)
     if audio_root_arg:
