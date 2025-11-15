@@ -538,6 +538,8 @@ def _process_single_text(
     max_clause_chars: int,
     debug_align: bool = False,
     drop_ascii_parens: bool,
+    preserve_fullwidth_parens: bool,
+    ascii_paren_mapping: bool,
     squash_mixed_english: bool,
     hard_punct: str | Sequence[str] | None,
     soft_punct: str | Sequence[str] | None,
@@ -575,6 +577,8 @@ def _process_single_text(
 
     text_cfg = TextNormConfig(
         drop_ascii_parens=drop_ascii_parens,
+        preserve_fullwidth_parens=preserve_fullwidth_parens,
+        ascii_paren_mapping=ascii_paren_mapping,
         squash_mixed_english=squash_mixed_english,
         collapse_lines=collapse_lines,
         max_len=align_max_len,
@@ -1013,7 +1017,9 @@ def run_prep_norm(
     max_clause_chars: int = 22,
     debug_align: bool = False,
     drop_ascii_parens: bool = True,
-    squash_mixed_english: bool = True,
+    preserve_fullwidth_parens: bool = True,
+    ascii_paren_mapping: bool = False,
+    squash_mixed_english: bool = False,
     hard_punct: str | Sequence[str] | None = DEFAULT_HARD_PUNCT,
     soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
     split_attach: str = "left",
@@ -1062,6 +1068,14 @@ def run_prep_norm(
         LOGGER.info("[normalize] collapse-lines=off (preserve original line breaks)")
     start = time.perf_counter()  # 记录起始时间
     LOGGER.info("[normalize] drop-ascii-parens=%s", "on" if drop_ascii_parens else "off")
+    LOGGER.info(
+        "[normalize] preserve-fullwidth-parens=%s",
+        "on" if preserve_fullwidth_parens else "off",
+    )
+    LOGGER.info(
+        "[normalize] ascii-paren-mapping=%s",
+        "on" if ascii_paren_mapping else "off",
+    )
     LOGGER.info("[normalize] squash-mixed-english=%s", "on" if squash_mixed_english else "off")
     last_progress = start
     processed = 0
@@ -1086,6 +1100,8 @@ def run_prep_norm(
             max_clause_chars=max_clause_chars,
             debug_align=debug_align,
             drop_ascii_parens=drop_ascii_parens,
+            preserve_fullwidth_parens=preserve_fullwidth_parens,
+            ascii_paren_mapping=ascii_paren_mapping,
             squash_mixed_english=squash_mixed_english,
             hard_punct=hard_punct,
             soft_punct=soft_punct,
@@ -1145,7 +1161,9 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
         + (["--no-keep-quotes"] if not args.keep_quotes else [])
         + (["--no-drop-ascii-parens"] if not args.drop_ascii_parens else [])
-        + (["--no-squash-mixed-english"] if not args.squash_mixed_english else [])
+        + (["--no-preserve-fullwidth-parens"] if not args.preserve_fullwidth_parens else [])
+        + (["--ascii-paren-mapping"] if args.ascii_paren_mapping else [])
+        + (["--squash-mixed-english"] if args.squash_mixed_english else [])
         + (["--dry-run"] if args.dry_run else []),
     )
     LOGGER.info("开始规范化任务: 输入=%s 输出=%s", args.input, args.output)
@@ -1175,6 +1193,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             max_clause_chars=args.max_clause_chars,
             debug_align=args.debug_align,
             drop_ascii_parens=args.drop_ascii_parens,
+            preserve_fullwidth_parens=args.preserve_fullwidth_parens,
+            ascii_paren_mapping=args.ascii_paren_mapping,
             squash_mixed_english=args.squash_mixed_english,
             hard_punct=args.hard_punct,
             soft_punct=args.soft_punct,
@@ -2735,7 +2755,9 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     no_collapse_align = bool(getattr(args, "no_collapse_align", True))
     include_canonical = bool(getattr(args, "include_canonical_kits", False))
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
-    squash_mixed_english = bool(getattr(args, "squash_mixed_english", True))
+    preserve_fullwidth_parens = bool(getattr(args, "preserve_fullwidth_parens", True))
+    ascii_paren_mapping = bool(getattr(args, "ascii_paren_mapping", False))
+    squash_mixed_english = bool(getattr(args, "squash_mixed_english", False))
     match_preset = getattr(args, "match_preset", "") or ""
     if not hasattr(args, "match_debug"):
         args.match_debug = False
@@ -2743,6 +2765,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         "params": {
             "no_collapse_align": no_collapse_align,
             "drop_ascii_parens": drop_ascii_parens,
+            "preserve_fullwidth_parens": preserve_fullwidth_parens,
+            "ascii_paren_mapping": ascii_paren_mapping,
             "squash_mixed_english": squash_mixed_english,
             "include_canonical_kits": include_canonical,
             "match_preset": match_preset,
@@ -2813,6 +2837,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         max_clause_chars=int(getattr(args, "max_clause_chars", 22)),
         debug_align=bool(getattr(args, "debug_align", False)),
         drop_ascii_parens=drop_ascii_parens,
+        preserve_fullwidth_parens=preserve_fullwidth_parens,
+        ascii_paren_mapping=ascii_paren_mapping,
         squash_mixed_english=squash_mixed_english,
         hard_punct=hard_punct,
         soft_punct=soft_punct,
@@ -3279,8 +3305,12 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     parts.append("--collapse-lines" if args.collapse_lines else "--no-collapse-lines")
     if not args.drop_ascii_parens:
         parts.append("--no-drop-ascii-parens")
-    if not args.squash_mixed_english:
-        parts.append("--no-squash-mixed-english")
+    if not args.preserve_fullwidth_parens:
+        parts.append("--no-preserve-fullwidth-parens")
+    if args.ascii_paren_mapping:
+        parts.append("--ascii-paren-mapping")
+    if args.squash_mixed_english:
+        parts.append("--squash-mixed-english")
     if not args.emit_align:
         parts.append("--no-emit-align")
     if debug_align:
@@ -3352,6 +3382,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "min_anchor_ngram": args.min_anchor_ngram,
         "fallback_policy": args.fallback_policy,
         "drop_ascii_parens": args.drop_ascii_parens,
+        "preserve_fullwidth_parens": args.preserve_fullwidth_parens,
+        "ascii_paren_mapping": args.ascii_paren_mapping,
         "squash_mixed_english": args.squash_mixed_english,
         "match_preset": args.match_preset,
         "serve": args.serve,
@@ -3483,11 +3515,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="删除括注中 ASCII 占比高的内容（默认开启）",
     )
     prep.add_argument(
+        "--preserve-fullwidth-parens",
+        dest="preserve_fullwidth_parens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="保留全角括注内容，不再自动清理（默认开启）",
+    )
+    prep.add_argument(
+        "--ascii-paren-mapping",
+        dest="ascii_paren_mapping",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="将（、）转换为 ASCII 括号以配合旧流水线策略（默认关闭）",
+    )
+    prep.add_argument(
         "--squash-mixed-english",
         dest="squash_mixed_english",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="去掉中文行尾紧跟的英文词串（默认开启）",
+        default=False,
+        help="额外压缩英文串内多余空白（默认关闭）",
     )
     prep.add_argument(
         "--prosody-gap-ms",
@@ -4093,11 +4139,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="删除括注中 ASCII 占比高的内容（默认开启）",
     )
     pipeline.add_argument(
+        "--preserve-fullwidth-parens",
+        dest="preserve_fullwidth_parens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="保留全角括注内容，不再自动清理（默认开启）",
+    )
+    pipeline.add_argument(
+        "--ascii-paren-mapping",
+        dest="ascii_paren_mapping",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="将（、）转换为 ASCII 括号以兼容旧流水线（默认关闭）",
+    )
+    pipeline.add_argument(
         "--squash-mixed-english",
         dest="squash_mixed_english",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="去掉中文行尾紧跟的英文词串（默认开启）",
+        default=False,
+        help="额外压缩英文串内多余空白（默认关闭）",
     )
     pipeline.add_argument(
         "--prosody-gap-ms",

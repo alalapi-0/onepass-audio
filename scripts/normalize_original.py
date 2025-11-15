@@ -7,12 +7,19 @@ import argparse
 import csv
 import glob
 import sys
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
+
+warnings.warn(
+    "scripts/normalize_original.py 已弃用：默认参数与 all-in-one 不再一致，仅保留给旧流水线使用。",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from onepass.text_normalizer import (
     TextNormConfig,

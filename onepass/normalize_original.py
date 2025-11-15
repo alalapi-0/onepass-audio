@@ -6,6 +6,7 @@ import argparse  # Parse command-line interface arguments.
 import json  # Load JSON structures such as compat maps and words data.
 import logging  # Provide structured runtime logging for diagnostics.
 import unicodedata  # Execute Unicode normalisation and character property checks.
+import warnings  # Emit deprecation notices for legacy helpers.
 from collections import Counter  # Count character frequencies and gather grouped statistics.
 from dataclasses import dataclass, field  # Define lightweight containers for accumulating metrics.
 from pathlib import Path  # Work with filesystem paths in a platform-independent way.
@@ -20,6 +21,12 @@ except Exception:  # Catch import errors or runtime failures gracefully.
 
 # Create a module-level logger for consistent diagnostic output.
 LOGGER = logging.getLogger(__name__)  # Logger named after the module for contextual messages.
+
+warnings.warn(
+    "onepass.normalize_original 已弃用：默认参数与 all-in-one 不再同步，仅面向旧流水线。",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 # Define punctuation endpoints that strongly indicate sentence boundaries.
 SENTENCE_ENDINGS = "。！？：；…"  # Characters that should prevent line merging when found at the end of a line.
