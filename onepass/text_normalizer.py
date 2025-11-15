@@ -6,10 +6,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
+from .canonicalize import load_alias_map as _load_match_alias_map
 from .text_norm import fullwidth_halfwidth_normalize, load_char_map
 
 __all__ = [
     "load_normalize_char_map",
+    "load_match_alias_map",
     "normalize_text_for_export",
     "normalize_alignment_text",
 ]
@@ -35,6 +37,16 @@ def load_normalize_char_map(path: str | Path | None) -> Mapping[str, object]:
     if path is None:
         return load_char_map(Path(__file__).resolve().parents[1] / "config" / "default_char_map.json")
     return load_char_map(Path(path))
+
+
+@lru_cache(maxsize=4)
+def load_match_alias_map(path: str | Path | None) -> dict[str, str]:
+    """Load alias mapping for matcher canonicalisation, with small caching."""
+
+    if path is None:
+        default_path = Path(__file__).resolve().parents[1] / "config" / "default_alias_map.json"
+        return _load_match_alias_map(default_path)
+    return _load_match_alias_map(Path(path))
 
 
 def _apply_char_map(text: str, char_map: Mapping[str, object]) -> str:
