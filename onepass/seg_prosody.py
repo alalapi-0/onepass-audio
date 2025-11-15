@@ -19,7 +19,7 @@ import math
 from typing import Iterable, Sequence
 
 from .asr_loader import Word
-from .text_split import DEFAULT_HARD_PUNCT, DEFAULT_SOFT_PUNCT
+from .text_normalizer import DEFAULT_HARD_PUNCT, DEFAULT_SOFT_PUNCT
 
 LOGGER = logging.getLogger(__name__)
 

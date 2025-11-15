@@ -47,8 +47,6 @@ from onepass.edl_renderer import (  # 音频渲染依赖
 from onepass.normalize import collapse_soft_linebreaks
 from onepass.zh_segmenter import Segment as ZhSegment
 from onepass.zh_segmenter import segment as segment_text
-from onepass.text_split import DEFAULT_HARD_PUNCT, DEFAULT_SOFT_PUNCT
-from onepass.split_rules import split_zh  # 新的中文切分规则入口
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
     EDLWriteResult,
     MAX_DUP_GAP_SEC as LINE_MAX_DUP_GAP_SEC,
@@ -74,6 +72,8 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
 from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.seg_prosody import ProsodyConfig, ProsodySplitResult, split_text_with_prosody
 from onepass.text_normalizer import (
+    DEFAULT_HARD_PUNCT,
+    DEFAULT_SOFT_PUNCT,
     TextNormConfig,
     load_alias_map,
     load_match_alias_map,
@@ -143,6 +143,28 @@ def _parse_cue_list(value: str | Sequence[str] | None) -> tuple[str, ...]:
     return tuple(dict.fromkeys(part for part in parts if part))
 
 
+def _coerce_punct_string(value: str | Sequence[str] | None, fallback: str) -> str:
+    if value is None:
+        return fallback
+    if isinstance(value, str):
+        return value
+    parts: list[str] = []
+    for item in value:
+        if not item:
+            continue
+        parts.append(str(item))
+    return "".join(parts) if parts else fallback
+
+
+def _get_split_attach(args: argparse.Namespace, default: str = "left") -> str:
+    for attr in ("split_attach", "attach", "punct_attach"):
+        if hasattr(args, attr):
+            value = getattr(args, attr)
+            if value:
+                return value
+    return default
+
+
 def _guess_words_json(text_path: Path) -> Path | None:
     """Try to find a nearby *.words.json for the given normalized text path."""
 
@@ -190,9 +212,9 @@ def _build_prosody_config(
         break_penalty_paren=float(getattr(args, "break_penalty_paren", -0.7)),
         break_penalty_too_short=float(getattr(args, "break_penalty_too_short", -1.2)),
         break_penalty_too_long=float(getattr(args, "break_penalty_too_long", -0.9)),
-        hard_punct=hard_punct or DEFAULT_HARD_PUNCT,
-        soft_punct=soft_punct or DEFAULT_SOFT_PUNCT,
-        punct_attach=getattr(args, "attach", getattr(args, "punct_attach", "right")),
+        hard_punct=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
+        soft_punct=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
+        punct_attach=_get_split_attach(args),
     )
 
 
@@ -470,6 +492,31 @@ def _resolve_match_parameters(
     return ratio, anchor, fallback
 
 
+def _rule_split_text(
+    text: str,
+    *,
+    min_len: int,
+    max_len: int,
+    hard_max: int,
+    attach: str,
+    hard_punct: str | Sequence[str] | None,
+    soft_punct: str | Sequence[str] | None,
+    soft_enabled: bool,
+) -> list[str]:
+    cfg = TextNormConfig(
+        drop_ascii_parens=False,
+        squash_mixed_english=False,
+        collapse_lines=True,
+        max_len=max_len,
+        min_len=min_len,
+        hard_max=hard_max,
+        hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
+        soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT) if soft_enabled else "",
+        attach_side=attach or "left",
+    )
+    return split_sentences_with_rules(text, cfg)
+
+
 def _process_single_text(
     path: Path,
     base_dir: Path,
@@ -494,7 +541,7 @@ def _process_single_text(
     squash_mixed_english: bool,
     hard_punct: str | Sequence[str] | None,
     soft_punct: str | Sequence[str] | None,
-    punct_attach: str,
+    split_attach: str,
     prosody_config: ProsodyConfig | None,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
@@ -533,9 +580,9 @@ def _process_single_text(
         max_len=align_max_len,
         min_len=align_min_len,
         hard_max=align_hard_max,
-        hard_puncts="".join(DEFAULT_HARD_PUNCT),
-        soft_puncts="".join(DEFAULT_SOFT_PUNCT),
-        attach_side=punct_attach or "left",
+        hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
+        soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
+        attach_side=split_attach or "left",
     )
     try:
         normalized_text = normalize_text_for_export(
@@ -692,11 +739,14 @@ def _process_single_text(
                         path.name,
                         prosody_result.fallback_reason or "unknown",
                     )
-                align_lines = split_zh(
-                    text=align_source,
+                align_lines = _rule_split_text(
+                    align_source,
                     min_len=align_min_len,
                     max_len=align_max_len,
-                    attach=punct_attach or "right",
+                    hard_max=align_hard_max,
+                    attach=split_attach or "left",
+                    hard_punct=hard_punct,
+                    soft_punct=soft_punct,
                     soft_enabled=(split_mode == "punct+len"),
                 )
                 if debug_align:
@@ -716,19 +766,27 @@ def _process_single_text(
                 if len(align_segments) <= 1:
                     align_guard_attempted = True
                     if debug_align:
-                        guard_lines = split_zh(
+                        guard_lines = _rule_split_text(
                             align_source,
                             min_len=8,
                             max_len=20,
-                            attach=punct_attach or "right",
+                            hard_max=28,
+                            attach=split_attach or "left",
+                            hard_punct=hard_punct,
+                            soft_punct=soft_punct,
+                            soft_enabled=True,
                         )
                         guard_debug = _build_split_debug_rows(guard_lines, reason="ZH_SPLIT/GUARD")
                     else:
-                        guard_lines = split_zh(
+                        guard_lines = _rule_split_text(
                             align_source,
                             min_len=8,
                             max_len=20,
-                            attach=punct_attach or "right",
+                            hard_max=28,
+                            attach=split_attach or "left",
+                            hard_punct=hard_punct,
+                            soft_punct=soft_punct,
+                            soft_enabled=True,
                         )
                         guard_debug = None
                     effective_split_mode = "punct+len"
@@ -750,8 +808,10 @@ def _process_single_text(
                         ]
             if use_split_rules and align_lines:
                 LOGGER.info(
-                    "[split] hard=。！？!?．.;； soft=，、,:：；;……— attach=%s max_len=%s -> lines=%s",
-                    (punct_attach or "right"),
+                    "[split] hard=%s soft=%s attach=%s max_len=%s -> lines=%s",
+                    _coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
+                    _coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
+                    (split_attach or "left"),
                     align_max_len,
                     len(align_lines),
                 )
@@ -843,7 +903,7 @@ def _process_single_text(
 
 
 def _build_split_debug_rows(lines: Sequence[str], *, reason: str = "ZH_SPLIT") -> list[tuple[str, int, str]]:
-    """为新的 split_zh 结果构造调试行，方便沿用原有 TSV 输出。"""
+    """为规则切分结果构造调试行，方便沿用原有 TSV 输出。"""
 
     rows: list[tuple[str, int, str]] = []
     for line in lines:
@@ -956,7 +1016,7 @@ def run_prep_norm(
     squash_mixed_english: bool = True,
     hard_punct: str | Sequence[str] | None = DEFAULT_HARD_PUNCT,
     soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
-    punct_attach: str = "right",
+    split_attach: str = "left",
     prosody_config: ProsodyConfig | None = None,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
@@ -1029,7 +1089,7 @@ def run_prep_norm(
             squash_mixed_english=squash_mixed_english,
             hard_punct=hard_punct,
             soft_punct=soft_punct,
-            punct_attach=punct_attach,
+            split_attach=split_attach,
             prosody_config=prosody_config,
         )  # 处理单个文件
         rows.append(row)
@@ -1081,7 +1141,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
         + (["--hard-max", str(args.hard_max)] if args.hard_max != DEFAULT_ALIGN_HARD_MAX else [])
         + (["--hard-punct", args.hard_punct] if args.hard_punct != DEFAULT_HARD_PUNCT else [])
         + (["--soft-punct", args.soft_punct] if args.soft_punct != DEFAULT_SOFT_PUNCT else [])
-        + (["--attach", args.attach] if args.attach != "right" else [])
+        + (["--split-attach", args.split_attach] if args.split_attach != "left" else [])
         + (["--no-weak-punct-enable"] if not args.weak_punct_enable else [])
         + (["--no-keep-quotes"] if not args.keep_quotes else [])
         + (["--no-drop-ascii-parens"] if not args.drop_ascii_parens else [])
@@ -1118,7 +1178,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             squash_mixed_english=args.squash_mixed_english,
             hard_punct=args.hard_punct,
             soft_punct=args.soft_punct,
-            punct_attach=args.attach,
+            split_attach=args.split_attach,
             prosody_config=prosody_config,
         )
     except Exception as exc:
@@ -2726,7 +2786,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     align_keep = bool(getattr(args, "keep_quotes", True))
     hard_punct = getattr(args, "hard_punct", DEFAULT_HARD_PUNCT)
     soft_punct = getattr(args, "soft_punct", DEFAULT_SOFT_PUNCT)
-    punct_attach = getattr(args, "attach", "right")
+    split_attach = _get_split_attach(args)
     prosody_config = _build_prosody_config(
         args,
         hard_punct=hard_punct,
@@ -2756,7 +2816,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         squash_mixed_english=squash_mixed_english,
         hard_punct=hard_punct,
         soft_punct=soft_punct,
-        punct_attach=punct_attach,
+        split_attach=split_attach,
         prosody_config=prosody_config,
     )
     report["prep_norm"] = norm_result
@@ -3204,8 +3264,8 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         parts.extend(["--hard-punct", args.hard_punct])
     if args.soft_punct != DEFAULT_SOFT_PUNCT:
         parts.extend(["--soft-punct", args.soft_punct])
-    if args.attach != "right":
-        parts.extend(["--attach", args.attach])
+    if args.split_attach != "left":
+        parts.extend(["--split-attach", args.split_attach])
     if not args.weak_punct_enable:
         parts.append("--no-weak-punct-enable")
     if not args.keep_quotes:
@@ -3452,12 +3512,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="punct+len 模式的软切标点集合（默认包含 ，、,:：；;……—）",
     )
     prep.add_argument(
+        "--split-attach",
         "--attach",
         "--punct-attach",
-        dest="attach",
-        choices=["right", "left"],
-        default="right",
-        help="硬标点归属（默认 right，--punct-attach 兼容旧版）",
+        dest="split_attach",
+        choices=["left", "right"],
+        default="left",
+        help="硬标点归属（默认 left，兼容旧版 --attach/--punct-attach）",
     )
     prep.add_argument(
         "--prosody-split",
@@ -4108,12 +4169,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="punct+len 模式软切标点集合（默认包含 ，、,:：；;……—）",
     )
     pipeline.add_argument(
+        "--split-attach",
         "--attach",
         "--punct-attach",
-        dest="attach",
-        choices=["right", "left"],
-        default="right",
-        help="硬标点归属（默认 right，--punct-attach 兼容旧版）",
+        dest="split_attach",
+        choices=["left", "right"],
+        default="left",
+        help="硬标点归属（默认 left，兼容旧版 --attach/--punct-attach）",
     )
     pipeline.add_argument(
         "--prosody-split",
