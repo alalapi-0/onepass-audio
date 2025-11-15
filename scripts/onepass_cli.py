@@ -73,19 +73,15 @@ from onepass.retake_keep_last import (  # 保留最后一遍导出函数
 )
 from onepass.silence_probe import probe_silence_ffmpeg
 from onepass.seg_prosody import ProsodyConfig, ProsodySplitResult, split_text_with_prosody
-from onepass.text_norm import (  # 规范化工具
-    load_alias_map,
-    normalize_chinese_text,
-    normalize_pipeline,
-    run_opencc_if_available,
-    scan_suspects,
-    sentence_lines_from_text,
-    validate_sentence_lines,
-)
 from onepass.text_normalizer import (
+    TextNormConfig,
+    load_alias_map,
     load_match_alias_map,
     load_normalize_char_map,
     normalize_text_for_export,
+    run_opencc_if_available,
+    scan_suspects,
+    split_sentences_with_rules,
 )
 from onepass.sent_align import (
     LOW_CONF as SENT_LOW_CONF,
@@ -529,14 +525,29 @@ def _process_single_text(
             "message": f"读取失败: {exc}",
         }
 
+    text_cfg = TextNormConfig(
+        drop_ascii_parens=drop_ascii_parens,
+        squash_mixed_english=squash_mixed_english,
+        collapse_lines=collapse_lines,
+        max_len=align_max_len,
+        min_len=align_min_len,
+        hard_max=align_hard_max,
+        hard_puncts="".join(DEFAULT_HARD_PUNCT),
+        soft_puncts="".join(DEFAULT_SOFT_PUNCT),
+        attach_side=punct_attach or "left",
+    )
     try:
-        normalized_text, stats = normalize_pipeline(
-            raw_text,  # 原始文本
-            cmap,  # 字符映射
-            use_width=bool(cmap.get("normalize_width", False)),  # 是否执行宽度归一
-            use_space=bool(cmap.get("normalize_space", False)),  # 是否执行空白归一
-            preserve_cjk_punct=bool(cmap.get("preserve_cjk_punct", False)),  # 是否保留中日韩标点
+        normalized_text = normalize_text_for_export(
+            raw_text,
+            char_map=cmap,
+            cfg=text_cfg,
         )
+        stats = {
+            "deleted_count": 0,
+            "mapped_count": 0,
+            "width_normalized_count": 1 if cmap.get("normalize_width") else 0,
+            "space_normalized_count": 1 if cmap.get("normalize_space") else 0,
+        }
     except Exception as exc:
         context_preview = _summarize_context(raw_text)
         LOGGER.exception("规范化流程失败: %s 上下文=%s", path, context_preview)
@@ -557,16 +568,8 @@ def _process_single_text(
         }
 
     converted_text, opencc_applied = run_opencc_if_available(normalized_text, opencc_mode)  # 运行 OpenCC
-    sentence_lines = sentence_lines_from_text(converted_text, collapse_lines=collapse_lines)
-    if collapse_lines and sentence_lines:
-        validate_sentence_lines(sentence_lines)
+    sentence_lines = split_sentences_with_rules(converted_text, text_cfg)
     converted_text = "\n".join(sentence_lines)
-    converted_text = normalize_chinese_text(
-        converted_text,
-        collapse_lines=collapse_lines,
-        drop_ascii_parens=drop_ascii_parens,
-        squash_mixed_english=squash_mixed_english,
-    )
     payload_text = converted_text.replace("\r\n", "\n").replace("\r", "\n")
     if collapse_lines:
         payload_text = collapse_soft_linebreaks(payload_text)
