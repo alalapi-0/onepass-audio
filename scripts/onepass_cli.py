@@ -90,6 +90,7 @@ from onepass.sent_align import (
 )
 from onepass.logging_utils import default_log_dir, setup_logger
 from onepass.ui_server import open_browser_later, start_static_server
+from onepass.debug_utils import set_debug_logging
 
 
 DEFAULT_NORMALIZE_REPORT = ROOT_DIR / "out" / "normalize_report.csv"  # 规范化报表路径
@@ -960,6 +961,7 @@ def run_prep_norm(
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
+    set_debug_logging(bool(debug_align))
     if opencc_mode not in {"none", "t2s", "s2t"}:  # 校验 opencc 取值
         raise ValueError("--opencc 仅支持 none/t2s/s2t。")
     try:
@@ -2663,6 +2665,7 @@ def handle_serve_web(args: argparse.Namespace) -> int:
 def run_all_in_one(args: argparse.Namespace) -> dict:
     """执行 all-in-one 流水线。"""
 
+    set_debug_logging(bool(getattr(args, "debug_align", False)))
     input_dir = Path(args.input_dir).expanduser().resolve()
     if not input_dir.exists():
         raise FileNotFoundError(f"输入目录不存在: {input_dir}")

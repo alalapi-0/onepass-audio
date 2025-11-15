@@ -175,18 +175,22 @@ def match_line_to_tokens(
     max_distance_ratio: float = 0.35,
     match_timeout: float | None = 60.0,
     prefer_latest: bool = True,
+    debug_details: dict | None = None,
 ) -> Optional[MatchResult]:
     if not stream.tokens or not stream.canonical_text:
         return None
     normalized_line = _normalize_query_text(line, alias)
     if not normalized_line:
         return None
+    if debug_details is not None:
+        debug_details.clear()
     max_windows = max(1, int(max_windows))
     anchor_len = max(1, min(min_anchor_ngram, len(normalized_line)))
     deadline = None
     if match_timeout and match_timeout > 0:
         deadline = time.time() + match_timeout
     windows: list[tuple[int, int]] = []
+    timed_out = False
     seen: set[tuple[int, int]] = set()
     anchor_hits = 0
     text = stream.canonical_text
@@ -198,6 +202,7 @@ def match_line_to_tokens(
         found = -1
         while True:
             if deadline and time.time() > deadline:
+                timed_out = True
                 break
             if prefer_latest:
                 found = text.rfind(anchor, 0, search_from)
@@ -222,6 +227,8 @@ def match_line_to_tokens(
                 continue
             search_from = found
         if len(windows) >= max_windows or (deadline and time.time() > deadline):
+            if deadline and time.time() > deadline:
+                timed_out = True
             break
         start_idx += 1
     if prefer_latest:
@@ -256,6 +263,7 @@ def match_line_to_tokens(
 
     for left, right in windows:
         if deadline and time.time() > deadline:
+            timed_out = True
             break
         if right <= left:
             continue
@@ -268,11 +276,13 @@ def match_line_to_tokens(
         if ratio <= max_distance_ratio:
             _update(tok_lo, tok_hi, ratio, "anchor+lev")
             continue
+    failure_reason = ""
     if best is None:
         window = max(len(normalized_line), anchor_len * 2)
         cursor = total_len
         while cursor > 0:
             if deadline and time.time() > deadline:
+                timed_out = True
                 break
             left = max(0, cursor - window)
             if cursor - left <= 0:
@@ -288,6 +298,26 @@ def match_line_to_tokens(
                 _update(tok_lo, tok_hi, ratio, "greedy-back")
                 break
             cursor -= max(1, window // 2)
+        if best is None:
+            if timed_out:
+                failure_reason = "time-window"
+            elif not windows:
+                failure_reason = "no-anchor"
+            else:
+                failure_reason = "distance"
+    if debug_details is not None:
+        debug_details.update(
+            {
+                "failure_reason": failure_reason,
+                "timed_out": timed_out,
+                "window_count": len(windows),
+                "anchor_hits": anchor_hits,
+                "max_distance_ratio": max_distance_ratio,
+            }
+        )
+        if best is not None:
+            debug_details["score"] = best.score
+            debug_details["method"] = best.method
     return best
 
 
