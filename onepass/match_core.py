@@ -1,11 +1,14 @@
 """Anchor-based matching helpers for keep-last alignment."""
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import bisect
 import logging
 import math
+import re
 import time
+import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .canonicalize import CanonicalAliasMap, canonicalize
@@ -13,12 +16,47 @@ from .words_loader import Token
 
 LOGGER = logging.getLogger(__name__)
 
+_NUMERIC_TRANS = str.maketrans(
+    {
+        "零": "0",
+        "〇": "0",
+        "一": "1",
+        "二": "2",
+        "两": "2",
+        "三": "3",
+        "四": "4",
+        "五": "5",
+        "六": "6",
+        "七": "7",
+        "八": "8",
+        "九": "9",
+    }
+)
+
+_UNIT_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("毫秒", "ms"),
+    ("ms", "ms"),
+    ("秒钟", "s"),
+    ("秒", "s"),
+    ("seconds", "s"),
+    ("分钟", "min"),
+    ("分鐘", "min"),
+    ("分", "min"),
+    ("minutes", "min"),
+    ("小时", "h"),
+    ("小時", "h"),
+    ("hrs", "h"),
+)
+
+_SPACE_RE = re.compile(r"\s+")
+
 @dataclass(slots=True)
 class TokenStream:
     tokens: List[Token]
     canonical_text: str
     raw_text: str
     char_boundaries: List[int]
+    alias_hits: int = 0
 
 
 @dataclass(slots=True)
@@ -32,15 +70,64 @@ class MatchResult:
     method: str
 
 
+def _apply_unit_normalization(value: str) -> str:
+    if not value:
+        return ""
+    normalized = value.translate(_NUMERIC_TRANS)
+    for src, dest in _UNIT_REPLACEMENTS:
+        if src in normalized:
+            normalized = normalized.replace(src, dest)
+    return normalized
+
+
+def _lookup_alias(token: str, alias: Dict[str, str] | CanonicalAliasMap | None) -> tuple[str, bool]:
+    if not token or not alias:
+        return token, False
+    mapping = alias.mapping if isinstance(alias, CanonicalAliasMap) else alias
+    replacement = mapping.get(token)
+    if replacement is None and token.lower() != token:
+        replacement = mapping.get(token.lower())
+    if replacement is None:
+        return token, False
+    return replacement, replacement != token
+
+
+def _normalize_token_text(text: str, alias: Dict[str, str] | CanonicalAliasMap | None) -> tuple[str, bool]:
+    raw = unicodedata.normalize("NFKC", text or "")
+    raw = _SPACE_RE.sub(" ", raw)
+    aliased, hit = _lookup_alias(raw, alias)
+    lowered = aliased.lower()
+    normalized = _apply_unit_normalization(lowered)
+    return normalized, hit
+
+
+def _normalize_query_text(line: str, alias: Dict[str, str] | CanonicalAliasMap | None) -> str:
+    canonical = canonicalize(line, alias)
+    canonical = canonical.lower()
+    canonical = _apply_unit_normalization(canonical)
+    return canonical
+
+
 def build_token_stream(tokens: Sequence[Token], alias: Dict[str, str] | CanonicalAliasMap | None) -> TokenStream:
     raw = "".join(token.get("text", "") or "" for token in tokens)
-    canonical = canonicalize(raw, alias)
+    normalized_tokens: list[str] = []
+    alias_hits = 0
     boundaries: List[int] = [0]
     cursor = 0
     for token in tokens:
-        cursor += len(token.get("text", "") or "")
+        normalized, hit = _normalize_token_text(token.get("text", "") or "", alias)
+        alias_hits += int(hit)
+        normalized_tokens.append(normalized)
+        cursor += len(normalized)
         boundaries.append(cursor)
-    return TokenStream(tokens=list(tokens), canonical_text=canonical, raw_text=raw, char_boundaries=boundaries)
+    canonical = "".join(normalized_tokens)
+    return TokenStream(
+        tokens=list(tokens),
+        canonical_text=canonical,
+        raw_text=raw,
+        char_boundaries=boundaries,
+        alias_hits=alias_hits,
+    )
 
 
 def _bounded_lev(left: str, right: str, max_ratio: float) -> float:
@@ -91,7 +178,7 @@ def match_line_to_tokens(
 ) -> Optional[MatchResult]:
     if not stream.tokens or not stream.canonical_text:
         return None
-    normalized_line = canonicalize(line, alias)
+    normalized_line = _normalize_query_text(line, alias)
     if not normalized_line:
         return None
     max_windows = max(1, int(max_windows))
@@ -241,12 +328,30 @@ def align_text(
             prefer_latest=prefer_latest,
         )
         matches.append(match)
+    method_counter: Counter[str] = Counter(match.method for match in matches if match)
+    total_anchor_hits = sum(match.anchor_hits for match in matches if match)
+    fallback_methods = {key: value for key, value in method_counter.items() if key != "anchor+lev"}
+    fallback_total = sum(fallback_methods.values())
+    if fallback_methods:
+        fallback_summary = ", ".join(f"{key}={value}" for key, value in sorted(fallback_methods.items()))
+    else:
+        fallback_summary = "none"
+    LOGGER.info(
+        "[align_text] alias_hits=%s anchor_hits=%s fallback=%s",
+        stream.alias_hits,
+        total_anchor_hits,
+        fallback_summary,
+    )
     metadata = {
         "alias_map_size": len(alias_map or {}),
         "dedupe_policy": dedupe_policy or "none",
         "min_anchor_ngram": int(min_anchor_ngram),
         "max_distance_ratio": float(max_distance_ratio),
         "fallback_policy": fallback_policy,
+        "alias_hits": stream.alias_hits,
+        "anchor_hits_total": total_anchor_hits,
+        "method_counts": dict(method_counter),
+        "fallback_usage": fallback_total,
     }
     return matches, metadata
 

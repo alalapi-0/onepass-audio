@@ -708,8 +708,9 @@ def create_app(
         cmd = [
             "ffmpeg",
             "-hide_banner",
+            "-nostats",
             "-loglevel",
-            "error",
+            "warning",
             "-y",
             "-i",
             str(source),
@@ -726,10 +727,19 @@ def create_app(
 
         LOGGER.info("[render] stem=%s cmd=%s", stem, " ".join(cmd))
         try:
-            proc = subprocess.run(cmd, check=False)
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+            )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=500, detail="未找到 ffmpeg，请安装后重试") from exc
+        stderr_bytes = proc.stderr or b""
+        stderr_text = stderr_bytes.decode("utf-8", "ignore")
         if proc.returncode != 0:
+            LOGGER.error("[render] ffmpeg failed rc=%s stderr=%s", proc.returncode, stderr_text.strip())
             raise HTTPException(status_code=500, detail=f"ffmpeg 渲染失败，退出码 {proc.returncode}")
         if not output.exists():
             raise HTTPException(status_code=500, detail="ffmpeg 未生成输出文件")

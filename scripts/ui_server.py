@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -16,12 +17,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from onepass.web_server import run_web_server
+from onepass.web_server import run_web_server, spawn_web_server
 
-__all__ = ["start_ui", "main"]
+__all__ = ["start_ui", "serve_web_ui", "main"]
 
 _DEFAULT_HOST = "127.0.0.1"
 _DEFAULT_PORT = 5173
+LOGGER = logging.getLogger("onepass.web_ui")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -105,6 +107,34 @@ def start_ui(
     if open_browser:
         threading.Thread(target=_delayed_open, args=(url,), daemon=True).start()
     return proc
+
+
+def serve_web_ui(host: str, port: int, open_browser: bool = False) -> threading.Thread:
+    """Start the Web UI via :mod:`uvicorn` in a background thread and return it."""
+
+    out_dir = ROOT_DIR / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _server, thread = spawn_web_server(
+        out_dir,
+        None,
+        host=host,
+        port=port,
+        enable_cors=False,
+        open_browser=False,
+    )
+    url = _build_url(host, port)
+
+    if open_browser:
+        def _open() -> None:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                LOGGER.warning("[web-ui] 自动打开浏览器失败: %s", url, exc_info=True)
+
+        threading.Thread(target=_open, name="onepass-webui-browser", daemon=True).start()
+
+    LOGGER.info("[web-ui] Serving at %s (thread=%s)", url, thread.name)
+    return thread
 
 
 def main() -> None:
