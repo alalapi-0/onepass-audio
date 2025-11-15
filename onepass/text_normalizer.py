@@ -17,6 +17,7 @@ __all__ = [
     "load_match_alias_map",
     "normalize_text_for_export",
     "split_sentences_with_rules",
+    "collapse_soft_linebreaks",
 ]
 
 
@@ -214,6 +215,12 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
         else:
             queue.insert(0, right)
     return [sent for sent in sentences if sent]
+
+
+def collapse_soft_linebreaks(text: str) -> str:
+    """Compatibility wrapper exposing the legacy helper under the new module."""
+
+    return _legacy_normalize.collapse_soft_linebreaks(text)
 
 
 # Re-export legacy helpers for compatibility.
