@@ -33,7 +33,9 @@ class TextNormConfig:
     """Configuration used by normalization and sentence splitting."""
 
     drop_ascii_parens: bool = True
-    squash_mixed_english: bool = True
+    preserve_fullwidth_parens: bool = True
+    ascii_paren_mapping: bool = False
+    squash_mixed_english: bool = False
     collapse_lines: bool = True
     max_len: int = 24
     min_len: int = 8
@@ -67,11 +69,13 @@ _SPECIAL_WHITESPACE = {
 }
 
 _ASCII_PARENS = {"(", ")", "[", "]", "{", "}"}
+_FULLWIDTH_PARENS = {"（", "）"}
+_FULLWIDTH_PAREN_TO_ASCII = str.maketrans({"（": "(", "）": ")"})
 _CJK_RANGE = "\u3400-\u9FFF\uF900-\uFAFF\u3040-\u30FF"
+_RE_ASCII_BLOCK = re.compile(rf"([A-Za-z0-9]+)(\s+)(?=[{_CJK_RANGE}])")
+_RE_ASCII_BLOCK_LEFT = re.compile(fr"(?<=[{_CJK_RANGE}])\s+([A-Za-z0-9]+)")
 _RE_CJK_GAP = re.compile(fr"(?<=[{_CJK_RANGE}])\s+(?=[{_CJK_RANGE}])")
 _RE_SPACE_RUN = re.compile(r" {2,}")
-_RE_ASCII_BLOCK = re.compile(r"([A-Za-z0-9]+)(\s+)(?=[{_CJK_RANGE}])")
-_RE_ASCII_BLOCK_LEFT = re.compile(fr"(?<=[{_CJK_RANGE}])\s+([A-Za-z0-9]+)")
 _RE_LINE_BREAK = re.compile(r"\s*\n\s*")
 _RE_DASH_VARIANTS = re.compile(r"[‒–—―﹘﹣]+")
 _RE_ELLIPSIS = re.compile(r"\.{4,}")
@@ -90,7 +94,7 @@ def _preview_line_for_debug(text: str, limit: int = 80) -> str:
     return compacted[:limit] if compacted else "<empty>"
 
 
-def _apply_char_map(text: str, char_map: Mapping[str, object]) -> str:
+def _apply_char_map(text: str, char_map: Mapping[str, object], cfg: TextNormConfig) -> str:
     normalized = text
     if char_map.get("normalize_width"):
         normalized = _legacy_norm.fullwidth_halfwidth_normalize(
@@ -100,9 +104,15 @@ def _apply_char_map(text: str, char_map: Mapping[str, object]) -> str:
     delete_chars = {ord(ch): None for ch in char_map.get("delete", [])}
     if delete_chars:
         normalized = normalized.translate(delete_chars)
-    mapping = char_map.get("map", {})
+    mapping = dict(char_map.get("map", {}))
+    if cfg.preserve_fullwidth_parens:
+        for paren in _FULLWIDTH_PARENS:
+            if paren in mapping and mapping[paren] != paren:
+                mapping[paren] = paren
     if mapping:
         normalized = normalized.translate(str.maketrans(mapping))
+    if cfg.ascii_paren_mapping and not cfg.preserve_fullwidth_parens:
+        normalized = normalized.translate(_FULLWIDTH_PAREN_TO_ASCII)
     return normalized
 
 
@@ -148,12 +158,14 @@ def normalize_text_for_export(
         collapse_lines = not preserve_newlines
 
     sample_before: str | None = None
-    normalized = _apply_char_map(text, char_map)
+    normalized = _apply_char_map(text, char_map, cfg)
     if is_debug_logging_enabled():
         sample_before = _preview_line_for_debug(text)
         log_debug(
-            "[normalize] drop_ascii_parens=%s squash_mixed_english=%s collapse_lines=%s order=char_map>whitespace>drop_ascii>mixed-spacing>punct char_map_flags width=%s space=%s delete=%s map=%s",
+            "[normalize] drop_ascii_parens=%s preserve_fullwidth_parens=%s ascii_paren_mapping=%s squash_mixed_english=%s collapse_lines=%s order=char_map>whitespace>drop_ascii>mixed-spacing>punct char_map_flags width=%s space=%s delete=%s map=%s",
             bool(cfg.drop_ascii_parens),
+            bool(cfg.preserve_fullwidth_parens),
+            bool(cfg.ascii_paren_mapping),
             bool(cfg.squash_mixed_english),
             bool(collapse_lines),
             bool(char_map.get("normalize_width")),
