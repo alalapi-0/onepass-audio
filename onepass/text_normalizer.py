@@ -113,14 +113,22 @@ def _final_punct_normalize(text: str) -> str:
 def normalize_text_for_export(
     text: str,
     char_map: Mapping[str, object],
-    cfg: TextNormConfig,
+    cfg: TextNormConfig | None = None,
+    *,
+    preserve_newlines: bool | None = None,
 ) -> str:
     """Normalize transcript text for downstream export."""
 
     if not text:
         return ""
+    if cfg is None:
+        cfg = TextNormConfig()
+    collapse_lines = cfg.collapse_lines
+    if preserve_newlines is not None:
+        collapse_lines = not preserve_newlines
+
     normalized = _apply_char_map(text, char_map)
-    normalized = _normalize_whitespace(normalized, cfg.collapse_lines)
+    normalized = _normalize_whitespace(normalized, collapse_lines)
     if cfg.drop_ascii_parens:
         table = {ord(ch): None for ch in _ASCII_PARENS}
         normalized = normalized.translate(table)
