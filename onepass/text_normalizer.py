@@ -13,8 +13,13 @@ from . import _legacy_text_norm as _legacy_norm
 from . import _legacy_textnorm as _legacy_textnorm
 from . import _legacy_normalize as _legacy_normalize
 
+DEFAULT_HARD_PUNCT = "。！？!?．.;；……—"
+DEFAULT_SOFT_PUNCT = "，、,:：；;"
+
 __all__ = [
     "TextNormConfig",
+    "DEFAULT_HARD_PUNCT",
+    "DEFAULT_SOFT_PUNCT",
     "load_normalize_char_map",
     "load_match_alias_map",
     "normalize_text_for_export",
@@ -33,8 +38,8 @@ class TextNormConfig:
     max_len: int = 24
     min_len: int = 8
     hard_max: int = 32
-    hard_puncts: str = "。！？!?．.;；"
-    soft_puncts: str = "，、,:：；;……—"
+    hard_puncts: str = DEFAULT_HARD_PUNCT
+    soft_puncts: str = DEFAULT_SOFT_PUNCT
     attach_side: str = "left"
 
 
@@ -174,6 +179,7 @@ _HARD_OPENERS = "（〔［【《〈「『“‘(\"'[{"
 _HARD_CLOSERS = "）〕］】》〉」』”’)\"'] }"
 _HARD_PAIRS = {op: cl for op, cl in zip(_HARD_OPENERS, _HARD_CLOSERS)}
 _HARD_REVERSE = {cl: op for op, cl in _HARD_PAIRS.items()}
+_CLOSER_SET = {ch for ch in _HARD_CLOSERS if not ch.isspace()}
 
 
 def _log_split_event(
@@ -200,39 +206,59 @@ def _log_split_event(
     )
 
 
-def _initial_hard_split(text: str, cfg: TextNormConfig, state: dict | None = None) -> List[str]:
-    hard_set = set(cfg.hard_puncts)
+def _split_hard_layers(text: str, cfg: TextNormConfig, state: dict | None = None) -> List[str]:
+    """Split *text* by hard punctuation while keeping closers on the left."""
+
+    hard_set = {ch for ch in cfg.hard_puncts if ch and not ch.isspace()}
     stack: List[str] = []
-    parts: List[str] = []
+    layers: List[str] = []
     current: List[str] = []
-    for ch in text:
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
         current.append(ch)
         if ch in _HARD_PAIRS:
             stack.append(_HARD_PAIRS[ch])
-            continue
-        if ch in _HARD_REVERSE:
+        elif ch in _HARD_REVERSE:
             if stack and stack[-1] == ch:
                 stack.pop()
-            continue
         if ch in hard_set and not stack:
+            j = i + 1
+            while j < length and text[j] in _CLOSER_SET:
+                current.append(text[j])
+                if stack and stack[-1] == text[j]:
+                    stack.pop()
+                j += 1
             chunk = "".join(current).strip()
             if chunk:
                 _log_split_event(
-                    "hard", state, chunk=_preview_line_for_debug(chunk), marker=ch, reason="stack-clear", attach=cfg.attach_side, max_len=cfg.max_len
+                    "hard",
+                    state,
+                    chunk=_preview_line_for_debug(chunk),
+                    marker=ch,
+                    reason="layer-1",
+                    attach=cfg.attach_side,
+                    max_len=cfg.max_len,
                 )
-                parts.append(chunk)
+                layers.append(chunk)
             current = []
-        elif ch in hard_set and stack and state:
-            _log_split_event(
-                "guard", state, chunk=_preview_line_for_debug("".join(current[-10:])), marker=ch, reason="within-quotes", attach=cfg.attach_side, max_len=cfg.max_len
-            )
+            i = j
+            continue
+        i += 1
     tail = "".join(current).strip()
     if tail:
         _log_split_event(
-            "tail", state, chunk=_preview_line_for_debug(tail), marker="", reason="flush", attach=cfg.attach_side, max_len=cfg.max_len
+            "tail",
+            state,
+            chunk=_preview_line_for_debug(tail),
+            marker="",
+            reason="flush",
+            attach=cfg.attach_side,
+            max_len=cfg.max_len,
         )
-        parts.append(tail)
-    return parts
+        layers.append(tail)
+    return layers
 
 
 def _find_split_index(segment: str, cfg: TextNormConfig, state: dict | None = None) -> int | None:
@@ -256,44 +282,21 @@ def _find_split_index(segment: str, cfg: TextNormConfig, state: dict | None = No
     return None
 
 
-def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
-    """Split text into sentences following hard/soft punctuation rules."""
-
-    if not text:
-        return []
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    normalized = _RE_LINE_BREAK.sub(" ", normalized)
-    normalized = _RE_SPACE_RUN.sub(" ", normalized).strip()
-    if not normalized:
-        return []
-    state: dict | None = None
-    if is_debug_logging_enabled():
-        state = make_log_limit(400)
-    queue = _initial_hard_split(normalized, cfg, state)
+def _split_soft_layer(segment: str, cfg: TextNormConfig, state: dict | None = None) -> List[str]:
+    queue = [segment]
     sentences: List[str] = []
     soft_set = set(cfg.soft_puncts)
     attach_left = cfg.attach_side != "right"
     while queue:
-        segment = queue.pop(0).strip()
-        if not segment:
+        chunk = queue.pop(0).strip()
+        if not chunk:
             continue
-        index = _find_split_index(segment, cfg, state)
+        index = _find_split_index(chunk, cfg, state)
         if index is None:
-            if state and any(ch in cfg.hard_puncts for ch in segment):
-                reason = "len<=max" if len(segment) <= cfg.max_len else "hard-guard"
-                _log_split_event(
-                    "hard-retained",
-                    state,
-                    chunk=_preview_line_for_debug(segment),
-                    marker="",
-                    reason=reason,
-                    attach=cfg.attach_side,
-                    max_len=cfg.max_len,
-                )
-            sentences.append(segment)
+            sentences.append(chunk)
             continue
-        left = segment[:index].rstrip()
-        right = segment[index:].lstrip()
+        left = chunk[:index].rstrip()
+        right = chunk[index:].lstrip()
         if left:
             if attach_left and right and right[0] in soft_set:
                 left = left + right[0]
@@ -307,7 +310,7 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
                     attach=cfg.attach_side,
                     max_len=cfg.max_len,
                 )
-            marker = segment[index - 1] if index > 0 else segment[index : index + 1]
+            marker = chunk[index - 1] if index > 0 else chunk[index : index + 1]
             _log_split_event(
                 "soft-split" if marker in soft_set else "len-split",
                 state,
@@ -325,11 +328,84 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
                 "skip-empty",
                 state,
                 chunk=_preview_line_for_debug(right),
-                marker=segment[:1],
+                marker=chunk[:1],
                 reason="leading-soft",
                 attach=cfg.attach_side,
                 max_len=cfg.max_len,
             )
+    return sentences
+
+
+def _merge_short_neighbors(sentences: List[str], cfg: TextNormConfig) -> List[str]:
+    merged: List[str] = []
+    for sentence in sentences:
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        if merged and len(stripped) < cfg.min_len and len(merged[-1]) < cfg.min_len:
+            merged[-1] = (merged[-1] + stripped).strip()
+        else:
+            merged.append(stripped)
+    return merged
+
+
+def _merge_quote_guards(sentences: List[str]) -> List[str]:
+    merged: List[str] = []
+    for sentence in sentences:
+        stripped = sentence.strip()
+        if not stripped:
+            continue
+        if merged and all(ch in _CLOSER_SET for ch in stripped):
+            merged[-1] = (merged[-1] + stripped).strip()
+        else:
+            merged.append(stripped)
+    return merged
+
+
+def _would_cross_block_merge(
+    sentences: List[str],
+    existing: List[str],
+    cfg: TextNormConfig,
+) -> int:
+    if not sentences or not existing:
+        return 0
+    first = sentences[0].strip()
+    if not first:
+        return 0
+    if all(ch in _CLOSER_SET for ch in first):
+        return 1
+    if len(first) < cfg.min_len and len(existing[-1]) < cfg.min_len:
+        return 1
+    return 0
+
+
+def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
+    """Split text into sentences following hard/soft punctuation rules."""
+
+    if not text:
+        return []
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _RE_LINE_BREAK.sub(" ", normalized)
+    normalized = _RE_SPACE_RUN.sub(" ", normalized).strip()
+    if not normalized:
+        return []
+    state: dict | None = None
+    if is_debug_logging_enabled():
+        state = make_log_limit(400)
+    hard_layers = _split_hard_layers(normalized, cfg, state)
+    sentences: List[str] = []
+    blocked_cross_hard_merges = 0
+    for layer in hard_layers:
+        soft_sentences = _split_soft_layer(layer, cfg, state)
+        soft_sentences = _merge_short_neighbors(soft_sentences, cfg)
+        blocked_cross_hard_merges += _would_cross_block_merge(soft_sentences, sentences, cfg)
+        guarded = _merge_quote_guards(soft_sentences)
+        sentences.extend(guarded)
+    if blocked_cross_hard_merges and is_debug_logging_enabled():
+        log_debug(
+            "[split] blocked_cross_hard_merges=%s",
+            blocked_cross_hard_merges,
+        )
     return [sent for sent in sentences if sent]
 
 

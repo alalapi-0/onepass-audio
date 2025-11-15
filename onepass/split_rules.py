@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import List
+
+warnings.warn(
+    "onepass.split_rules is deprecated; the all-in-one pipeline now uses text_normalizer.split_sentences_with_rules.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 # 硬标点（不可跨越）：句号/问号/感叹号/全角变体/英文分号等，右侧可跟右引号/右括号
 HARD_PUNCT_RE = re.compile(r'[。！？!?．.;；]+[」』”’）)]*')

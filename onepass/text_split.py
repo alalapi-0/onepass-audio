@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import re
+import warnings
 from typing import List, Optional, Sequence, Tuple
+
+warnings.warn(
+    "onepass.text_split is deprecated; text_normalizer.split_sentences_with_rules supersedes it for OnePass pipelines.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 DEFAULT_HARD_PUNCT = "。！？!?．.;；"
 DEFAULT_SOFT_PUNCT = "，、,:：；;……—"
