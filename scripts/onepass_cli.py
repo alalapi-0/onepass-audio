@@ -102,22 +102,27 @@ DEFAULT_ALIGN_MAX_LEN = 24
 DEFAULT_ALIGN_HARD_MAX = 32
 DEFAULT_LEX_CUES = "但是,而且,因为,所以,比如,然而,如果,总之,同时,另外"
 DEFAULT_ENUM_CUES = "一是,二是,三是,首先,其次,再次,最后"
-DEFAULT_MATCH_MAX_DISTANCE_RATIO = 0.45
-DEFAULT_MATCH_MIN_ANCHOR_NGRAM = 4
-DEFAULT_MATCH_FALLBACK_POLICY = "greedy+expand"
+DEFAULT_MATCH_MAX_DISTANCE_RATIO = 0.35
+DEFAULT_MATCH_MIN_ANCHOR_NGRAM = 6
+DEFAULT_MATCH_FALLBACK_POLICY = "greedy"
 LOGGER = logging.getLogger("onepass.cli")  # 模块级日志器
 
 _UI_PROCESSES: list[object] = []
 
-_MATCH_PRESET_BASE = {
+_STRICT_BASE = {
     "max_distance_ratio": DEFAULT_MATCH_MAX_DISTANCE_RATIO,
     "min_anchor_ngram": DEFAULT_MATCH_MIN_ANCHOR_NGRAM,
     "fallback_policy": DEFAULT_MATCH_FALLBACK_POLICY,
-    "pause_gap_sec": PAUSE_GAP_SEC,
+    "pause_gap_sec": 0.45,
 }
 MATCH_PRESETS: dict[str, dict[str, float | int | str]] = {
-    "speech_zh_reading": dict(_MATCH_PRESET_BASE),
-    "tolerant": dict(_MATCH_PRESET_BASE),
+    "strict_zh_punct": dict(_STRICT_BASE),
+    "tolerant": {
+        "max_distance_ratio": 0.45,
+        "min_anchor_ngram": 4,
+        "fallback_policy": "greedy+expand",
+        "pause_gap_sec": 0.55,
+    },
 }
 MATCH_PRESET_CHOICES = tuple(MATCH_PRESETS.keys())
 
@@ -581,6 +586,24 @@ def _process_single_text(
 
     LOGGER.debug("Normalize %s", path)  # 调试输出当前文件
 
+    def _split_punct_only(payload: str, attach: str = "right") -> list[str]:
+        """仅按硬标点断句，支持右附着。"""
+
+        import re
+
+        text = payload or ""
+        if not text.strip():
+            return []
+        pattern = re.compile(r"(.+?[。！？!?．.;；])", re.S)
+        segments = pattern.findall(text)
+        consumed = sum(len(segment) for segment in segments)
+        tail = text[consumed:]
+        lines = [segment.strip() for segment in segments if segment and segment.strip()]
+        tail = tail.strip()
+        if tail:
+            lines.append(tail)
+        return lines
+
     raw_text = ""
     try:
         raw_text = path.read_text(encoding="utf-8-sig")  # 按 UTF-8-sig 读取原文
@@ -729,7 +752,7 @@ def _process_single_text(
             align_lines: list[str] | None = None
             align_debug_rows: list[tuple[str, int, str]] | None = None
             prosody_result: ProsodySplitResult | None = None
-            use_split_rules = split_mode in {"punct+len", "all-punct", "punct"}
+            use_split_rules = split_mode in {"punct+len", "all-punct"}
             if split_mode == "punct+len" and prosody_config and prosody_config.enabled:
                 guessed_words = _guess_words_json(path)
                 if guessed_words and guessed_words.exists():
@@ -767,6 +790,16 @@ def _process_single_text(
                     len(align_lines),
                     len(prosody_result.candidates),
                 )
+            elif split_mode == "punct":
+                align_lines = _split_punct_only(align_source, attach="right")
+                if debug_align:
+                    align_debug_rows = _build_split_debug_rows(align_lines, reason="PUNCT_ONLY")
+                LOGGER.info("[split] mode=punct hard-only attach=right -> lines=%s", len(align_lines))
+                effective_split_mode = "punct"
+                effective_min_len = 0
+                effective_max_len = 0
+                effective_hard_max = align_hard_max
+                effective_weak = False
             elif use_split_rules:
                 if prosody_result and not prosody_result.lines:
                     LOGGER.warning(
@@ -3360,8 +3393,6 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     ]
     if args.include_canonical_kits:
         parts.append("--include-canonical-kits")
-    if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE:
-        parts.extend(["--split-mode", args.split_mode])
     if args.min_len != DEFAULT_ALIGN_MIN_LEN:
         parts.extend(["--min-len", str(args.min_len)])
     if args.max_len != DEFAULT_ALIGN_MAX_LEN:
@@ -3422,6 +3453,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
     parts.extend(["--max-windows", str(args.max_windows)])
     parts.extend(["--match-timeout", str(args.match_timeout)])
     parts.extend(["--pause-gap-sec", str(args.pause_gap_sec)])
+    parts.extend(["--split-mode", str(args.split_mode)])
     parts.extend(["--max-distance-ratio", str(args.max_distance_ratio)])
     parts.extend(["--min-anchor-ngram", str(args.min_anchor_ngram)])
     if args.match_debug:
@@ -3979,13 +4011,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "对齐失败时的回退策略（默认 "
-            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy-expand）"
+            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy）"
         ),
     )
     retake.add_argument(
         "--match-preset",
         choices=MATCH_PRESET_CHOICES,
-        help="匹配参数预设（speech_zh_reading=中文朗读默认，tolerant=旧版宽松）",
+        help="匹配参数预设（strict_zh_punct=严格中文朗读默认；tolerant=旧版宽松）",
     )
     retake.add_argument("--no-silence-probe", action="store_true", help="跳过 ffmpeg 静音探测")
     retake.add_argument(
@@ -4506,13 +4538,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "对齐失败时的回退策略（默认 "
-            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy-expand）"
+            f"{DEFAULT_MATCH_FALLBACK_POLICY}, 对应 align-greedy）"
         ),
     )
     pipeline.add_argument(
         "--match-preset",
         choices=MATCH_PRESET_CHOICES,
-        help="匹配参数预设（speech_zh_reading=中文朗读默认，tolerant=旧版宽松）",
+        help="匹配参数预设（strict_zh_punct=严格中文朗读默认；tolerant=旧版宽松）",
     )
     pipeline.set_defaults(func=handle_all_in_one)
 
