@@ -181,6 +181,28 @@ python scripts/onepass_cli.py prep-norm \
   --weak-punct-enable --keep-quotes
 ```
 
+#### `onepass.debug` 调试日志
+
+- 统一的调试日志使用 `onepass.debug` logger 输出，需通过 `--debug-align` 或环境变量 `ONEPASS_DEBUG=1` 显式开启；其余命令行参数不变。
+- 日志按照“规范化 → 分句 → 匹配 → 剪切保护”顺序串联，典型输出如下：
+
+  ```text
+  [normalize] drop_ascii_parens=True squash_mixed_english=True ...
+  [normalize] sample.before=（未清洗的原句...)
+  [normalize] sample.after=未清洗的原句...
+  [split.hard] chunk=这是第一句。 marker=。 reason=stack-clear attach=right max_len=24
+  [split.soft-split] chunk=这是补刀 marker=， reason=soft attach=right max_len=24
+  [split.hard-retained] chunk=但句子里仍有。 reason=len<=max attach=right max_len=24
+  [match.sample] section=head idx=1 status=matched score=0.042 anchor=8 ratio=0.35 reason=-
+  [match.sample] section=tail idx=58 status=unmatched score=-1.000 anchor=6 ratio=0.50 reason=time-window
+  [match.unmatched] idx=42 reason=无锚点 ratio=0.35 ngram=8 text=缺少锚点...
+  [match.monotonic-drop] idx=17 reason=被 monotonic 丢弃 mode=strict t0=65.320 t1=66.480 raw_reason=pre_take
+  [cut-ratio] threshold=0.60 ratio=0.72 triggered=Y min_sent=12->16 max_dup_gap=30.00->18.00
+  ```
+
+- 为避免刷屏，分句阶段日志最多打印 400 条（逐条说明硬/软切、附着与二次合并），匹配样例仅展示首/末 10 行（共 20 条），monotonic 丢弃日志上限 500 条；`[match.unmatched]` 原因分类则针对每一行输出，便于逐条对照现有告警。
+- 当 CLI 未提供 `--debug-align` 时，可通过 `ONEPASS_DEBUG=1 python scripts/onepass_cli.py ...` 在任意子命令上开启同样的调试串流；若只想查看部分阶段，可结合 `grep "onepass.debug" out/logs/*.log` 过滤。
+
 ### Web 可视化面板
 
 1. **本地服务**：`scripts/web_panel_server.py` 提供 `/api/list`、`/api/file`、`/api/save_edl`、`/api/save_markers_csv` 等接口；内部通过 `_build_list_payload()` 列举 `out/` 目录成果，保存文件时校验路径防止越权。 【F:scripts/web_panel_server.py†L1-L200】【F:scripts/web_panel_server.py†L200-L360】

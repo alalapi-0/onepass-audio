@@ -40,6 +40,7 @@ from .text_norm import (
     normalize_text,
 )
 from .utils.subproc import run_cmd
+from .debug_utils import is_debug_logging_enabled, log_debug, make_log_limit
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,6 +95,13 @@ _DEDUPE_POLICY_MAP = {
 }
 
 _SIM_TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
+
+_MATCH_FAILURE_LABELS = {
+    "no-anchor": "无锚点",
+    "distance": "距离过大",
+    "time-window": "时间窗超限",
+    "monotonic": "被 monotonic 丢弃",
+}
 
 
 def _resolve_dedupe_policy(policy: str | None) -> tuple[str, str]:
@@ -855,6 +863,36 @@ def _preview_text(text: str, limit: int = 120) -> str:
     return text[: limit - 1] + "…"
 
 
+def _log_match_samples(samples: Sequence[dict[str, object]] | None) -> None:
+    """Print the first/last 10 match decisions via onepass.debug."""
+
+    if not samples or not is_debug_logging_enabled():
+        return
+    limit = make_log_limit(20)
+    head = list(samples[:10])
+    tail = list(samples[-10:]) if len(samples) > 10 else []
+    for section, rows in (("head", head), ("tail", tail)):
+        if not rows:
+            continue
+        for row in rows:
+            score = row.get("score")
+            if score is None:
+                score = -1.0
+            status = row.get("status", "unknown")
+            reason = row.get("reason", "-") if status != "matched" else "-"
+            log_debug(
+                "[match.sample] section=%s idx=%s status=%s score=%.3f anchor=%s ratio=%.2f reason=%s",
+                section,
+                row.get("idx"),
+                status,
+                float(score),
+                row.get("ngram"),
+                float(row.get("distance_ratio", 0.0) or 0.0),
+                reason,
+                limit=limit,
+            )
+
+
 def _ascii_ratio(text: str) -> float:
     if not text:
         return 0.0
@@ -1188,6 +1226,7 @@ def compute_retake_keep_last(
         search_elapsed = 0.0
         ascii_relaxed = 0
         match_rows: list[dict[str, object]] | None = [] if collect_match_debug else None
+        line_probe: list[dict[str, object]] = []
         for index, line in enumerate(lines, start=1):
             if active_deadline and time.monotonic() > active_deadline:
                 raise TimeoutError("match deadline")
@@ -1213,6 +1252,7 @@ def compute_retake_keep_last(
                 continue
             spans: list[tuple[float, float]] = []
             match_result: MatchResult | None = None
+            match_meta: dict[str, object] = {}
             effective_timeout = per_line_timeout
             local_deadline = active_deadline
             if local_deadline is not None:
@@ -1237,8 +1277,14 @@ def compute_retake_keep_last(
                     max_distance_ratio=line_ratio,
                     match_timeout=effective_timeout,
                     prefer_latest=True,
+                    debug_details=match_meta,
                 )
                 search_elapsed += time.monotonic() - match_start
+            line_debug = {
+                "idx": index,
+                "distance_ratio": float(line_ratio),
+                "ngram": current_anchor_ngram,
+            }
             if match_result:
                 spans.append((match_result.time_start, match_result.time_end))
                 if match_result.method == "anchor+lev":
@@ -1249,6 +1295,13 @@ def compute_retake_keep_last(
                 coarse_total += hits
                 coarse_passed += hits
                 fine_evaluated += 1
+                line_debug.update(
+                    {
+                        "status": "matched",
+                        "score": float(match_result.score or 0.0),
+                        "anchor_hits": int(match_result.anchor_hits or 0),
+                    }
+                )
                 if row_record is not None:
                     row_record.update(
                         {
@@ -1283,6 +1336,24 @@ def compute_retake_keep_last(
                             "distance": None,
                         }
                     )
+                failure_key = str(match_meta.get("failure_reason") or "")
+                if not failure_key:
+                    failure_key = "no-anchor" if not token_stream or not token_stream.canonical_text else "distance"
+                line_debug.update(
+                    {
+                        "status": "unmatched",
+                        "reason": failure_key,
+                    }
+                )
+                reason_label = _MATCH_FAILURE_LABELS.get(failure_key, failure_key)
+                log_debug(
+                    "[match.unmatched] idx=%s reason=%s ratio=%.2f ngram=%s text=%s",
+                    index,
+                    reason_label,
+                    float(line_ratio),
+                    current_anchor_ngram,
+                    _preview_text(units, 80),
+                )
                 LOGGER.warning(
                     "[unmatched] line=%s text=%s",
                     index,
@@ -1290,7 +1361,9 @@ def compute_retake_keep_last(
                 )
                 if match_rows is not None and row_record is not None:
                     match_rows.append(row_record)
+                line_probe.append(line_debug)
                 continue
+            line_probe.append(line_debug)
             spans.sort(key=lambda item: item[0])
             sentence_length = len(units)
             if sentence_length < max(0, min_sent_cutoff):
@@ -1328,6 +1401,7 @@ def compute_retake_keep_last(
             "search_elapsed_sec": search_elapsed,
             "ascii_relaxed_lines": ascii_relaxed,
             "match_debug_rows": match_rows,
+            "match_probe": line_probe,
         }
 
     keeps: list[KeepSpan] = []
@@ -1352,6 +1426,7 @@ def compute_retake_keep_last(
     dp_path_rows_final: list[dict[str, object]] | None = None
     dp_stats: dict[str, object] = {}
     monotonic_stats: dict[str, object] = {}
+    latest_match_probe: list[dict[str, object]] | None = None
 
     current_min_sent = int(min_sent_chars)
     current_dup_gap = float(max_dup_gap_sec)
@@ -1374,6 +1449,7 @@ def compute_retake_keep_last(
         current_distance_ratio = float(stage["ratio"])
         try:
             alignment = _align_once(current_min_sent, current_dup_gap)
+            latest_match_probe = alignment.pop("match_probe", None)
         except TimeoutError:
             timed_out = True
             degrade_reason = degrade_reason or "timeout"
@@ -1698,11 +1774,27 @@ def compute_retake_keep_last(
             )
         else:
             kept_rows, dropped_rows = [], []
+        mono_limit = make_log_limit(500) if is_debug_logging_enabled() and dropped_rows else None
         for row in dropped_rows:
             row.setdefault("drop_reason", "pre_take")
             row["kept"] = 0
             if row.get("dp_in_best"):
                 row["dp_drop_reason"] = row.get("drop_reason", "pre_take")
+            if mono_limit:
+                start_val = float(row.get("snap_t0", row.get("match_t0", 0.0)) or 0.0)
+                end_val = float(row.get("snap_t1", row.get("match_t1", 0.0)) or 0.0)
+                reason_label = _MATCH_FAILURE_LABELS.get("monotonic")
+                drop_reason = row.get("drop_reason", "pre_take")
+                log_debug(
+                    "[match.monotonic-drop] idx=%s reason=%s mode=%s t0=%.3f t1=%.3f raw_reason=%s",
+                    row.get("idx"),
+                    reason_label,
+                    monotonic_mode,
+                    start_val,
+                    end_val,
+                    drop_reason,
+                    limit=mono_limit,
+                )
 
         final_keeps: list[KeepSpan] = []
         for row in kept_rows:
@@ -1824,7 +1916,13 @@ def compute_retake_keep_last(
         else:
             stats["prune_rate"] = 0.0
 
-        if not recomputed and stats["cut_ratio"] > 0.6 and raw_keeps:
+        guard_threshold = 0.6
+        ratio_snapshot = float(stats.get("cut_ratio", 0.0) or 0.0)
+        prev_min_sent = current_min_sent
+        prev_dup_gap = current_dup_gap
+        guard_triggered = False
+        if not recomputed and ratio_snapshot > guard_threshold and raw_keeps:
+            guard_triggered = True
             new_min_sent = max(current_min_sent + 4, int(math.ceil(current_min_sent * 1.2)))
             new_dup_gap = max(0.5, current_dup_gap * 0.6) if current_dup_gap > 0 else current_dup_gap
             if new_min_sent != current_min_sent or not math.isclose(new_dup_gap, current_dup_gap, rel_tol=1e-2):
@@ -1855,6 +1953,16 @@ def compute_retake_keep_last(
                 )
                 recomputed = True
                 continue
+        log_debug(
+            "[cut-ratio] threshold=%.2f ratio=%.3f triggered=%s min_sent=%s->%s max_dup_gap=%.2f->%.2f",
+            guard_threshold,
+            ratio_snapshot,
+            "Y" if guard_triggered else "N",
+            prev_min_sent,
+            current_min_sent,
+            prev_dup_gap,
+            current_dup_gap,
+        )
         if stats.get("matched_lines", 0) == 0 and stage_index + 1 < len(stage_plan):
             degrade_reason = degrade_reason or "no-match"
             next_stage = stage_plan[stage_index + 1]
@@ -1870,6 +1978,8 @@ def compute_retake_keep_last(
             stage_index += 1
             continue
         break
+
+    _log_match_samples(latest_match_probe)
 
     if stats is None:
         stats = {

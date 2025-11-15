@@ -6,6 +6,8 @@ import re
 from pathlib import Path
 from typing import Dict, List, Mapping
 
+from .debug_utils import is_debug_logging_enabled, log_debug, make_log_limit
+
 from .canonicalize import load_alias_map as _canonical_load_alias_map
 from . import _legacy_text_norm as _legacy_norm
 from . import _legacy_textnorm as _legacy_textnorm
@@ -70,6 +72,19 @@ _RE_DASH_VARIANTS = re.compile(r"[‒–—―﹘﹣]+")
 _RE_ELLIPSIS = re.compile(r"\.{4,}")
 
 
+def _preview_line_for_debug(text: str, limit: int = 80) -> str:
+    """Return a single-line preview for verbose logs."""
+
+    if not text:
+        return "<empty>"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:limit]
+    compacted = text.replace("\n", " ").strip()
+    return compacted[:limit] if compacted else "<empty>"
+
+
 def _apply_char_map(text: str, char_map: Mapping[str, object]) -> str:
     normalized = text
     if char_map.get("normalize_width"):
@@ -127,7 +142,20 @@ def normalize_text_for_export(
     if preserve_newlines is not None:
         collapse_lines = not preserve_newlines
 
+    sample_before: str | None = None
     normalized = _apply_char_map(text, char_map)
+    if is_debug_logging_enabled():
+        sample_before = _preview_line_for_debug(text)
+        log_debug(
+            "[normalize] drop_ascii_parens=%s squash_mixed_english=%s collapse_lines=%s order=char_map>whitespace>drop_ascii>mixed-spacing>punct char_map_flags width=%s space=%s delete=%s map=%s",
+            bool(cfg.drop_ascii_parens),
+            bool(cfg.squash_mixed_english),
+            bool(collapse_lines),
+            bool(char_map.get("normalize_width")),
+            bool(char_map.get("normalize_space")),
+            len(char_map.get("delete", [])),
+            len(char_map.get("map", {})),
+        )
     normalized = _normalize_whitespace(normalized, collapse_lines)
     if cfg.drop_ascii_parens:
         table = {ord(ch): None for ch in _ASCII_PARENS}
@@ -135,7 +163,11 @@ def normalize_text_for_export(
     if cfg.squash_mixed_english:
         normalized = _squash_mixed_spacing(normalized)
     normalized = _final_punct_normalize(normalized)
-    return normalized.strip()
+    normalized = normalized.strip()
+    if is_debug_logging_enabled():
+        log_debug("[normalize] sample.before=%s", sample_before or "<empty>")
+        log_debug("[normalize] sample.after=%s", _preview_line_for_debug(normalized))
+    return normalized
 
 
 _HARD_OPENERS = "（〔［【《〈「『“‘(\"'[{"
@@ -144,7 +176,31 @@ _HARD_PAIRS = {op: cl for op, cl in zip(_HARD_OPENERS, _HARD_CLOSERS)}
 _HARD_REVERSE = {cl: op for op, cl in _HARD_PAIRS.items()}
 
 
-def _initial_hard_split(text: str, cfg: TextNormConfig) -> List[str]:
+def _log_split_event(
+    event: str,
+    state: dict | None,
+    *,
+    chunk: str,
+    marker: str = "",
+    reason: str = "",
+    attach: str,
+    max_len: int,
+) -> None:
+    if not state:
+        return
+    log_debug(
+        "[split.%s] chunk=%s marker=%s reason=%s attach=%s max_len=%s",
+        event,
+        chunk,
+        marker or "-",
+        reason or "-",
+        attach,
+        max_len,
+        limit=state,
+    )
+
+
+def _initial_hard_split(text: str, cfg: TextNormConfig, state: dict | None = None) -> List[str]:
     hard_set = set(cfg.hard_puncts)
     stack: List[str] = []
     parts: List[str] = []
@@ -161,15 +217,25 @@ def _initial_hard_split(text: str, cfg: TextNormConfig) -> List[str]:
         if ch in hard_set and not stack:
             chunk = "".join(current).strip()
             if chunk:
+                _log_split_event(
+                    "hard", state, chunk=_preview_line_for_debug(chunk), marker=ch, reason="stack-clear", attach=cfg.attach_side, max_len=cfg.max_len
+                )
                 parts.append(chunk)
             current = []
+        elif ch in hard_set and stack and state:
+            _log_split_event(
+                "guard", state, chunk=_preview_line_for_debug("".join(current[-10:])), marker=ch, reason="within-quotes", attach=cfg.attach_side, max_len=cfg.max_len
+            )
     tail = "".join(current).strip()
     if tail:
+        _log_split_event(
+            "tail", state, chunk=_preview_line_for_debug(tail), marker="", reason="flush", attach=cfg.attach_side, max_len=cfg.max_len
+        )
         parts.append(tail)
     return parts
 
 
-def _find_split_index(segment: str, cfg: TextNormConfig) -> int | None:
+def _find_split_index(segment: str, cfg: TextNormConfig, state: dict | None = None) -> int | None:
     if len(segment) <= cfg.max_len:
         return None
     soft_set = set(cfg.soft_puncts)
@@ -200,7 +266,10 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     normalized = _RE_SPACE_RUN.sub(" ", normalized).strip()
     if not normalized:
         return []
-    queue = _initial_hard_split(normalized, cfg)
+    state: dict | None = None
+    if is_debug_logging_enabled():
+        state = make_log_limit(400)
+    queue = _initial_hard_split(normalized, cfg, state)
     sentences: List[str] = []
     soft_set = set(cfg.soft_puncts)
     attach_left = cfg.attach_side != "right"
@@ -208,8 +277,19 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
         segment = queue.pop(0).strip()
         if not segment:
             continue
-        index = _find_split_index(segment, cfg)
+        index = _find_split_index(segment, cfg, state)
         if index is None:
+            if state and any(ch in cfg.hard_puncts for ch in segment):
+                reason = "len<=max" if len(segment) <= cfg.max_len else "hard-guard"
+                _log_split_event(
+                    "hard-retained",
+                    state,
+                    chunk=_preview_line_for_debug(segment),
+                    marker="",
+                    reason=reason,
+                    attach=cfg.attach_side,
+                    max_len=cfg.max_len,
+                )
             sentences.append(segment)
             continue
         left = segment[:index].rstrip()
@@ -218,10 +298,38 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
             if attach_left and right and right[0] in soft_set:
                 left = left + right[0]
                 right = right[1:]
+                _log_split_event(
+                    "attach-soft",
+                    state,
+                    chunk=_preview_line_for_debug(left),
+                    marker=right[:1],
+                    reason="attach-left",
+                    attach=cfg.attach_side,
+                    max_len=cfg.max_len,
+                )
+            marker = segment[index - 1] if index > 0 else segment[index : index + 1]
+            _log_split_event(
+                "soft-split" if marker in soft_set else "len-split",
+                state,
+                chunk=_preview_line_for_debug(left),
+                marker=marker,
+                reason="soft" if marker in soft_set else "hard-max",
+                attach=cfg.attach_side,
+                max_len=cfg.max_len,
+            )
             queue.insert(0, right)
             sentences.append(left)
         else:
             queue.insert(0, right)
+            _log_split_event(
+                "skip-empty",
+                state,
+                chunk=_preview_line_for_debug(right),
+                marker=segment[:1],
+                reason="leading-soft",
+                attach=cfg.attach_side,
+                max_len=cfg.max_len,
+            )
     return [sent for sent in sentences if sent]
 
 
