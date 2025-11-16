@@ -11,7 +11,7 @@ import fnmatch  # 大小写无关的 glob 匹配
 import sys  # 访问解释器信息
 import threading
 import time  # 统计耗时
-from dataclasses import asdict, dataclass  # 复用数据类结构化统计
+from dataclasses import asdict, dataclass, replace  # 复用数据类结构化统计
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed  # 并发执行
 from pathlib import Path  # 跨平台路径处理
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
@@ -192,7 +192,7 @@ def _resolve_split_attach(value: str | None, *, warn: bool = False) -> str:
         return "right"
     if normalized == "left":
         if warn:
-            LOGGER.warning("当前分句实现仅支持右挂标点，已强制改为 right")
+            LOGGER.warning("split-attach=left 未实现，已强制为 right")
         return "right"
     return normalized
 
@@ -583,17 +583,25 @@ def _rule_split_text(
     hard_punct: str | Sequence[str] | None,
     soft_punct: str | Sequence[str] | None,
     soft_enabled: bool,
+    split_mode: str,
+    quote_protect: bool,
+    paren_protect: bool,
+    hard_collapse_lines: bool,
 ) -> list[str]:
     cfg = TextNormConfig(
         drop_ascii_parens=False,
         squash_mixed_english=False,
         collapse_lines=True,
+        hard_collapse_lines=hard_collapse_lines,
         max_len=max_len,
         min_len=min_len,
         hard_max=hard_max,
         hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
         soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT) if soft_enabled else "",
         attach_side=attach or "right",
+        quote_protect=quote_protect,
+        paren_protect=paren_protect,
+        split_mode=(split_mode or "punct+len").strip().lower(),
     )
     return split_sentences_with_rules(text, cfg)
 
@@ -627,6 +635,8 @@ def _process_single_text(
     soft_punct: str | Sequence[str] | None,
     split_attach: str,
     prosody_config: ProsodyConfig | None,
+    quote_protect: bool,
+    paren_protect: bool,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -649,6 +659,17 @@ def _process_single_text(
         if tail:
             lines.append(tail)
         return lines
+
+    split_mode = (split_mode or "punct+len").strip().lower()
+    align_weak_flag = bool(align_weak_punct)
+    local_prosody = prosody_config
+    if split_mode == "all-punct":
+        if local_prosody and local_prosody.enabled:
+            LOGGER.warning("split-mode=all-punct 已忽略 prosody_split (已强制禁用)")
+            local_prosody = replace(local_prosody, enabled=False)
+        if align_weak_flag:
+            LOGGER.warning("split-mode=all-punct 已忽略 weak-punct-enable")
+            align_weak_flag = False
 
     raw_text = ""
     try:
@@ -688,6 +709,9 @@ def _process_single_text(
         hard_puncts=_coerce_punct_string(hard_punct, DEFAULT_HARD_PUNCT),
         soft_puncts=_coerce_punct_string(soft_punct, DEFAULT_SOFT_PUNCT),
         attach_side=split_attach or "right",
+        quote_protect=quote_protect,
+        paren_protect=paren_protect,
+        split_mode=split_mode,
     )
     try:
         normalized_text = normalize_text_for_export(
@@ -757,7 +781,7 @@ def _process_single_text(
     effective_min_len = align_min_len
     effective_max_len = align_max_len
     effective_hard_max = align_hard_max
-    effective_weak = align_weak_punct
+    effective_weak = align_weak_flag
     canonical_path: Path | None = None
 
     if not dry_run:
@@ -800,7 +824,7 @@ def _process_single_text(
             align_debug_rows: list[tuple[str, int, str]] | None = None
             prosody_result: ProsodySplitResult | None = None
             use_split_rules = split_mode in {"punct+len", "all-punct"}
-            if split_mode == "punct+len" and prosody_config and prosody_config.enabled:
+            if split_mode == "punct+len" and local_prosody and local_prosody.enabled:
                 guessed_words = _guess_words_json(path)
                 if guessed_words and guessed_words.exists():
                     try:
@@ -808,14 +832,14 @@ def _process_single_text(
                         prosody_result = split_text_with_prosody(
                             align_source,
                             list(words_doc),
-                            prosody_config,
+                            local_prosody,
                         )
                     except Exception as exc:  # pragma: no cover - 容错
                         LOGGER.warning(
                             "[prosody] 切句失败 %s: %s，已回退 punct+len", path.name, exc
                         )
                         prosody_result = None
-                elif prosody_config.enabled:
+                elif local_prosody and local_prosody.enabled:
                     LOGGER.debug("[prosody] 未找到词级 JSON，已使用 punct+len: %s", path.name)
             if (
                 split_mode == "punct+len"
@@ -863,6 +887,10 @@ def _process_single_text(
                     hard_punct=hard_punct,
                     soft_punct=soft_punct,
                     soft_enabled=(split_mode == "punct+len"),
+                    split_mode=split_mode,
+                    quote_protect=quote_protect,
+                    paren_protect=paren_protect,
+                    hard_collapse_lines=hard_collapse_lines,
                 )
                 if debug_align:
                     align_debug_rows = _build_split_debug_rows(align_lines)
@@ -873,7 +901,7 @@ def _process_single_text(
                     min_len=align_min_len,
                     max_len=align_max_len,
                     hard_max=align_hard_max,
-                    weak_punct_enable=align_weak_punct,
+                    weak_punct_enable=align_weak_flag,
                     keep_quotes=align_keep_quotes,
                     prosody_gap_ms=prosody_gap_ms,
                     max_clause_chars=max_clause_chars,
@@ -890,6 +918,10 @@ def _process_single_text(
                             hard_punct=hard_punct,
                             soft_punct=soft_punct,
                             soft_enabled=True,
+                            split_mode="punct+len",
+                            quote_protect=quote_protect,
+                            paren_protect=paren_protect,
+                            hard_collapse_lines=hard_collapse_lines,
                         )
                         guard_debug = _build_split_debug_rows(guard_lines, reason="ZH_SPLIT/GUARD")
                     else:
@@ -902,6 +934,10 @@ def _process_single_text(
                             hard_punct=hard_punct,
                             soft_punct=soft_punct,
                             soft_enabled=True,
+                            split_mode="punct+len",
+                            quote_protect=quote_protect,
+                            paren_protect=paren_protect,
+                            hard_collapse_lines=hard_collapse_lines,
                         )
                         guard_debug = None
                     effective_split_mode = "punct+len"
@@ -1144,6 +1180,8 @@ def run_prep_norm(
     soft_punct: str | Sequence[str] | None = DEFAULT_SOFT_PUNCT,
     split_attach: str = "right",
     prosody_config: ProsodyConfig | None = None,
+    quote_protect: bool = True,
+    paren_protect: bool = True,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -1233,6 +1271,8 @@ def run_prep_norm(
             soft_punct=soft_punct,
             split_attach=split_attach,
             prosody_config=prosody_config,
+            quote_protect=quote_protect,
+            paren_protect=paren_protect,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -1276,7 +1316,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             args.glob,
         ]
         + (["--collapse-lines"] if args.collapse_lines else ["--no-collapse-lines"])
-        + (["--hard-collapse-lines"] if args.hard_collapse_lines else [])
+        + (["--hard-collapse-lines"] if args.hard_collapse_lines else ["--no-hard-collapse-lines"])
         + (["--emit-align"] if args.emit_align else [])
         + (["--debug-align"] if args.debug_align else [])
         + (["--split-mode", args.split_mode] if args.split_mode != DEFAULT_ALIGN_SPLIT_MODE else [])
@@ -1329,6 +1369,8 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             soft_punct=args.soft_punct,
             split_attach=args.split_attach,
             prosody_config=prosody_config,
+            quote_protect=args.quote_protect,
+            paren_protect=args.paren_protect,
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -2994,6 +3036,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     norm_pattern = _casefold_pattern(args.norm_glob)
     norm_out_dir = out_dir / "norm"
     split_mode = getattr(args, "split_mode", DEFAULT_ALIGN_SPLIT_MODE)
+    report.setdefault("params", {})["split_mode"] = split_mode
+    report["params"]["hard_collapse_lines"] = bool(getattr(args, "hard_collapse_lines", True))
     align_min_len = int(getattr(args, "min_len", DEFAULT_ALIGN_MIN_LEN))
     align_max_len = int(getattr(args, "max_len", DEFAULT_ALIGN_MAX_LEN))
     align_hard_max = int(getattr(args, "hard_max", DEFAULT_ALIGN_HARD_MAX))
@@ -3036,6 +3080,8 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         soft_punct=soft_punct,
         split_attach=split_attach,
         prosody_config=prosody_config,
+        quote_protect=bool(getattr(args, "quote_protect", True)),
+        paren_protect=bool(getattr(args, "paren_protect", True)),
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})
@@ -3637,8 +3683,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--hard-collapse-lines",
         dest="hard_collapse_lines",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="先将换行/制表符/全角空格统一为单空格并压缩空白（默认关闭）",
+        default=True,
+        help="先将换行/制表符/全角空格统一为单空格并压缩空白（默认开启，可用 --no-hard-collapse-lines 关闭）",
     )
     prep.add_argument(
         "--emit-align",
@@ -3750,9 +3796,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--attach",
         "--punct-attach",
         dest="split_attach",
-        choices=["left", "right"],
+        choices=["right"],
         default="right",
-        help="硬标点归属（当前仅支持 right，传 left 会自动回退）",
+        help="硬标点归属（仅支持 right，旧配置将被强制改为 right）",
     )
     prep.add_argument(
         "--prosody-split",
@@ -4238,8 +4284,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--hard-collapse-lines",
         dest="hard_collapse_lines",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="是否额外启用硬清空白（默认关闭，兼容旧流程）",
+        default=True,
+        help="是否额外启用硬清空白（默认开启，可用 --no-hard-collapse-lines 关闭）",
     )
     pipeline.add_argument(
         "--char-map",
@@ -4434,9 +4480,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--attach",
         "--punct-attach",
         dest="split_attach",
-        choices=["left", "right"],
+        choices=["right"],
         default="right",
-        help="硬标点归属（当前仅支持 right，传 left 会提示并改写）",
+        help="硬标点归属（仅支持 right）",
     )
     pipeline.add_argument(
         "--prosody-split",

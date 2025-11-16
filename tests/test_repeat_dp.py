@@ -9,7 +9,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from onepass.dp_path import select_best_path
 from onepass.repeat_detect import RepeatCandidate, cluster_candidates
-from onepass.text_split import smart_split
+from legacy.text_split import smart_split
 
 
 def test_cluster_candidates_groups_and_ranks() -> None:

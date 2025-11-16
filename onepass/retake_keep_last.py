@@ -1919,7 +1919,8 @@ def compute_retake_keep_last(
             stats["prune_rate"] = 0.0
 
         guard_threshold = 0.6
-        ratio_snapshot = float(stats.get("cut_ratio", 0.0) or 0.0)
+        snapshot_stats = stats or {}
+        ratio_snapshot = float(snapshot_stats.get("cut_ratio", 0.0) or 0.0)
         guard_triggered = False
         prev_min_sent = current_min_sent
         prev_dup_gap = current_dup_gap
@@ -1983,7 +1984,7 @@ def compute_retake_keep_last(
             prev_dup_gap,
             current_dup_gap,
         )
-        if stats.get("matched_lines", 0) == 0 and stage_index + 1 < len(stage_plan):
+        if snapshot_stats.get("matched_lines", 0) == 0 and stage_index + 1 < len(stage_plan):
             degrade_reason = degrade_reason or "no-match"
             next_stage = stage_plan[stage_index + 1]
             degrade_history.append(

@@ -12,7 +12,7 @@ if str(ROOT_DIR) not in sys.path:
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from onepass.retake.matcher import MatchRequest, StableMatcher
+from legacy.retake.matcher import MatchRequest, StableMatcher
 from scripts.onepass_cli import (
     DEFAULT_CHAR_MAP,
     DEFAULT_MATCH_FALLBACK_POLICY,

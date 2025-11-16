@@ -166,7 +166,9 @@ pip install opencc
 
 #### 中文分句模式与验收
 
-- **三种模式**：`--split-mode punct` 仅依赖 `。！？；…` 等强标点；`--split-mode all-punct` 会在强标点之外追加 `，、：—` 等弱断点；`--split-mode punct+len`（默认）先按强标点分句，再根据 `--min-len/--max-len/--hard-max` 自动在弱标点、空白或逗号处分块，并将过短片段与邻句合并。
+- **三种模式**：`--split-mode punct` 仅依赖 `。！？；…` 等强标点；`--split-mode all-punct` 会在硬清空白后对所有标点（含逗号、顿号、冒号、破折号等）逐一右挂切分，并自动忽略 `--weak-punct-enable/--prosody-split` 以避免重复切分；`--split-mode punct+len`（默认）先按强标点分句，再根据 `--min-len/--max-len/--hard-max` 自动在弱标点、空白或逗号处分块，并将过短片段与邻句合并。
+- **硬清空白**：`prep-norm` 与 `all-in-one` 默认启用 `--hard-collapse-lines`，会先统一换行/制表符/全角空格/不间断空格，再进入分句阶段；若需回退旧行为，可显式传入 `--no-hard-collapse-lines`。
+- **标点附着**：CLI 仅接受 `--split-attach right`，旧脚本若传入 `left` 会收到一次性告警并被强制改写。
 - **调参与护栏**：`--min-len` 控制短句合并阈值，`--max-len` 决定二次切分的软上限，`--hard-max` 则在超长句子中强制寻找空白/逗号断开；`--weak-punct-enable/--no-weak-punct-enable` 用于全局开关弱断点，`--keep-quotes/--no-keep-quotes` 用于指定括号/引号内部是否跳过弱断点。若 `.align.txt` 仍只有 1 行，流水线会自动切回 `punct+len` 并应用 `min_len=8/max_len=20/hard_max=28` 再跑一遍，同时在 `batch_report.json` 中记录 `align_guard_triggered/align_guard_failed` 以及最终使用的分句参数。
 - **调试文件**：生成 `.align.txt` 时会同步写出 `.align.debug.tsv`，包含 `idx/start_char/end_char/text_preview` 四列，可快速定位句段与字符区间。
 - **统计与验收**：`batch_report.json` 的 `prep_norm.items[]` 现会附带 `align_total_lines/split_mode/min_len/max_len/hard_max/weak_punct_enable` 等字段。R2 需要至少 100 行且使用 `punct+len`，可运行 `python scripts/check_r2_alignment.py out/batch_report.json` 自动列出 PASS/FAIL 并附上 `.align.txt` 与 `.align.debug.tsv` 前 5 行。
@@ -179,6 +181,38 @@ python scripts/onepass_cli.py prep-norm \
   --out out/norm \
   --emit-align --split-mode punct+len --min-len 8 --max-len 24 --hard-max 32 \
   --weak-punct-enable --keep-quotes
+```
+
+**全标点切分示例**（默认会启用硬清空白，`--split-attach` 仅保留 right）：
+
+- PowerShell：
+
+```powershell
+python scripts/onepass_cli.py all-in-one ^
+  --in materials ^
+  --out out ^
+  --render auto --no-interaction ^
+  --char-map config/default_char_map.json ^
+  --hard-collapse-lines ^
+  --split-mode all-punct ^
+  --no-weak-punct-enable --no-prosody-split ^
+  --split-attach right ^
+  --quote-protect --paren-protect
+```
+
+- Bash：
+
+```bash
+python scripts/onepass_cli.py all-in-one \
+  --in materials \
+  --out out \
+  --render auto --no-interaction \
+  --char-map config/default_char_map.json \
+  --hard-collapse-lines \
+  --split-mode all-punct \
+  --no-weak-punct-enable --no-prosody-split \
+  --split-attach right \
+  --quote-protect --paren-protect
 ```
 
 #### `onepass.debug` 调试日志

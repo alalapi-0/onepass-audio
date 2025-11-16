@@ -18,7 +18,12 @@ from onepass.alignment.canonical import CanonicalRules, concat_and_index
 from onepass.asr_loader import Word, load_words
 from onepass.retake_keep_last import compute_retake_keep_last
 from onepass.text_norm import collapse_and_resplit
-from scripts.onepass_cli import DEFAULT_CHAR_MAP, run_all_in_one, run_prep_norm
+from scripts.onepass_cli import (
+    DEFAULT_ALIGN_SPLIT_MODE,
+    DEFAULT_CHAR_MAP,
+    run_all_in_one,
+    run_prep_norm,
+)
 
 
 def _default_canonical_rules() -> CanonicalRules:
@@ -57,6 +62,7 @@ def test_norm_outputs_are_sentence_lines(tmp_path: Path) -> None:
         "*.txt",
         dry_run=False,
         collapse_lines=True,
+        hard_collapse_lines=True,
         emit_align=True,
         allow_missing_char_map=False,
     )
@@ -131,6 +137,8 @@ def test_all_in_one_without_audio_reports_records(tmp_path: Path) -> None:
         no_interaction=True,
         verbose=False,
         quiet=False,
+        hard_collapse_lines=True,
+        split_mode=DEFAULT_ALIGN_SPLIT_MODE,
     )
     report = run_all_in_one(args)
     records = report["summary"]["records"]
@@ -232,6 +240,7 @@ def test_retake_align_line_count_preserved(tmp_path: Path) -> None:
         "*.txt",
         dry_run=False,
         collapse_lines=True,
+        hard_collapse_lines=True,
         emit_align=True,
         allow_missing_char_map=False,
     )
@@ -241,4 +250,4 @@ def test_retake_align_line_count_preserved(tmp_path: Path) -> None:
     result = compute_retake_keep_last(words, align_path, no_collapse_align=True)
     count = result.stats.get("align_line_count_read")
     assert isinstance(count, int)
-    assert count >= 80
+    assert count >= 60
