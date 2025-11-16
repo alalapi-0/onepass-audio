@@ -15,14 +15,17 @@ from . import _legacy_normalize as _legacy_normalize
 
 DEFAULT_HARD_PUNCT = "。！？!?．.;；……—"
 DEFAULT_SOFT_PUNCT = "，、,:：；;"
-ZWS_RE = re.compile(r"[\u200B-\u200D\uFEFF]")
-FULLWIDTH_SPACE = "\u3000"
-WHITES_RE = re.compile(r"[ \t\r\n\u3000]+")
+ALL_PUNCT: tuple[str, ...] = tuple(
+    sorted({ch for ch in DEFAULT_HARD_PUNCT + DEFAULT_SOFT_PUNCT if ch and not ch.isspace()})
+)
+_ALL_PUNCT_RE = re.compile("([{}])".format(re.escape("".join(ALL_PUNCT))))
+_WS_RE = re.compile(r"[ \t\r\f\v\u00A0\u2000-\u200D\u3000\uFEFF]+")
 
 __all__ = [
     "TextNormConfig",
     "DEFAULT_HARD_PUNCT",
     "DEFAULT_SOFT_PUNCT",
+    "ALL_PUNCT",
     "load_normalize_char_map",
     "load_match_alias_map",
     "normalize_text_for_export",
@@ -41,13 +44,16 @@ class TextNormConfig:
     ascii_paren_mapping: bool = False
     squash_mixed_english: bool = False
     collapse_lines: bool = True
-    hard_collapse_lines: bool = False
+    hard_collapse_lines: bool = True
     max_len: int = 24
     min_len: int = 8
     hard_max: int = 32
     hard_puncts: str = DEFAULT_HARD_PUNCT
     soft_puncts: str = DEFAULT_SOFT_PUNCT
     attach_side: str = "left"
+    quote_protect: bool = True
+    paren_protect: bool = True
+    split_mode: str = "punct+len"
 
 
 def load_normalize_char_map(path: str | None) -> Dict[str, object]:
@@ -194,10 +200,11 @@ def hard_collapse_whitespace(text: str) -> str:
 
     if not text:
         return text
-    normalized = ZWS_RE.sub("", text)
-    normalized = normalized.replace(FULLWIDTH_SPACE, " ")
-    normalized = WHITES_RE.sub(" ", normalized)
-    return normalized.strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u3000", " ").replace("\t", " ")
+    text = re.sub(r"\n+", "\n", text)
+    text = _WS_RE.sub(" ", text)
+    return text.strip()
 
 
 def normalize_text_for_export(
@@ -256,6 +263,30 @@ _HARD_CLOSERS = "）〕］】》〉」』”’)\"'] }"
 _HARD_PAIRS = {op: cl for op, cl in zip(_HARD_OPENERS, _HARD_CLOSERS)}
 _HARD_REVERSE = {cl: op for op, cl in _HARD_PAIRS.items()}
 _CLOSER_SET = {ch for ch in _HARD_CLOSERS if not ch.isspace()}
+_QUOTE_PAIRS = {
+    "“": "”",
+    "‘": "’",
+    "「": "」",
+    "『": "』",
+    "‹": "›",
+    "«": "»",
+}
+_SYMMETRIC_QUOTES = {'"', "'"}
+_QUOTE_OPENERS = set(_QUOTE_PAIRS.keys()) | _SYMMETRIC_QUOTES
+_QUOTE_CLOSERS = set(_QUOTE_PAIRS.values()) | _SYMMETRIC_QUOTES
+_PAREN_PAIRS = {
+    "（": "）",
+    "〔": "〕",
+    "［": "］",
+    "【": "】",
+    "《": "》",
+    "〈": "〉",
+    "(": ")",
+    "[": "]",
+    "{": "}",
+}
+_PAREN_OPENERS = set(_PAREN_PAIRS.keys())
+_PAREN_CLOSERS = set(_PAREN_PAIRS.values())
 
 
 def _log_split_event(
@@ -434,7 +465,7 @@ def _merge_short_neighbors(
         if not stripped:
             continue
         if merged and len(stripped) < cfg.min_len and len(merged[-1]) < cfg.min_len:
-            if _ends_with_hard_punct(merged[-1], puncts):
+            if _ends_with_hard_punct(merged[-1], puncts) or _ends_with_hard_punct(stripped, puncts):
                 merged.append(stripped)
             else:
                 merged[-1] = (merged[-1] + stripped).strip()
@@ -499,6 +530,82 @@ def _enforce_hard_punct_split(
     return output
 
 
+def _enforce_all_punct_split(
+    lines: list[str], *, protect_quotes: bool, protect_parens: bool
+) -> list[str]:
+    output: list[str] = []
+
+    def _consume_chunk(
+        chunk: str,
+        quote_stack: list[str],
+        paren_stack: list[str],
+    ) -> None:
+        if not chunk:
+            return
+        for ch in chunk:
+            if protect_quotes and ch in _QUOTE_OPENERS:
+                closer = _QUOTE_PAIRS.get(ch, ch)
+                if closer == ch:
+                    if quote_stack and quote_stack[-1] == ch:
+                        quote_stack.pop()
+                    else:
+                        quote_stack.append(ch)
+                else:
+                    quote_stack.append(closer)
+                continue
+            if protect_quotes and ch in _QUOTE_CLOSERS:
+                if quote_stack and quote_stack[-1] == ch:
+                    quote_stack.pop()
+            if protect_parens and ch in _PAREN_OPENERS:
+                paren_stack.append(_PAREN_PAIRS.get(ch, ch))
+            elif protect_parens and ch in _PAREN_CLOSERS:
+                if paren_stack and paren_stack[-1] == ch:
+                    paren_stack.pop()
+
+    for line in lines:
+        if not line:
+            continue
+        parts = _ALL_PUNCT_RE.split(line)
+        buf: list[str] = []
+        quote_stack: list[str] = []
+        paren_stack: list[str] = []
+        pending_flush = False
+
+        def _flush() -> None:
+            if not buf:
+                return
+            segment = "".join(buf).strip()
+            if segment:
+                output.append(segment)
+            buf.clear()
+
+        for part in parts:
+            if not part:
+                continue
+            if len(part) == 1 and part in ALL_PUNCT:
+                buf.append(part)
+                _consume_chunk(part, quote_stack, paren_stack)
+                allow_split = True
+                if protect_quotes and quote_stack:
+                    allow_split = False
+                if protect_parens and paren_stack:
+                    allow_split = False
+                if allow_split:
+                    _flush()
+                    pending_flush = False
+                else:
+                    pending_flush = True
+                continue
+            for ch in part:
+                buf.append(ch)
+                _consume_chunk(ch, quote_stack, paren_stack)
+                if pending_flush and not quote_stack and not paren_stack:
+                    _flush()
+                    pending_flush = False
+        _flush()
+    return output
+
+
 def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     """Split text into sentences following hard/soft punctuation rules."""
 
@@ -534,6 +641,13 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
             blocked_cross_hard_merges,
         )
     cleaned = [sent for sent in sentences if sent]
+    mode = (getattr(cfg, "split_mode", "punct+len") or "punct+len").strip().lower()
+    if mode == "all-punct":
+        return _enforce_all_punct_split(
+            cleaned,
+            protect_quotes=bool(getattr(cfg, "quote_protect", True)),
+            protect_parens=bool(getattr(cfg, "paren_protect", True)),
+        )
     return _enforce_hard_punct_split(cleaned, hard_puncts)
 
 
