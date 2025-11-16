@@ -18,12 +18,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from onepass.align import align_sentences
+from legacy.align import align_sentences
 from onepass.asr_loader import Word, load_words
 from onepass.edl import EDL, build_keep_last_edl
 from onepass.markers import write_audition_markers
 from onepass.pipeline import PreparedSentences, prepare_sentences
-from onepass.textnorm import Sentence
+from onepass._legacy_textnorm import Sentence
 
 
 def _warn_mismatch(words: List[Word], sentences: List[Sentence]) -> None:

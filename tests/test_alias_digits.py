@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from onepass.text_norm import apply_alias_map, load_alias_map
+from onepass._legacy_text_norm import apply_alias_map, load_alias_map
 
 
 DEF_ALIAS = Path("config/default_alias_map.json")

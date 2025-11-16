@@ -12,7 +12,7 @@ from pathlib import Path  # 使用 Path 进行跨平台路径操作
 from typing import Dict, Iterable, List, Optional, Tuple  # 导入常用类型注解
 
 from onepass import __version__  # 引入包版本信息用于展示
-from onepass.align import align_sentences  # 引入句子对齐核心函数
+from legacy.align import align_sentences  # 引入句子对齐核心函数
 from onepass.asr_loader import Word, load_words  # 引入词级别数据结构与加载函数
 from onepass.edl import EDL, build_keep_last_edl  # 引入 EDL 数据结构与构建函数
 from onepass.edl_renderer import (  # 引入音频渲染相关工具
@@ -24,7 +24,7 @@ from onepass.edl_renderer import (  # 引入音频渲染相关工具
 )
 from onepass.markers import write_audition_markers  # 引入写入 Audition 标记的工具
 from onepass.pipeline import PreparedSentences, prepare_sentences  # 引入句子预处理逻辑
-from onepass.textnorm import Sentence  # 引入规范化后的句子结构
+from onepass._legacy_textnorm import Sentence  # 引入规范化后的句子结构
 from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需函数
     compute_retake_keep_last,
     export_audition_markers,
@@ -33,7 +33,7 @@ from onepass.retake_keep_last import (  # 引入“保留最后一遍”所需�
     export_txt,
 )
 from onepass.canonicalize import load_alias_map as load_match_alias_map
-from onepass.text_norm import load_alias_map
+from onepass._legacy_text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir  # 引入统一日志目录工具
 from onepass.ux import (  # 引入命令行交互的工具函数
     print_error,  # 打印错误信息的工具

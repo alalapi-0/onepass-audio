@@ -15,7 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from onepass.textnorm import (
+from onepass._legacy_textnorm import (
     TextNormConfig,
     find_nonstandard_chars,
     normalize_text,

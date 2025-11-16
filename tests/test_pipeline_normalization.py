@@ -17,7 +17,7 @@ import re
 from onepass.alignment.canonical import CanonicalRules, concat_and_index
 from onepass.asr_loader import Word, load_words
 from onepass.retake_keep_last import compute_retake_keep_last
-from onepass.text_norm import collapse_and_resplit
+from onepass._legacy_text_norm import collapse_and_resplit
 from scripts.onepass_cli import (
     DEFAULT_ALIGN_SPLIT_MODE,
     DEFAULT_CHAR_MAP,

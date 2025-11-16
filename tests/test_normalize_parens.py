@@ -1,4 +1,4 @@
-from onepass.text_norm import normalize_chinese_text
+from onepass._legacy_text_norm import normalize_chinese_text
 
 
 def test_drop_ascii_parens_and_squash_trailing_english():

@@ -44,7 +44,7 @@ from onepass.edl_renderer import (  # 音频渲染依赖
     render_audio,
     resolve_source_audio,
 )
-from onepass.normalize import collapse_soft_linebreaks
+from onepass.text_normalizer import collapse_soft_linebreaks
 from onepass.zh_segmenter import Segment as ZhSegment
 from onepass.zh_segmenter import segment as segment_text
 from onepass.retake_keep_last import (  # 保留最后一遍导出函数
@@ -1277,7 +1277,7 @@ def run_prep_norm(
             prosody_config=prosody_config,
             quote_protect=quote_protect,
             paren_protect=paren_protect,
-            split_all_punct=bool(getattr(args, "split_all_punct", True)),
+            split_all_punct=split_all_punct,
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -3088,6 +3088,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
         prosody_config=prosody_config,
         quote_protect=bool(getattr(args, "quote_protect", True)),
         paren_protect=bool(getattr(args, "paren_protect", True)),
+        split_all_punct=bool(getattr(args, "split_all_punct", True)),
     )
     report["prep_norm"] = norm_result
     stage_summary["prep_norm"] = norm_result.get("summary", {})

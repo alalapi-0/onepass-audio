@@ -28,7 +28,7 @@ from onepass.retake_keep_last import (
     export_txt,
 )
 from onepass.canonicalize import load_alias_map as load_match_alias_map
-from onepass.text_norm import load_alias_map
+from onepass._legacy_text_norm import load_alias_map
 from onepass.logging_utils import default_log_dir, setup_logger
 
 

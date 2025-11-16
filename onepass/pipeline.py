@@ -4,7 +4,7 @@ from __future__ import annotations  # 启用未来的注解特性，兼容 Pytho
 from dataclasses import dataclass  # 引入 dataclass 装饰器，用于定义数据容器类
 from typing import List  # 导入泛型 List 类型，用于类型注解
 
-from .textnorm import (
+from ._legacy_textnorm import (
     Sentence,
     normalize_for_align,
     split_sentences,
