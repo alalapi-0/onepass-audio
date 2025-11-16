@@ -602,6 +602,7 @@ def _rule_split_text(
         quote_protect=quote_protect,
         paren_protect=paren_protect,
         split_mode=(split_mode or "punct+len").strip().lower(),
+        split_all_punct=True,  # Default to True for backward compatibility
     )
     return split_sentences_with_rules(text, cfg)
 
@@ -637,6 +638,7 @@ def _process_single_text(
     prosody_config: ProsodyConfig | None,
     quote_protect: bool,
     paren_protect: bool,
+    split_all_punct: bool = True,
 ) -> dict:
     """对单个文本执行规范化处理并返回报表行。"""
 
@@ -712,6 +714,7 @@ def _process_single_text(
         quote_protect=quote_protect,
         paren_protect=paren_protect,
         split_mode=split_mode,
+        split_all_punct=split_all_punct,
     )
     try:
         normalized_text = normalize_text_for_export(
@@ -1182,6 +1185,7 @@ def run_prep_norm(
     prosody_config: ProsodyConfig | None = None,
     quote_protect: bool = True,
     paren_protect: bool = True,
+    split_all_punct: bool = True,
 ) -> dict:
     """执行规范化批处理并返回统计结果。"""
 
@@ -1273,6 +1277,7 @@ def run_prep_norm(
             prosody_config=prosody_config,
             quote_protect=quote_protect,
             paren_protect=paren_protect,
+            split_all_punct=bool(getattr(args, "split_all_punct", True)),
         )  # 处理单个文件
         rows.append(row)
         if row.get("status") != "ok":  # 判断成功与否
@@ -1371,6 +1376,7 @@ def handle_prep_norm(args: argparse.Namespace) -> int:
             prosody_config=prosody_config,
             quote_protect=args.quote_protect,
             paren_protect=args.paren_protect,
+            split_all_punct=bool(getattr(args, "split_all_punct", True)),
         )
     except Exception as exc:
         LOGGER.exception("处理 prep-norm 失败")
@@ -2258,7 +2264,7 @@ def run_retake_keep_last(args: argparse.Namespace, *, report_path: Path, write_r
         fallback_policy,
     )
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
-    no_collapse_align = bool(getattr(args, "no_collapse_align", True))
+    no_collapse_align = bool(getattr(args, "no_collapse_align", False))
     if args.audio_root:
         audio_root_path = Path(args.audio_root).expanduser().resolve()
     elif args.words_json:
@@ -2943,7 +2949,7 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     report_path = out_dir / "batch_report.json"
-    no_collapse_align = bool(getattr(args, "no_collapse_align", True))
+    no_collapse_align = bool(getattr(args, "no_collapse_align", False))
     include_canonical = bool(getattr(args, "include_canonical_kits", False))
     drop_ascii_parens = bool(getattr(args, "drop_ascii_parens", True))
     preserve_fullwidth_parens = bool(getattr(args, "preserve_fullwidth_parens", True))
@@ -3593,6 +3599,7 @@ def handle_all_in_one(args: argparse.Namespace) -> int:
         "split_mode": args.split_mode,
         "weak_punct_enable": args.weak_punct_enable,
         "prosody_split": args.prosody_split,
+        "split_all_punct": bool(getattr(args, "split_all_punct", True)),
         "split_attach": args.split_attach,
         "render": canonical_render,
         "audio_root": str(args.audio_root) if args.audio_root else str(Path(args.input_dir)),
@@ -3731,8 +3738,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--weak-punct-enable",
         dest="weak_punct_enable",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="弱标点可作为断句点（默认关闭）",
+        default=True,
+        help="弱标点可作为断句点（默认开启）",
     )
     prep.add_argument(
         "--keep-quotes",
@@ -3801,11 +3808,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="硬标点归属（仅支持 right，旧配置将被强制改为 right）",
     )
     prep.add_argument(
+        "--split-all-punct",
+        dest="split_all_punct",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="所有标点都分句（默认开启，包括逗号、顿号、分号、冒号等）",
+    )
+    prep.add_argument(
         "--prosody-split",
         dest="prosody_split",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="punct+len 模式下启用语气/呼吸位切句（默认关闭）",
+        default=True,
+        help="punct+len 模式下启用语气/呼吸位切句（默认开启）",
     )
     prep.add_argument("--pause-gap-ms", type=float, default=160.0, help="预测停顿阈值 (毫秒)")
     prep.add_argument("--micro-silence-db", type=int, default=-35, help="微停顿噪声门限 (dBFS)")
@@ -3939,8 +3953,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-collapse-align",
         dest="no_collapse_align",
         action="store_true",
-        default=True,
-        help="读取 *.align.txt 时保留原始换行与空白（默认开启）",
+        default=False,
+        help="读取 *.align.txt 时保留原始换行与空白（默认关闭，对齐更宽松）",
     )
     align_group.add_argument(
         "--collapse-align",
@@ -4323,8 +4337,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-collapse-align",
         dest="no_collapse_align",
         action="store_true",
-        default=True,
-        help="读取 *.align.txt 时保留原样，不再额外折叠（默认开启）",
+        default=False,
+        help="读取 *.align.txt 时保留原样，不再额外折叠（默认关闭，对齐更宽松）",
     )
     pipeline_align_group.add_argument(
         "--collapse-align",

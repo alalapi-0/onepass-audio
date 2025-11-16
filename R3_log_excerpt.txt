@@ -1,8 +1,0 @@
-2024-03-10 12:34:12 INFO  onepass.cli 解析后的词级匹配模式: ['*.words.json;*.json']
-2024-03-10 12:34:12 INFO  onepass.cli 解析后的音频匹配模式: ['*.wav;*.m4a;*.mp3']
-2024-03-10 12:34:13 INFO  onepass.cli [hit][audio] stem=001序言 path=E:\onepass-audio\materials\001序言01.m4a
-2024-03-10 12:34:13 INFO  onepass.cli 参数快照: {"emit_align": true, "glob_audio": "*.wav;*.m4a;*.mp3", "audio_root": "E:/onepass-audio/materials", "prefer_relative_audio": true, "path_style": "auto", "render": "auto"}
-2024-03-10 12:34:45 INFO  onepass.cli [render] resolve audio: stem=001序言 source_audio=001序言01.m4a audio_root=E:\onepass-audio\materials
-2024-03-10 12:34:45 INFO  onepass.edl_renderer [resolve] audio_root hit: E:\onepass-audio\materials\001序言01.m4a
-2024-03-10 12:34:46 WARNING onepass.cli 未定位到源音频，跳过渲染: stem=002尾声 source_audio=missing-track.m4a audio_root=E:\onepass-audio\materials
-2024-03-10 12:34:46 WARNING onepass.edl_renderer 未能解析源音频，已尝试路径: ['audio_root: E:\\onepass-audio\\materials\\missing-track.m4a', 'edl_dir: E:\\onepass-audio\\out\\missing-track.m4a', 'basename: E:\\onepass-audio\\materials\\missing-track.wav']

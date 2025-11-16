@@ -1922,37 +1922,45 @@ def compute_retake_keep_last(
         snapshot_stats = stats or {}
         ratio_snapshot = float(snapshot_stats.get("cut_ratio", 0.0) or 0.0)
         guard_triggered = False
+        # Define prev_* before guard check to avoid NameError
         prev_min_sent = current_min_sent
         prev_dup_gap = current_dup_gap
+        prev_pause_gap = pause_gap_sec
         if (
             ratio_snapshot > guard_threshold
             and raw_keeps
             and degrade_reason != "cut_ratio_guard"
         ):
-            new_min_sent = max(int(math.ceil(current_min_sent * 1.2)), current_min_sent + 2)
-            new_dup_gap = (
-                max(0.5, current_dup_gap * 0.75) if current_dup_gap > 0 else current_dup_gap
-            )
+            # Relax strategy: make parameters more lenient
+            new_min_sent = max(1, current_min_sent - 4)
+            new_dup_gap = min(45.0, current_dup_gap * 1.5)
+            new_pause_gap = 0.45 if pause_gap_sec > 0.45 else pause_gap_sec
             if (
                 new_min_sent != current_min_sent
                 or not math.isclose(new_dup_gap, current_dup_gap, rel_tol=1e-2)
+                or not math.isclose(new_pause_gap, pause_gap_sec, rel_tol=1e-2)
             ):
                 guard_triggered = True
                 LOGGER.warning(
-                    "降级: stem=%s reason=cut_ratio_guard -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f",
+                    "放宽参数: stem=%s reason=cut_ratio_guard -> 参数调整: min_sent=%s->%s, max_dup_gap=%.2f->%.2f, pause_gap=%.2f->%.2f",
                     debug_label or "-",
-                    current_min_sent,
+                    prev_min_sent,
                     new_min_sent,
-                    current_dup_gap,
+                    prev_dup_gap,
                     new_dup_gap,
+                    prev_pause_gap,
+                    new_pause_gap,
                 )
                 previous_params = {
-                    "min_sent": current_min_sent,
-                    "max_dup_gap": current_dup_gap,
+                    "min_sent": prev_min_sent,
+                    "max_dup_gap": prev_dup_gap,
+                    "pause_gap": prev_pause_gap,
                 }
                 degrade_reason = "cut_ratio_guard"
                 current_min_sent = new_min_sent
                 current_dup_gap = new_dup_gap
+                # Use new_pause_gap for subsequent pause boundary inference
+                pause_gap_sec = new_pause_gap
                 degrade_history.append(
                     {
                         "reason": "cut_ratio_guard",
@@ -1960,6 +1968,7 @@ def compute_retake_keep_last(
                         "adjusted": {
                             "min_sent": current_min_sent,
                             "max_dup_gap": current_dup_gap,
+                            "pause_gap": pause_gap_sec,
                         },
                     }
                 )
@@ -1975,7 +1984,7 @@ def compute_retake_keep_last(
             )
             guard_log_pending = False
         log_debug(
-            "[cut-ratio] threshold=%.2f ratio=%.3f triggered=%s min_sent=%s->%s max_dup_gap=%.2f->%.2f",
+            "[cut-ratio] threshold=%.2f ratio=%.3f triggered=%s min_sent=%s->%s max_dup_gap=%.2f->%.2f pause_gap=%.2f->%.2f",
             guard_threshold,
             ratio_snapshot,
             "Y" if guard_triggered else "N",
@@ -1983,6 +1992,8 @@ def compute_retake_keep_last(
             current_min_sent,
             prev_dup_gap,
             current_dup_gap,
+            prev_pause_gap,
+            pause_gap_sec,
         )
         if snapshot_stats.get("matched_lines", 0) == 0 and stage_index + 1 < len(stage_plan):
             degrade_reason = degrade_reason or "no-match"

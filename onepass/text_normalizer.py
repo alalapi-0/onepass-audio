@@ -50,10 +50,11 @@ class TextNormConfig:
     hard_max: int = 32
     hard_puncts: str = DEFAULT_HARD_PUNCT
     soft_puncts: str = DEFAULT_SOFT_PUNCT
-    attach_side: str = "left"
+    attach_side: str = "right"
     quote_protect: bool = True
     paren_protect: bool = True
     split_mode: str = "punct+len"
+    split_all_punct: bool = True
 
 
 def load_normalize_char_map(path: str | None) -> Dict[str, object]:
@@ -95,7 +96,8 @@ _RE_SPACE_RUN = re.compile(r" {2,}")
 _RE_LINE_BREAK = re.compile(r"\s*\n\s*")
 _RE_DASH_VARIANTS = re.compile(r"[‒–—―﹘﹣]+")
 _RE_ELLIPSIS = re.compile(r"\.{4,}")
-HARD_PUNCT = set(DEFAULT_HARD_PUNCT)
+HARD_PUNCT = set("。.!！?？…")
+SOFT_PUNCT = set("，,、;；:：（）()［］[]｛｝{}—-·…")
 
 
 def _preview_line_for_debug(text: str, limit: int = 80) -> str:
@@ -196,13 +198,19 @@ def _final_punct_normalize(text: str) -> str:
 
 
 def hard_collapse_whitespace(text: str) -> str:
-    """Forcibly collapse all whitespace into single spaces and trim."""
+    """Forcibly collapse all whitespace into single spaces and trim.
+    
+    Collapses \\r\\n, \\n, \\r, \\t, fullwidth space \\u3000, and multiple
+    whitespace into a single space. Preserves natural spacing between CJK segments,
+    avoiding double spaces.
+    """
 
     if not text:
         return text
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Replace all line breaks and tabs with space
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     text = text.replace("\u3000", " ").replace("\t", " ")
-    text = re.sub(r"\n+", "\n", text)
+    # Collapse all whitespace sequences to single space
     text = _WS_RE.sub(" ", text)
     return text.strip()
 
@@ -314,9 +322,13 @@ def _log_split_event(
 
 
 def _split_hard_layers(text: str, cfg: TextNormConfig, state: dict | None = None) -> List[str]:
-    """Split *text* by hard punctuation while keeping closers on the left."""
+    """Split *text* by hard punctuation while keeping closers on the left.
+    
+    Always uses HARD_PUNCT set to ensure period-always rule.
+    """
 
-    hard_set = {ch for ch in cfg.hard_puncts if ch and not ch.isspace()}
+    # Always use HARD_PUNCT to ensure period-always rule
+    hard_set = HARD_PUNCT | {ch for ch in cfg.hard_puncts if ch and not ch.isspace()}
     stack: List[str] = []
     layers: List[str] = []
     current: List[str] = []
@@ -455,16 +467,46 @@ def _ends_with_hard_punct(text: str, hard_puncts: set[str]) -> bool:
     return bool(stripped) and stripped[-1] in hard_puncts
 
 
+def _split_by_soft_punct(text: str, soft_puncts: set[str], attach_side: str = "right") -> List[str]:
+    """Split text by soft punctuation, attaching punct to the right side (current sentence)."""
+    if not text:
+        return []
+    sentences: List[str] = []
+    current: List[str] = []
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch in soft_puncts:
+            # Attach punct to current sentence (right side)
+            current.append(ch)
+            chunk = "".join(current).strip()
+            if chunk:
+                sentences.append(chunk)
+            current = []
+        else:
+            current.append(ch)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        sentences.append(tail)
+    return sentences if sentences else [text.strip()] if text.strip() else []
+
+
 def _merge_short_neighbors(
     sentences: List[str], cfg: TextNormConfig, hard_puncts: set[str] | None = None
 ) -> List[str]:
+    """Merge short neighboring sentences, but never across hard punctuation."""
     merged: List[str] = []
-    puncts = set(hard_puncts) if hard_puncts else _hard_punct_set(cfg)
+    # Use HARD_PUNCT set to ensure period-always rule
+    puncts = set(hard_puncts) if hard_puncts else HARD_PUNCT
     for sentence in sentences:
         stripped = sentence.strip()
         if not stripped:
             continue
+        # If both are short, check if we can merge
         if merged and len(stripped) < cfg.min_len and len(merged[-1]) < cfg.min_len:
+            # Never merge if either ends with hard punctuation
             if _ends_with_hard_punct(merged[-1], puncts) or _ends_with_hard_punct(stripped, puncts):
                 merged.append(stripped)
             else:
@@ -607,7 +649,12 @@ def _enforce_all_punct_split(
 
 
 def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
-    """Split text into sentences following hard/soft punctuation rules."""
+    """Split text into sentences following hard/soft punctuation rules.
+    
+    When split_all_punct=True (default), splits by both hard and soft punctuation.
+    Hard punctuation (。.!！?？…) always splits. Soft punctuation (，,、;；:：等)
+    splits only when split_all_punct=True.
+    """
 
     if not text:
         return []
@@ -625,12 +672,33 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     state: dict | None = None
     if is_debug_logging_enabled():
         state = make_log_limit(400)
-    hard_puncts = _hard_punct_set(cfg)
+    # Use HARD_PUNCT to ensure period-always rule
+    hard_puncts = HARD_PUNCT
     hard_layers = _split_hard_layers(normalized, cfg, state)
     sentences: List[str] = []
     blocked_cross_hard_merges = 0
+    split_all_punct = bool(getattr(cfg, "split_all_punct", True))
+    
     for layer in hard_layers:
-        soft_sentences = _split_soft_layer(layer, cfg, state)
+        # First split by soft punctuation if enabled
+        if split_all_punct:
+            # Get soft punct set from config, fallback to SOFT_PUNCT
+            soft_punct_set = set(cfg.soft_puncts) if cfg.soft_puncts else SOFT_PUNCT
+            # Split by soft punct first
+            soft_split = _split_by_soft_punct(layer, soft_punct_set, cfg.attach_side)
+            # Then apply length-based splitting if needed
+            soft_sentences: List[str] = []
+            for segment in soft_split:
+                if len(segment) <= cfg.max_len:
+                    soft_sentences.append(segment)
+                else:
+                    # Apply length-based splitting
+                    soft_sentences.extend(_split_soft_layer(segment, cfg, state))
+        else:
+            # Only length-based splitting, no soft punct splitting
+            soft_sentences = _split_soft_layer(layer, cfg, state)
+        
+        # Merge short neighbors (but never across hard punct)
         soft_sentences = _merge_short_neighbors(soft_sentences, cfg, hard_puncts)
         blocked_cross_hard_merges += _would_cross_block_merge(soft_sentences, sentences, cfg)
         guarded = _merge_quote_guards(soft_sentences)
@@ -648,6 +716,7 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
             protect_quotes=bool(getattr(cfg, "quote_protect", True)),
             protect_parens=bool(getattr(cfg, "paren_protect", True)),
         )
+    # Final enforcement: ensure all sentences end with hard punct if they should
     return _enforce_hard_punct_split(cleaned, hard_puncts)
 
 
