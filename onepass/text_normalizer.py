@@ -1,17 +1,27 @@
 """Unified text normalization and sentence splitting helpers."""
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 import re
 from pathlib import Path
 from typing import Dict, List, Mapping
 
-from .debug_utils import is_debug_logging_enabled, log_debug, make_log_limit
-
-from .canonicalize import load_alias_map as _canonical_load_alias_map
-from . import _legacy_text_norm as _legacy_norm
-from . import _legacy_textnorm as _legacy_textnorm
-from . import _legacy_normalize as _legacy_normalize
+# Import package modules with error handling for direct execution
+try:
+    from .debug_utils import is_debug_logging_enabled, log_debug, make_log_limit
+    from .canonicalize import load_alias_map as _canonical_load_alias_map
+    from . import _legacy_text_norm as _legacy_norm
+    from . import _legacy_textnorm as _legacy_textnorm
+    from . import _legacy_normalize as _legacy_normalize
+except ImportError as e:
+    if __name__ == "__main__":
+        print("ERROR: This module cannot be run directly.", file=sys.stderr)
+        print("Please use it as a package: python -m onepass.text_normalizer", file=sys.stderr)
+        print("Or import it: from onepass.text_normalizer import ...", file=sys.stderr)
+        print(f"Import error: {e}", file=sys.stderr)
+        sys.exit(1)
+    raise
 
 DEFAULT_HARD_PUNCT = "。！？!?．.;；……—"
 DEFAULT_SOFT_PUNCT = "，、,:：；;"
@@ -197,12 +207,16 @@ def _final_punct_normalize(text: str) -> str:
     return compacted
 
 
-def hard_collapse_whitespace(text: str) -> str:
+def hard_collapse_whitespace(text: str, mode: str = "space") -> str:
     """Forcibly collapse all whitespace into single spaces and trim.
     
     Collapses \\r\\n, \\n, \\r, \\t, fullwidth space \\u3000, and multiple
-    whitespace into a single space. Preserves natural spacing between CJK segments,
-    avoiding double spaces.
+    whitespace into a single space (mode="space") or removes them (mode="remove").
+    Preserves natural spacing between CJK segments when mode="space".
+    
+    Args:
+        text: Input text
+        mode: "space" (default) to collapse to single space, "remove" to delete all whitespace
     """
 
     if not text:
@@ -210,8 +224,11 @@ def hard_collapse_whitespace(text: str) -> str:
     # Replace all line breaks and tabs with space
     text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     text = text.replace("\u3000", " ").replace("\t", " ")
-    # Collapse all whitespace sequences to single space
-    text = _WS_RE.sub(" ", text)
+    # Collapse all whitespace sequences
+    if mode == "remove":
+        text = _WS_RE.sub("", text)
+    else:
+        text = _WS_RE.sub(" ", text)
     return text.strip()
 
 
@@ -496,18 +513,32 @@ def _split_by_soft_punct(text: str, soft_puncts: set[str], attach_side: str = "r
 def _merge_short_neighbors(
     sentences: List[str], cfg: TextNormConfig, hard_puncts: set[str] | None = None
 ) -> List[str]:
-    """Merge short neighboring sentences, but never across hard punctuation."""
+    """Merge short neighboring sentences, but never across any split punctuation.
+    
+    RULE: Never merge across HARD_PUNCT or SOFT_PUNCT boundaries.
+    This ensures "句号必分句" and "所有标点分句" rules are not violated.
+    """
     merged: List[str] = []
     # Use HARD_PUNCT set to ensure period-always rule
-    puncts = set(hard_puncts) if hard_puncts else HARD_PUNCT
+    hard_punct_set = set(hard_puncts) if hard_puncts else HARD_PUNCT
+    # Get all split punctuation (hard + soft) to prevent merging across any
+    soft_punct_set = set(cfg.soft_puncts) if cfg.soft_puncts else SOFT_PUNCT
+    all_split_punct = hard_punct_set | soft_punct_set
+    
+    def _ends_with_any_split_punct(text: str, punct_set: set[str]) -> bool:
+        """Check if text ends with any split punctuation."""
+        stripped = text.rstrip()
+        return bool(stripped) and stripped[-1] in punct_set
+    
     for sentence in sentences:
         stripped = sentence.strip()
         if not stripped:
             continue
         # If both are short, check if we can merge
         if merged and len(stripped) < cfg.min_len and len(merged[-1]) < cfg.min_len:
-            # Never merge if either ends with hard punctuation
-            if _ends_with_hard_punct(merged[-1], puncts) or _ends_with_hard_punct(stripped, puncts):
+            # Never merge if either ends with ANY split punctuation (hard or soft)
+            if (_ends_with_any_split_punct(merged[-1], all_split_punct) or 
+                _ends_with_any_split_punct(stripped, all_split_punct)):
                 merged.append(stripped)
             else:
                 merged[-1] = (merged[-1] + stripped).strip()
@@ -711,13 +742,19 @@ def split_sentences_with_rules(text: str, cfg: TextNormConfig) -> List[str]:
     cleaned = [sent for sent in sentences if sent]
     mode = (getattr(cfg, "split_mode", "punct+len") or "punct+len").strip().lower()
     if mode == "all-punct":
-        return _enforce_all_punct_split(
+        result = _enforce_all_punct_split(
             cleaned,
             protect_quotes=bool(getattr(cfg, "quote_protect", True)),
             protect_parens=bool(getattr(cfg, "paren_protect", True)),
         )
-    # Final enforcement: ensure all sentences end with hard punct if they should
-    return _enforce_hard_punct_split(cleaned, hard_puncts)
+    else:
+        result = cleaned
+    
+    # CRITICAL: Final enforcement - ensure "句号必分句" rule is never violated
+    # Re-split any sentence that contains multiple hard punctuation marks
+    result = _enforce_hard_punct_split(result, hard_puncts)
+    
+    return result
 
 
 def collapse_soft_linebreaks(text: str) -> str:

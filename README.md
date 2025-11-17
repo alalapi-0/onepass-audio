@@ -869,6 +869,61 @@ python scripts/onepass_cli.py all-in-one --in materials --out out \
 - 预期：两次命令均应 `success 2/2`，每篇 `unaligned ≤ 2`。
 - 批次剪切的 `cut_seconds` 波动应控制在 ±10% 内，以验证匹配放宽但稳定。
 
+## 分句与规范化检查工作流
+
+为确保"句号必分句，其余标点也分句"规则正确执行，提供了体检与报告生成工具。
+
+### 仅分句/规范化回归（不渲染，提升速度）
+
+```bash
+# Windows 示例
+python scripts\onepass_cli.py all-in-one --in materials --out out ^
+  --emit-align --render never ^
+  --char-map config\default_char_map.json ^
+  --collapse-lines --hard-collapse-lines ^
+  --split-mode punct --no-weak-punct-enable --no-prosody-split ^
+  --split-attach right --no-interaction
+```
+
+此命令会执行规范化与分句，但不进行音频渲染，适合快速验证分句规则。
+
+### 体检
+
+```bash
+# Windows 示例
+python scripts\dev_tools\healthcheck.py --in materials --out out\audit --glob-text *.txt --glob-words "*.words.json;*.json" --render never
+```
+
+体检脚本会检查：
+- **调用链核验**：从 `onepass_main.py` → `scripts/onepass_cli.py` → 预处理与分句函数 → retake 核心的真实调用路径
+- **参数快照比对**：收集 CLI 默认与实际运行时的"分句/规范化/匹配"关键参数
+- **死链/冲突开关提示**：若 CLI 提供了 `split_attach=left` 但实现强制 `right`，给出 WARNING
+
+输出文件：
+- `out/audit/report.json`、`out/audit/report.md`：完整体检报告
+- `out/audit/params.json`：参数快照
+- `out/audit/callgraph.json`：调用图
+
+### 报告
+
+```bash
+# Windows 示例
+python scripts\dev_tools\make_reports.py --in materials --out out\reports
+```
+
+报告生成脚本会输出：
+- **规范化报告** (`norm_report.json/md`)：对每个 `materials/*.txt`，与 `out/norm/*.norm.txt` 做差异摘要
+- **分句报告** (`split_report.json/md`)：统计句数、硬标点命中率（"句号必分句"达成率）、软标点命中率、是否存在"段内多句号"
+- **对齐/切句对比报告** (`align_report.json/md`)：若存在 `*.words.json`，给出对齐统计与未匹配样例
+
+### 验收标准
+
+对样例材料：
+- "句号必分句"达成率=100%（中文。与英文.皆如此）
+- "标点全分句"达成率≥99%（引号贴附不算错）
+- `split_report` 中"段内多句号"计数=0
+- 不再出现"长度合并把句号重新黏回去"的情况
+
 ## 小程序使用说明
 
 - 首页显示「关卡、目标、得分、总分、最佳分」
