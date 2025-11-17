@@ -32,7 +32,7 @@ from .match_core import MatchResult, TokenStream, build_token_stream, match_line
 from .retake_seq import enforce_monotonic
 from .repeat_detect import cluster_candidates, supports_pinyin
 from .dp_path import select_best_path
-from .text_norm import (
+from ._legacy_text_norm import (
     apply_alias_map,
     build_char_index_map,
     cjk_or_latin_seq,

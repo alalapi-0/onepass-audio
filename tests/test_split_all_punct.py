@@ -79,3 +79,4 @@ def test_hard_collapse_whitespace():
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
+

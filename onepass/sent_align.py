@@ -14,7 +14,7 @@ except Exception:  # 未安装或加载失败时自动回退到内置 LCS
     _HAS_RAPIDFUZZ = False
 
 from .asr_loader import Word
-from .text_norm import (
+from ._legacy_text_norm import (
     build_char_index_map,
     cjk_or_latin_seq,
     merge_hard_wraps,

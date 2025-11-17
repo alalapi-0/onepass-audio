@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 from typing import Literal
 
-from .align import AlignResult  # 引入对齐结果数据结构
+from legacy.align import AlignResult  # 引入对齐结果数据结构
 from .asr_loader import Word  # 引入词级时间戳数据结构
 
 

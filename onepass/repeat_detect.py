@@ -6,7 +6,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Sequence
 
-from .text_norm import apply_alias_map, normalize_for_align
+from ._legacy_text_norm import apply_alias_map, normalize_for_align
 
 try:  # pragma: no cover - optional dependency
     from pypinyin import Style, lazy_pinyin
