@@ -187,14 +187,19 @@ def _get_split_attach(args: argparse.Namespace, default: str = "right") -> str:
 
 
 def _resolve_split_attach(value: str | None, *, warn: bool = False) -> str:
+    """解析 split_attach 参数，统一为 right（中文标点统一右附着）。"""
     normalized = (value or "").strip().lower()
     if not normalized:
         return "right"
     if normalized == "left":
         if warn:
-            LOGGER.warning("split-attach=left 未实现，已强制为 right")
+            LOGGER.warning("split-attach=left 已废弃，中文标点统一右附着，已强制为 right")
         return "right"
-    return normalized
+    if normalized != "right":
+        if warn:
+            LOGGER.warning("split-attach=%s 不支持，已强制为 right（中文标点统一右附着）", normalized)
+        return "right"
+    return "right"
 
 
 def _guess_words_json(text_path: Path) -> Path | None:
@@ -1154,6 +1159,254 @@ def _write_dp_path_debug(path: Path, rows: Sequence[dict[str, object]]) -> None:
             )
 
 
+def _generate_health_report(
+    out_dir: Path,
+    input_dir: Path,
+    norm_out_dir: Path,
+    items: list[dict],
+    norm_result: dict,
+    retake_result: dict,
+    report: dict,
+    args: argparse.Namespace,
+) -> None:
+    """生成标准体检报告 report.md 和 report.json，包含所有细分报告。"""
+    import statistics
+    from onepass.text_normalizer import TextNormConfig, split_sentences_with_rules, HARD_PUNCT
+
+    # 收集所有 stem 的产物路径
+    stems = [item.get("stem", "") for item in items if item.get("stem")]
+    norm_reports = []
+    split_reports = []
+    align_reports = []
+    artifacts_list = []
+
+    for item in items:
+        stem = item.get("stem", "")
+        if not stem:
+            continue
+
+        # 规范化报告
+        orig_path = input_dir / f"{stem}.txt"
+        norm_path = norm_out_dir / f"{stem}.norm.txt"
+        align_path = norm_out_dir / f"{stem}.align.txt"
+
+        norm_report = {"stem": stem}
+        if orig_path.exists() and norm_path.exists():
+            try:
+                orig_text = orig_path.read_text(encoding="utf-8-sig")
+                norm_text = norm_path.read_text(encoding="utf-8-sig")
+                norm_report.update({
+                    "orig_len": len(orig_text),
+                    "norm_len": len(norm_text),
+                    "length_change": len(norm_text) - len(orig_text),
+                    "removed_newlines": orig_text.count("\n") - norm_text.count("\n"),
+                })
+                # 可疑混写样例（展示5条上下文）
+                suspects = scan_suspects(norm_text)
+                suspect_examples = []
+                for key, info in suspects.items():
+                    if info.get("count", 0) > 0:
+                        examples = info.get("examples", [])[:5]
+                        suspect_examples.extend([f"{key}:{ex}" for ex in examples])
+                norm_report["suspect_examples"] = suspect_examples[:5]
+            except Exception as exc:
+                norm_report["error"] = str(exc)
+        else:
+            norm_report["error"] = "文件不存在"
+        norm_reports.append(norm_report)
+
+        # 分句报告
+        split_report = {"stem": stem}
+        if norm_path.exists():
+            try:
+                norm_text = norm_path.read_text(encoding="utf-8-sig")
+                cfg = TextNormConfig(
+                    split_all_punct=bool(getattr(args, "split_all_punct", True)),
+                    split_mode=getattr(args, "split_mode", "punct+len"),
+                    min_len=int(getattr(args, "min_len", 8)),
+                    max_len=int(getattr(args, "max_len", 24)),
+                    hard_max=int(getattr(args, "hard_max", 32)),
+                )
+                sentences = split_sentences_with_rules(norm_text, cfg)
+                valid_sentences = [s.strip() for s in sentences if s.strip()]
+                sent_lens = [len(s) for s in valid_sentences]
+                
+                hard_punct_count = sum(1 for s in valid_sentences if s and s[-1] in HARD_PUNCT)
+                non_end_punct_count = sum(
+                    1 for s in valid_sentences 
+                    if s and any(ch in HARD_PUNCT for ch in s[:-1])
+                )
+
+                length_p95 = 0
+                if sent_lens:
+                    if len(sent_lens) > 1:
+                        try:
+                            quantiles = statistics.quantiles(sent_lens, n=20)
+                            length_p95 = int(quantiles[18]) if len(quantiles) > 18 else max(sent_lens)
+                        except Exception:
+                            length_p95 = max(sent_lens)
+                    else:
+                        length_p95 = sent_lens[0]
+
+                split_report.update({
+                    "total_sentences": len(valid_sentences),
+                    "length_min": min(sent_lens) if sent_lens else 0,
+                    "length_median": int(statistics.median(sent_lens)) if sent_lens else 0,
+                    "length_p95": length_p95,
+                    "length_max": max(sent_lens) if sent_lens else 0,
+                    "hard_punct_rate": round((hard_punct_count / len(valid_sentences) * 100) if valid_sentences else 0, 2),
+                    "non_end_punct_count": non_end_punct_count,
+                })
+            except Exception as exc:
+                split_report["error"] = str(exc)
+        else:
+            split_report["error"] = "规范化文件不存在"
+        split_reports.append(split_report)
+
+        # 对齐核验
+        align_report = {"stem": stem}
+        item_stats = item.get("stats", {})
+        align_report.update({
+            "matched_lines": item_stats.get("matched_lines", 0),
+            "strict_matches": item_stats.get("strict_matches", 0),
+            "fallback_matches": item_stats.get("fallback_matches", 0),
+            "unmatched": item_stats.get("unmatched_lines", 0),
+            "cut_ratio": item_stats.get("cut_ratio", 0.0),
+            "degrade_history": item_stats.get("degrade_history", []),
+        })
+        align_reports.append(align_report)
+
+        # 产物清单
+        outputs = item.get("outputs", {})
+        artifacts_list.append({
+            "stem": stem,
+            "edl_json": outputs.get("edl", ""),
+            "srt": outputs.get("srt", ""),
+            "txt": outputs.get("txt", ""),
+            "align_txt": safe_rel(out_dir, align_path) if align_path.exists() else "",
+            "markers": outputs.get("markers", ""),
+        })
+
+    # 参数快照
+    params_snapshot = {
+        "normalization": {
+            "collapse_lines": bool(getattr(args, "collapse_lines", False)),
+            "hard_collapse_lines": bool(getattr(args, "hard_collapse_lines", True)),
+            "drop_ascii_parens": bool(getattr(args, "drop_ascii_parens", True)),
+            "preserve_fullwidth_parens": bool(getattr(args, "preserve_fullwidth_parens", True)),
+        },
+        "splitting": {
+            "split_mode": getattr(args, "split_mode", "punct+len"),
+            "split_attach": _resolve_split_attach(getattr(args, "split_attach", "right")),
+            "min_len": int(getattr(args, "min_len", 8)),
+            "max_len": int(getattr(args, "max_len", 24)),
+            "hard_max": int(getattr(args, "hard_max", 32)),
+            "hard_punct": getattr(args, "hard_punct", DEFAULT_HARD_PUNCT),
+            "soft_punct": getattr(args, "soft_punct", DEFAULT_SOFT_PUNCT),
+        },
+        "matching": {
+            "min_anchor_ngram": int(getattr(args, "min_anchor_ngram", 6)),
+            "max_distance_ratio": float(getattr(args, "max_distance_ratio", 0.35)),
+            "fallback_policy": getattr(args, "fallback_policy", "align-greedy"),
+            "fast_match": bool(getattr(args, "fast_match", True)),
+        },
+    }
+
+    # 生成总览报告
+    health_report = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "summary": {
+            "total_stems": len(stems),
+            "success_stems": sum(1 for item in items if item.get("status") == "ok"),
+            "failed_stems": sum(1 for item in items if item.get("status") != "ok"),
+        },
+        "normalization": norm_reports,
+        "splitting": split_reports,
+        "alignment": align_reports,
+        "params": params_snapshot,
+        "artifacts": artifacts_list,
+    }
+
+    # 写入 JSON 报告
+    report_json_path = out_dir / "report.json"
+    write_json(report_json_path, health_report)
+
+    # 写入细分报告
+    (out_dir / "norm_report.json").write_text(
+        json.dumps({"normalization": norm_reports}, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    (out_dir / "split_report.json").write_text(
+        json.dumps({"splitting": split_reports}, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    (out_dir / "align_report.json").write_text(
+        json.dumps({"alignment": align_reports}, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+    # 生成 Markdown 报告
+    md_lines = ["# OnePass Audio 体检报告\n"]
+    md_lines.append(f"生成时间: {health_report['generated_at']}\n")
+    md_lines.append(f"## 总览\n\n")
+    md_lines.append(f"- 总素材数: {health_report['summary']['total_stems']}\n")
+    md_lines.append(f"- 成功: {health_report['summary']['success_stems']}\n")
+    md_lines.append(f"- 失败: {health_report['summary']['failed_stems']}\n\n")
+
+    md_lines.append("## 规范化报告\n\n")
+    for nr in norm_reports:
+        md_lines.append(f"### {nr['stem']}\n\n")
+        if "error" in nr:
+            md_lines.append(f"错误: {nr['error']}\n\n")
+        else:
+            md_lines.append(f"- 原始长度: {nr.get('orig_len', 0)}\n")
+            md_lines.append(f"- 规范化后长度: {nr.get('norm_len', 0)}\n")
+            md_lines.append(f"- 长度变化: {nr.get('length_change', 0)}\n")
+            if nr.get("suspect_examples"):
+                md_lines.append(f"- 可疑混写样例: {', '.join(nr['suspect_examples'][:5])}\n")
+        md_lines.append("\n")
+
+    md_lines.append("## 分句报告\n\n")
+    for sr in split_reports:
+        md_lines.append(f"### {sr['stem']}\n\n")
+        if "error" in sr:
+            md_lines.append(f"错误: {sr['error']}\n\n")
+        else:
+            md_lines.append(f"- 总句数: {sr.get('total_sentences', 0)}\n")
+            md_lines.append(f"- 长度分布: min={sr.get('length_min', 0)}, median={sr.get('length_median', 0)}, p95={sr.get('length_p95', 0)}, max={sr.get('length_max', 0)}\n")
+            md_lines.append(f"- 句号必分合规率: {sr.get('hard_punct_rate', 0)}%\n")
+            md_lines.append(f"- 非句末标点行数: {sr.get('non_end_punct_count', 0)}\n")
+        md_lines.append("\n")
+
+    md_lines.append("## 参数快照\n\n")
+    md_lines.append("```json\n")
+    md_lines.append(json.dumps(params_snapshot, ensure_ascii=False, indent=2))
+    md_lines.append("\n```\n\n")
+
+    md_lines.append("## 对齐核验\n\n")
+    for ar in align_reports:
+        md_lines.append(f"### {ar['stem']}\n\n")
+        md_lines.append(f"- 匹配行数: {ar.get('matched_lines', 0)}\n")
+        md_lines.append(f"- 严格匹配: {ar.get('strict_matches', 0)}\n")
+        md_lines.append(f"- 回退匹配: {ar.get('fallback_matches', 0)}\n")
+        md_lines.append(f"- 未匹配: {ar.get('unmatched', 0)}\n")
+        md_lines.append(f"- 剪切比例: {ar.get('cut_ratio', 0.0):.3f}\n")
+        if ar.get("degrade_history"):
+            md_lines.append(f"- 参数调整记录: {len(ar['degrade_history'])} 次\n")
+        md_lines.append("\n")
+
+    md_lines.append("## 产物清单\n\n")
+    for art in artifacts_list:
+        md_lines.append(f"### {art['stem']}\n\n")
+        for key, value in art.items():
+            if key != "stem" and value:
+                md_lines.append(f"- {key}: {value}\n")
+        md_lines.append("\n")
+
+    (out_dir / "report.md").write_text("".join(md_lines), encoding="utf-8")
+    LOGGER.info("体检报告已生成: %s", out_dir / "report.json")
+
+
 def run_prep_norm(
     input_path: Path,
     output_dir: Path,
@@ -1538,8 +1791,54 @@ def _process_retake_item(
 
     stem = stem_from_words_json(words_path)  # 解析输出前缀
     try:
-        doc = load_words(words_path)  # 读取词级 JSON
-        words = list(doc)
+        if not words_path.exists():
+            # 尝试查找别名文件
+            base_dir = materials_base or words_path.parent
+            stem_name = stem_from_words_json(words_path)
+            candidates = [
+                base_dir / f"{stem_name}.words.json",
+                base_dir / f"{stem_name}.json",
+                words_path.parent / f"{stem_name}.words.json",
+                words_path.parent / f"{stem_name}.json",
+            ]
+            found_candidate = None
+            for candidate in candidates:
+                if candidate.exists() and candidate != words_path:
+                    found_candidate = candidate
+                    LOGGER.info("未找到 %s，使用别名文件 %s", words_path, found_candidate)
+                    break
+            if found_candidate:
+                words_path = found_candidate
+            else:
+                expected_names = [f"{stem_name}.words.json", f"{stem_name}.json"]
+                expected_dir = str(base_dir)
+                raise FileNotFoundError(
+                    f"未找到匹配的词级 JSON: {words_path}\n"
+                    f"期望文件名: {', '.join(expected_names)}\n"
+                    f"期望目录: {expected_dir}\n"
+                    f"请确认文件名与目录是否正确，或检查别名映射配置。"
+                )
+        try:
+            doc = load_words(words_path)  # 读取词级 JSON
+            words = list(doc)
+        except FileNotFoundError:
+            # 重新抛出，让外层处理
+            raise
+        except Exception as exc:
+            # 其他加载错误（JSON 格式错误等）
+            base_dir = materials_base or words_path.parent
+            stem_name = stem_from_words_json(words_path)
+            expected_names = [f"{stem_name}.words.json", f"{stem_name}.json"]
+            expected_dir = str(base_dir)
+            error_msg = (
+                f"加载词级 JSON 失败: {words_path}\n"
+                f"错误: {exc}\n"
+                f"期望文件名: {', '.join(expected_names)}\n"
+                f"期望目录: {expected_dir}\n"
+                f"请检查文件格式是否正确。"
+            )
+            LOGGER.error("词级 JSON 加载失败: stem=%s %s", stem, error_msg)
+            raise ValueError(error_msg) from exc
         audio_path: Path | None = None
         source_audio_name: str | None = None
         source_audio_abs: Path | None = None
@@ -1665,6 +1964,31 @@ def _process_retake_item(
                 current_sentence_gap,
                 current_pause_gap,
             )
+        except FileNotFoundError as exc:
+            # 词级 JSON 缺失的专门处理
+            context_preview = _load_context_preview()
+            base_dir = materials_base or text_path.parent
+            stem_name = stem_from_words_json(words_path)
+            expected_names = [f"{stem_name}.words.json", f"{stem_name}.json"]
+            expected_dir = str(base_dir)
+            error_msg = (
+                f"未找到匹配的词级 JSON: {words_path}\n"
+                f"期望文件名: {', '.join(expected_names)}\n"
+                f"期望目录: {expected_dir}"
+            )
+            LOGGER.error("词级 JSON 缺失: stem=%s %s", stem, error_msg)
+            item = {
+                "stem": stem,
+                "words_json": safe_rel(base_dir, words_path) if base_dir else str(words_path),
+                "text": safe_rel(base_dir, text_path) if base_dir else str(text_path),
+                "outputs": {},
+                "stats": {},
+                "status": "failed",
+                "message": error_msg,
+                "expected_words_json": expected_names,
+                "expected_dir": expected_dir,
+            }
+            return stem, item
         except Exception as exc:
             context_preview = _load_context_preview()
             LOGGER.exception(
@@ -3445,6 +3769,21 @@ def run_all_in_one(args: argparse.Namespace) -> dict:
     stats_section["max_clause_chars"] = int(getattr(args, "max_clause_chars", 22))
     write_json(report_path, report)
 
+    # 生成标准体检报告
+    try:
+        _generate_health_report(
+            out_dir=out_dir,
+            input_dir=input_dir,
+            norm_out_dir=norm_out_dir,
+            items=items,
+            norm_result=norm_result,
+            retake_result=retake_result,
+            report=report,
+            args=args,
+        )
+    except Exception as exc:
+        LOGGER.warning("生成体检报告失败: %s", exc)
+
     LOGGER.info(_safe_text(f"处理结果：成功 {success_items}/{total_items}"))
     for record in pipeline_records:
         if record["status"] == "ok":
@@ -3806,7 +4145,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="split_attach",
         choices=["right"],
         default="right",
-        help="硬标点归属（仅支持 right，旧配置将被强制改为 right）",
+        help="硬标点归属（仅支持 right，中文标点统一右附着）",
     )
     prep.add_argument(
         "--split-all-punct",
@@ -4497,7 +4836,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="split_attach",
         choices=["right"],
         default="right",
-        help="硬标点归属（仅支持 right）",
+        help="硬标点归属（仅支持 right，中文标点统一右附着）",
     )
     pipeline.add_argument(
         "--prosody-split",

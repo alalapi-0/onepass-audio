@@ -23,8 +23,10 @@ except ImportError as e:
 
 def analyze_normalization(orig_path: Path, norm_path: Path) -> Dict[str, Any]:
     """分析规范化差异。"""
-    if not orig_path.exists() or not norm_path.exists():
-        return {"error": "文件不存在"}
+    if not orig_path.exists():
+        return {"error": f"原始文件不存在: {orig_path}"}
+    if not norm_path.exists():
+        return {"error": f"规范化文件不存在: {norm_path}"}
     
     orig_text = orig_path.read_text(encoding="utf-8")
     norm_text = norm_path.read_text(encoding="utf-8")
@@ -54,7 +56,10 @@ def analyze_normalization(orig_path: Path, norm_path: Path) -> Dict[str, Any]:
 def analyze_splitting(norm_path: Path, align_path: Optional[Path] = None) -> Dict[str, Any]:
     """分析分句结果。"""
     if not norm_path.exists():
-        return {"error": "规范化文件不存在"}
+        return {"error": f"规范化文件不存在: {norm_path}"}
+    if align_path and not align_path.exists():
+        # align_path 缺失不影响分句分析，但记录警告
+        pass
     
     norm_text = norm_path.read_text(encoding="utf-8")
     
@@ -160,15 +165,21 @@ def main() -> int:
     """主函数。"""
     parser = argparse.ArgumentParser(description="生成规范化、分句、参数、对齐报告")
     parser.add_argument("--in", dest="input_dir", default="materials", help="输入目录（默认 materials）")
-    parser.add_argument("--out", dest="output_dir", default="out/reports", help="输出目录（默认 out/reports）")
+    parser.add_argument("--out", dest="output_dir", default="out", help="输出目录（默认 out）")
+    parser.add_argument("--norm-dir", help="规范化文件目录（默认 {output_dir}/norm）")
+    parser.add_argument("--split-dir", help="分句文件目录（默认 {output_dir}/split，若不存在则使用 norm_dir）")
+    parser.add_argument("--align-dir", help="对齐文件目录（默认 {output_dir}/align，若不存在则使用 norm_dir）")
     
     args = parser.parse_args()
     
     input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    norm_dir = ROOT_DIR / "out" / "norm"
+    # 使用指定的目录或从 output_dir 推导
+    norm_dir = Path(args.norm_dir).expanduser().resolve() if args.norm_dir else output_dir / "norm"
+    split_dir = Path(args.split_dir).expanduser().resolve() if args.split_dir else (output_dir / "split" if (output_dir / "split").exists() else norm_dir)
+    align_dir = Path(args.align_dir).expanduser().resolve() if args.align_dir else (output_dir / "align" if (output_dir / "align").exists() else norm_dir)
     
     # 查找所有文本文件
     text_files = list(input_dir.glob("*.txt"))
@@ -180,7 +191,7 @@ def main() -> int:
     for text_file in text_files:
         stem = text_file.stem
         norm_file = norm_dir / f"{stem}.norm.txt"
-        align_file = norm_dir / f"{stem}.align.txt"
+        align_file = align_dir / f"{stem}.align.txt"
         words_file = input_dir / f"{stem}.words.json"
         if not words_file.exists():
             words_file = input_dir / f"{stem}.json"

@@ -1923,6 +1923,7 @@ def compute_retake_keep_last(
         ratio_snapshot = float(snapshot_stats.get("cut_ratio", 0.0) or 0.0)
         guard_triggered = False
         # Define prev_* before guard check to avoid NameError
+        # Initialize with current values to ensure they're always defined
         prev_min_sent = current_min_sent
         prev_dup_gap = current_dup_gap
         prev_pause_gap = pause_gap_sec
